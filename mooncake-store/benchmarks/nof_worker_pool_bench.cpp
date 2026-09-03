@@ -24,6 +24,15 @@
 #include "spdk/spdk_wrapper.h"
 #include "transfer_task.h"
 #include "utils.h"
+// Modified By Yida (v3): GPU Direct 验证（--memory=cuda / --op=verify /
+// --require_dmabuf）
+#if defined(USE_NOF_URMA)
+#include "spdk/nof_memory_domain.h"
+#endif
+#if defined(USE_NOF_GPU_DIRECT)
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
 
 namespace {
 
@@ -95,6 +104,15 @@ DEFINE_int32(socket_id, -1,
              "NUMA socket for benchmark buffers. -1 lets SPDK choose.");
 DEFINE_bool(fill_on_write, true,
             "Fill buffers with a deterministic pattern for write/mixed ops.");
+// Modified By Yida (v3): GPU Direct 验证参数
+DEFINE_string(memory, "host",
+              "Benchmark buffer memory: host (SPDK DMA) or cuda (user GPU "
+              "memory, exercises NoF GPU Direct memory-domain path).");
+DEFINE_bool(require_dmabuf, false,
+            "Exit non-zero unless URMA DMA-BUF registrations were observed "
+            "(meaningful with --memory=cuda).");
+DEFINE_uint64(verify_rounds, 4,
+              "Write+read+compare rounds per endpoint in --op=verify mode.");
 
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
@@ -103,6 +121,7 @@ enum class BenchOp {
     READ = 0,
     WRITE = 1,
     MIXED = 2,
+    VERIFY = 3,  // Modified By Yida (v3): 写入→读回→比对
 };
 
 BenchOp ParseBenchOp(const std::string &value) {
@@ -119,8 +138,11 @@ BenchOp ParseBenchOp(const std::string &value) {
     if (normalized == "mixed") {
         return BenchOp::MIXED;
     }
+    if (normalized == "verify") {
+        return BenchOp::VERIFY;
+    }
     throw std::invalid_argument(
-        "Invalid --op. Supported values: read, write, mixed");
+        "Invalid --op. Supported values: read, write, mixed, verify");
 }
 
 struct ParsedRw {
@@ -295,6 +317,10 @@ struct EndpointStats {
 struct Slot {
     void *buffer{nullptr};
     size_t buffer_size{0};
+    // Modified By Yida (v3): cuda 模式下 buffer 为 cudaMalloc 设备内存，
+    // cuda_host 为写填充用的 host staging（cudaMallocHost）
+    bool cuda_buffer{false};
+    void *cuda_host{nullptr};
     std::shared_ptr<mooncake::SpdkNofOperationState> state;
     std::unique_ptr<mooncake::TransferFuture> future;
     uint64_t io_bytes{0};
@@ -539,7 +565,19 @@ void SubmitSlot(Slot &slot, EndpointContext &endpoint, size_t endpoint_index,
                 EndpointStats &endpoint_stats) {
     int op = PickTaskOp(op_mode, endpoint.rng);
     if (op == 1 && FLAGS_fill_on_write) {
-        FillPattern(slot.buffer, slot.buffer_size, submit_seq);
+        if (slot.cuda_buffer) {
+#if defined(USE_NOF_GPU_DIRECT)
+            // Modified By Yida (v3): 设备内存不能由 CPU 直接写——先在 host
+            // staging 里生成 pattern，再 H2D 拷贝（与真实用户数据路径一致）
+            FillPattern(slot.cuda_host, slot.buffer_size, submit_seq);
+            if (cudaMemcpy(slot.buffer, slot.cuda_host, slot.buffer_size,
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                LOG(ERROR) << "cudaMemcpy H2D failed for write pattern";
+            }
+#endif
+        } else {
+            FillPattern(slot.buffer, slot.buffer_size, submit_seq);
+        }
     }
 
     uint64_t lba = NextLba(endpoint, FLAGS_random_lba);
@@ -643,12 +681,227 @@ void FreeThreadSlots(mooncake::SpdkWrapper &wrapper,
         for (auto &thread_endpoint : thread_context.endpoints) {
             for (auto &slot : thread_endpoint.slots) {
                 if (slot.buffer) {
+#if defined(USE_NOF_GPU_DIRECT)
+                    // Modified By Yida (v3): cuda 缓冲走 cudaFree/cudaFreeHost
+                    if (slot.cuda_buffer) {
+                        cudaFree(slot.buffer);
+                        if (slot.cuda_host) {
+                            cudaFreeHost(slot.cuda_host);
+                        }
+                    } else {
+                        wrapper.Free(slot.buffer);
+                    }
+#else
                     wrapper.Free(slot.buffer);
+#endif
                     slot.buffer = nullptr;
+                    slot.cuda_host = nullptr;
                 }
             }
         }
     }
+}
+
+}  // namespace
+
+// ===================== Modified By Yida (v3): verify mode =====================
+// --op=verify：向每个 endpoint 写入确定性 pattern（cuda 模式先 H2D 拷入用户
+// 显存），NoF 写入后读回，逐字节比对。覆盖 host 与 cuda（GPU Direct）两种
+// buffer。运行在命名空间外，仅使用上面的公开符号。
+
+namespace {
+
+bool VerifyOneOp(mooncake::SpdkNofWorkerPool &pool, EndpointContext &endpoint,
+                 void *buf, uint64_t lba, int op) {
+    auto state = std::make_shared<mooncake::SpdkNofOperationState>();
+    mooncake::SpdkNofTask task(endpoint.seg_handle, buf, lba,
+                               static_cast<uint32_t>(endpoint.io_blocks), op,
+                               state);
+    pool.submitTask(std::move(task));
+    mooncake::TransferFuture future(state);
+    return future.get() == mooncake::ErrorCode::OK;
+}
+
+int RunVerifyMode(std::vector<EndpointContext> &endpoints,
+                  mooncake::SpdkNofWorkerPool &pool, bool use_cuda_memory) {
+    uint64_t total_ops = 0;
+    uint64_t failed_ops = 0;
+    uint64_t mismatch_ops = 0;
+
+    for (size_t ep_idx = 0; ep_idx < endpoints.size(); ++ep_idx) {
+        auto &endpoint = endpoints[ep_idx];
+        void *write_src = nullptr;
+        void *read_dst = nullptr;
+        void *host_expected = nullptr;
+        void *host_readback = nullptr;
+        bool is_cuda = use_cuda_memory;
+
+        if (is_cuda) {
+#if defined(USE_NOF_GPU_DIRECT)
+            if (cudaMalloc(&write_src, FLAGS_io_size) != cudaSuccess ||
+                cudaMalloc(&read_dst, FLAGS_io_size) != cudaSuccess ||
+                cudaMallocHost(&host_expected, FLAGS_io_size) != cudaSuccess ||
+                cudaMallocHost(&host_readback, FLAGS_io_size) != cudaSuccess) {
+                LOG(ERROR) << "verify: CUDA allocation failed";
+                return 1;
+            }
+            cudaMemset(write_src, 0, FLAGS_io_size);
+            cudaMemset(read_dst, 0, FLAGS_io_size);
+#endif
+        } else {
+            auto &wrapper = mooncake::SpdkWrapper::GetInstance();
+            write_src = wrapper.Alloc(FLAGS_io_size, 0x1000, FLAGS_socket_id);
+            read_dst = wrapper.Alloc(FLAGS_io_size, 0x1000, FLAGS_socket_id);
+            host_expected = std::malloc(FLAGS_io_size);
+            host_readback = std::malloc(FLAGS_io_size);
+        }
+        if (!write_src || !read_dst || !host_expected || !host_readback) {
+            LOG(ERROR) << "verify: buffer allocation failed";
+            return 1;
+        }
+
+        for (uint64_t round = 0; round < FLAGS_verify_rounds; ++round) {
+            for (uint64_t slot_idx = 0; slot_idx < FLAGS_iodepth; ++slot_idx) {
+                const uint64_t lba = NextLba(endpoint, FLAGS_random_lba);
+                const uint64_t seq =
+                    (round * 1'000'003ull) ^ (slot_idx * 7919ull) ^
+                    (ep_idx * 104729ull);
+
+                // 1) 生成 pattern 并放入写入 buffer
+                FillPattern(host_expected, FLAGS_io_size, seq);
+                if (is_cuda) {
+#if defined(USE_NOF_GPU_DIRECT)
+                    if (cudaMemcpy(write_src, host_expected, FLAGS_io_size,
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        LOG(ERROR) << "verify: H2D copy failed";
+                        ++failed_ops;
+                        continue;
+                    }
+#endif
+                } else {
+                    std::memcpy(write_src, host_expected, FLAGS_io_size);
+                }
+
+                // 2) NoF 写入（cuda buffer 走 GPU Direct memory domain）
+                ++total_ops;
+                if (!VerifyOneOp(pool, endpoint, write_src, lba,
+                                 /*op=*/1)) {
+                    LOG(ERROR) << "verify: WRITE failed ep=" << ep_idx
+                               << " round=" << round << " slot=" << slot_idx;
+                    ++failed_ops;
+                    continue;
+                }
+
+                // 3) 读回到独立 buffer
+                if (is_cuda) {
+#if defined(USE_NOF_GPU_DIRECT)
+                    cudaMemset(read_dst, 0, FLAGS_io_size);
+#endif
+                } else {
+                    std::memset(read_dst, 0, FLAGS_io_size);
+                }
+                ++total_ops;
+                if (!VerifyOneOp(pool, endpoint, read_dst, lba,
+                                 /*op=*/0)) {
+                    LOG(ERROR) << "verify: READ failed ep=" << ep_idx
+                               << " round=" << round << " slot=" << slot_idx;
+                    ++failed_ops;
+                    continue;
+                }
+
+                // 4) D2H 读回并比对
+                if (is_cuda) {
+#if defined(USE_NOF_GPU_DIRECT)
+                    if (cudaMemcpy(host_readback, read_dst, FLAGS_io_size,
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        LOG(ERROR) << "verify: D2H copy failed";
+                        ++failed_ops;
+                        continue;
+                    }
+#endif
+                } else {
+                    std::memcpy(host_readback, read_dst, FLAGS_io_size);
+                }
+                if (std::memcmp(host_expected, host_readback, FLAGS_io_size) !=
+                    0) {
+                    size_t diff_off = 0;
+                    auto *a = static_cast<const uint8_t *>(host_expected);
+                    auto *b = static_cast<const uint8_t *>(host_readback);
+                    while (diff_off < FLAGS_io_size && a[diff_off] == b[diff_off]) {
+                        ++diff_off;
+                    }
+                    LOG(ERROR) << "verify: DATA MISMATCH ep=" << ep_idx
+                               << " round=" << round << " slot=" << slot_idx
+                               << " lba=" << lba << " first_diff_off="
+                               << diff_off;
+                    ++mismatch_ops;
+                } else {
+                    VLOG(1) << "verify: OK ep=" << ep_idx << " round=" << round
+                            << " slot=" << slot_idx << " lba=" << lba;
+                }
+            }
+        }
+
+        if (is_cuda) {
+#if defined(USE_NOF_GPU_DIRECT)
+            cudaFree(write_src);
+            cudaFree(read_dst);
+            cudaFreeHost(host_expected);
+            cudaFreeHost(host_readback);
+#endif
+        } else {
+            auto &wrapper = mooncake::SpdkWrapper::GetInstance();
+            wrapper.Free(write_src);
+            wrapper.Free(read_dst);
+            std::free(host_expected);
+            std::free(host_readback);
+        }
+    }
+
+    std::cout << "verify_ops=" << total_ops << "\n";
+    std::cout << "verify_failed_ops=" << failed_ops << "\n";
+    std::cout << "verify_mismatch_ops=" << mismatch_ops << "\n";
+    std::cout << "verify_result="
+              << ((failed_ops == 0 && mismatch_ops == 0) ? "PASS" : "FAIL")
+              << "\n";
+    return (failed_ops == 0 && mismatch_ops == 0) ? 0 : 1;
+}
+
+// Modified By Yida (v3): 打印 URMA 注册统计与内存识别指标；
+// --require_dmabuf 时校验确实发生了 DMA-BUF 注册（GPU Direct 生效的证据）
+int ReportUrmaMemoryStats(bool require_dmabuf) {
+#if defined(USE_NOF_URMA)
+    struct spdk_nvme_urma_memory_stats stats{};
+    mooncake::NofMemoryDomainManager::GetUrmaMemoryStats(&stats);
+    auto &manager = mooncake::NofMemoryDomainManager::GetInstance();
+    std::cout << "urma_host_registrations=" << stats.host_registrations << "\n";
+    std::cout << "urma_accelerator_registrations="
+              << stats.accelerator_registrations << "\n";
+    std::cout << "urma_dmabuf_registrations=" << stats.dmabuf_registrations
+              << "\n";
+    std::cout << "urma_peer_memory_registrations="
+              << stats.peer_memory_registrations << "\n";
+    std::cout << "urma_registration_failures=" << stats.registration_failures
+              << "\n";
+    std::cout << "nof_host_io_total=" << manager.host_io_total() << "\n";
+    std::cout << "nof_cuda_io_total=" << manager.cuda_io_total() << "\n";
+    std::cout << "nof_classify_fail_total=" << manager.classify_fail_total()
+              << "\n";
+    std::cout << "nof_dmabuf_registration_total="
+              << manager.dmabuf_registration_total() << "\n";
+    std::cout << "nof_gpu_staging_fallback_total="
+              << manager.gpu_staging_fallback_total() << "\n";
+    std::cout << "nof_payload_staged_bytes=" << manager.payload_staged_bytes()
+              << "\n";
+    if (require_dmabuf && stats.dmabuf_registrations == 0) {
+        LOG(ERROR) << "--require_dmabuf: no URMA DMA-BUF registration observed"
+                   << " (GPU Direct did not engage)";
+        return 1;
+    }
+#else
+    (void)require_dmabuf;
+#endif
+    return 0;
 }
 
 }  // namespace
@@ -691,6 +944,27 @@ int main(int argc, char **argv) {
         }
 
         BenchOp op_mode = ParseBenchOp(FLAGS_op);
+        // Modified By Yida (v3): buffer 内存类型（host=SPDK DMA，cuda=用户显存
+        // GPU Direct）
+        const bool use_cuda_memory = FLAGS_memory == "cuda";
+        if (!use_cuda_memory && FLAGS_memory != "host") {
+            throw std::invalid_argument(
+                "Invalid --memory. Supported values: host, cuda");
+        }
+#if defined(USE_NOF_URMA)
+        if (use_cuda_memory &&
+            !mooncake::NofMemoryDomainManager::GetInstance()
+                 .IsGpuDirectAvailable()) {
+            LOG(ERROR) << "--memory=cuda requires GPU Direct support (build "
+                          "with USE_NOF_GPU_DIRECT and a CUDA device present)";
+            return 1;
+        }
+#else
+        if (use_cuda_memory) {
+            LOG(ERROR) << "--memory=cuda requires a build with USE_NOF_URMA";
+            return 1;
+        }
+#endif
         if (FLAGS_endpoints.empty()) {
             LOG(ERROR) << "--endpoints is required";
             return 1;
@@ -799,6 +1073,16 @@ int main(int argc, char **argv) {
                    "not increase worker parallelism.";
         }
 
+        // Modified By Yida (v3): verify 模式走独立的同步 写→读→比对 流程，
+        // 不进入吞吐线程池
+        if (op_mode == BenchOp::VERIFY) {
+            mooncake::SpdkNofWorkerPool pool;
+            int rc = RunVerifyMode(endpoints, pool, use_cuda_memory);
+            rc |= ReportUrmaMemoryStats(FLAGS_require_dmabuf);
+            google::ShutdownGoogleLogging();
+            return rc;
+        }
+
         std::vector<BenchThreadContext> thread_contexts(
             effective_submit_threads);
         for (size_t thread_index = 0; thread_index < effective_submit_threads;
@@ -819,8 +1103,31 @@ int main(int argc, char **argv) {
             for (auto &thread_endpoint : thread_context.endpoints) {
                 for (auto &slot : thread_endpoint.slots) {
                     slot.buffer_size = FLAGS_io_size;
-                    slot.buffer = wrapper.Alloc(slot.buffer_size, 0x1000,
-                                                FLAGS_socket_id);
+                    if (use_cuda_memory) {
+#if defined(USE_NOF_GPU_DIRECT)
+                        // Modified By Yida (v3): 用户显存 + host staging
+                        if (cudaMalloc(&slot.buffer, slot.buffer_size) !=
+                            cudaSuccess) {
+                            LOG(ERROR) << "Failed to allocate CUDA buffer of "
+                                          "size "
+                                       << slot.buffer_size;
+                            FreeThreadSlots(wrapper, thread_contexts);
+                            return 1;
+                        }
+                        slot.cuda_buffer = true;
+                        if (cudaMallocHost(&slot.cuda_host,
+                                           slot.buffer_size) != cudaSuccess) {
+                            LOG(ERROR) << "Failed to allocate CUDA host "
+                                          "staging of size "
+                                       << slot.buffer_size;
+                            FreeThreadSlots(wrapper, thread_contexts);
+                            return 1;
+                        }
+#endif
+                    } else {
+                        slot.buffer = wrapper.Alloc(slot.buffer_size, 0x1000,
+                                                    FLAGS_socket_id);
+                    }
                     if (!slot.buffer) {
                         LOG(ERROR) << "Failed to allocate DMA buffer of size "
                                    << slot.buffer_size;
@@ -1009,8 +1316,10 @@ int main(int argc, char **argv) {
         }
         std::cout << "==========================================\n";
 
+        // Modified By Yida (v3): URMA 注册统计 / GPU Direct 指标 / dmabuf 校验
+        int urma_rc = ReportUrmaMemoryStats(FLAGS_require_dmabuf);
         google::ShutdownGoogleLogging();
-        return 0;
+        return urma_rc;
     } catch (const std::exception &e) {
         LOG(ERROR) << "Benchmark failed: " << e.what();
         google::ShutdownGoogleLogging();

@@ -4,6 +4,7 @@
 
 import argparse
 import logging
+import os
 import paramiko
 import re
 import shlex
@@ -16,12 +17,17 @@ class SPDKTgtCreator:
     Remotely creates SPDK targets on multiple nodes via SSH.
     """
 
+    # Modified By Yida (v3): 修正 max_io_size / in_capsule_data_size 的默认值
+    # 与 RPC flag 映射。SPDK CLI 中 -c = in_capsule_data_size、-i = max_io_size；
+    # 旧代码 flag 与默认值同时反置（数值上恰好抵消），只改一处都会让实际行为
+    # 变化，因此两处必须一起改：max_io_size=131072(-i)、
+    # in_capsule_data_size=4096(-c)。
     DEFAULT_TRANSPORT_OPTIONS = {
         'trtype': 'RDMA',
         'max_queue_depth': 128,
         'max_io_qpairs_per_ctrlr': 127,
-        'max_io_size': 4096,
-        'in_capsule_data_size': 131072,
+        'max_io_size': 131072,
+        'in_capsule_data_size': 4096,
         'io_unit_size': 131072,
         'max_aq_depth': 128,
         'num_shared_buffers': 4096,
@@ -32,22 +38,56 @@ class SPDKTgtCreator:
         'trtype': '-t',
         'max_queue_depth': '-q',
         'max_io_qpairs_per_ctrlr': '-m',
-        'max_io_size': '-c',
-        'in_capsule_data_size': '-i',
+        'max_io_size': '-i',
+        'in_capsule_data_size': '-c',
         'io_unit_size': '-u',
         'max_aq_depth': '-a',
         'num_shared_buffers': '-n',
         'buf_cache_size': '-b',
     }
 
-    def __init__(self, spdk_targets: List[str], transport_options: Dict[str, Any] = None, core_mask: str = '0xff'):
+    # Modified By Yida (v3): nvmf_tgt 进程必须携带的 URMA 环境变量。
+    # 注意这些变量必须出现在 nvmf_tgt 进程环境中——只在调用 rpc.py 的
+    # shell 中设置没有作用。包含 JETTY_COUNT（SPDK nvme/nvmf 侧都会读取，
+    # 旧列表遗漏）。MC_URMA_* 为兼容别名，同样转发。
+    URMA_ENV_VARS = (
+        'SPDK_URMA_DEV_NAME',
+        'SPDK_URMA_EID_INDEX',
+        'SPDK_URMA_TRANS_MODE',
+        'SPDK_URMA_ACTIVE_PORT',
+        'SPDK_URMA_BONDING_BALANCE',
+        'SPDK_URMA_BONDING_MULTIPATH_ENABLE',
+        'SPDK_URMA_JFC_COUNT',
+        'SPDK_URMA_JFC_DEPTH',
+        'SPDK_URMA_JETTY_COUNT',
+        'SPDK_URMA_JETTY_DEPTH',
+        'SPDK_URMA_MAX_IO_SIZE',
+    )
+
+    def __init__(self, spdk_targets: List[str], transport_options: Dict[str, Any] = None, core_mask: str = '0xff', urma_env: Dict[str, str] = None):
         self.spdk_targets = spdk_targets
         self.core_mask = core_mask
         self.transport_options = dict(self.DEFAULT_TRANSPORT_OPTIONS)
         if transport_options:
             self.transport_options.update(transport_options)
+        self.urma_env = self._collect_urma_env(urma_env)
         self._setup_logging()
         self.target_configs = self._parse_spdk_targets()
+
+    def _collect_urma_env(self, explicit: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """收集要注入 nvmf_tgt 进程的 URMA 环境变量。
+
+        来源优先级（后者覆盖前者）：
+        1. 调用 shell 中已设置的 SPDK_URMA_* / MC_URMA_* 变量（自动转发）
+        2. --urma-env NAME=VALUE 显式指定
+        """
+        env: Dict[str, str] = {}
+        for name, value in os.environ.items():
+            if name.startswith('SPDK_URMA_') or name.startswith('MC_URMA_'):
+                env[name] = value
+        if explicit:
+            env.update(explicit)
+        return env
 
     def _setup_logging(self):
         logging.basicConfig(
@@ -301,9 +341,21 @@ done"""
         self.logger.info(f"Starting SPDK tgt service with core mask {self.core_mask}")
         tgt_binary = f"{spdk_path}/build/bin/nvmf_tgt"
         log_file = f"{spdk_path}/tgt.log"
+        # Modified By Yida (v3): URMA 环境变量必须出现在 nvmf_tgt 进程环境中。
+        # 通过 `env KEY=VALUE` 前缀注入 nohup 启动的进程；未设置任何 URMA
+        # 变量时不改变原有启动方式。
+        env_prefix = ''
+        if self.urma_env:
+            env_kv = ' '.join(
+                f'{shlex.quote(name)}={shlex.quote(str(value))}'
+                for name, value in sorted(self.urma_env.items()))
+            env_prefix = f'env {env_kv} '
+            self.logger.info(
+                "Passing URMA env to nvmf_tgt: %s",
+                ', '.join(sorted(self.urma_env)))
         self._execute_command(
             ssh,
-            f"nohup {tgt_binary} -m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
+            f"nohup {env_prefix}{tgt_binary} -m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
             timeout=None
         )
         time.sleep(3)  # Give it time to start
@@ -467,15 +519,18 @@ def parse_arguments():
     parser.add_argument('--core-mask', type=str, default='0xff',
                         help='CPU core mask used to start nvmf_tgt with -m (default: 0xff)')
     parser.add_argument('--transport-type', type=str, default='RDMA',
+                        choices=['RDMA', 'TCP', 'URMA'],
                         help='NVMe-oF transport type for nvmf_create_transport (default: RDMA)')
     parser.add_argument('--max-queue-depth', type=int, default=128,
                         help='Max number of outstanding I/O per queue (default: 128)')
     parser.add_argument('--max-io-qpairs-per-ctrlr', type=int, default=127,
                         help='Max number of I/O qpairs per controller (default: 127)')
-    parser.add_argument('--max-io-size', type=int, default=4096,
-                        help='Max I/O size in bytes (default: 4096)')
-    parser.add_argument('--in-capsule-data-size', type=int, default=131072,
-                        help='Max in-capsule data size in bytes (default: 131072)')
+    # Modified By Yida (v3): 默认值与 SPDK 语义对齐（max_io_size=131072，
+    # in_capsule_data_size=4096），与 DEFAULT_TRANSPORT_OPTIONS 保持一致
+    parser.add_argument('--max-io-size', type=int, default=131072,
+                        help='Max I/O size in bytes (default: 131072)')
+    parser.add_argument('--in-capsule-data-size', type=int, default=4096,
+                        help='Max in-capsule data size in bytes (default: 4096)')
     parser.add_argument('--io-unit-size', type=int, default=131072,
                         help='I/O unit size in bytes (default: 131072)')
     parser.add_argument('--max-aq-depth', type=int, default=128,
@@ -490,6 +545,14 @@ def parse_arguments():
                         help='SSH password for target nodes')
     parser.add_argument('--key-file', type=str,
                         help='SSH private key file path')
+    # Modified By Yida (v3): 显式传入 nvmf_tgt 的 URMA 环境变量（可重复）。
+    # 调用 shell 中已设置的 SPDK_URMA_* / MC_URMA_* 变量也会自动转发。
+    parser.add_argument('--urma-env', action='append', default=None,
+                        metavar='NAME=VALUE',
+                        help='URMA environment variable to pass to nvmf_tgt, '
+                             'e.g. --urma-env SPDK_URMA_DEV_NAME=udmac0d1e2 '
+                             '(repeatable; SPDK_URMA_*/MC_URMA_* vars from the '
+                             'invoking shell are forwarded automatically)')
     return parser.parse_args()
 
 
@@ -507,8 +570,18 @@ def main():
         'buf_cache_size': args.buf_cache_size,
     }
 
+    # Modified By Yida (v3): 收集显式指定的 URMA 环境变量
+    urma_env = {}
+    for item in (args.urma_env or []):
+        if '=' in item:
+            name, value = item.split('=', 1)
+            urma_env[name.strip()] = value.strip()
+        else:
+            logging.warning(f"Ignoring invalid --urma-env entry (expected NAME=VALUE): {item}")
+
     try:
-        creator = SPDKTgtCreator(args.spdk_target_info, transport_options, args.core_mask)
+        creator = SPDKTgtCreator(args.spdk_target_info, transport_options, args.core_mask,
+                                 urma_env=urma_env)
         success = creator.deploy_all_targets()
         exit(0 if success else 1)
     except Exception as e:

@@ -51,6 +51,10 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+// Modified By Yida (v3): NoF GPU Direct 内存识别
+#if defined(USE_NOF) && defined(USE_NOF_URMA)
+#include "spdk/nof_memory_domain.h"
+#endif
 #ifdef USE_UB
 #include "ub_allocator.h"
 #endif
@@ -388,6 +392,23 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
     }
     return {};
 }
+
+#if defined(USE_NOF) && defined(USE_NOF_URMA)
+// Modified By Yida (v3): te_endpoint 含 trtype（见 ssd_register_client.cpp
+// BuildTeEndpoint）。GPU Direct ext I/O 只对 URMA transport 生效——RDMA
+// transport 无法注册用户设备内存，直接读会失败，必须继续走 host staging。
+inline bool NofEndpointIsUrma(const std::string &te_endpoint) {
+    return te_endpoint.find("trtype:URMA") != std::string::npos;
+}
+
+// 严格回退开关：dst 已识别为设备内存但 GPU Direct 不可用时，默认报错；
+// 仅显式 MC_NOF_GPU_STAGING_FALLBACK=1 才允许退回 host staging（多一次
+// SSD→host→GPU 拷贝），并计入回退指标。
+inline bool NofGpuStagingFallbackEnabled() {
+    const char *v = std::getenv("MC_NOF_GPU_STAGING_FALLBACK");
+    return v != nullptr && std::string(v) == "1";
+}
+#endif
 
 // SelectBestReplica and the replica-scoring helpers live in
 // replica_selection.h (included above) so they can be unit-tested directly.
@@ -4059,6 +4080,57 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst)) {
+#if defined(USE_NOF) && defined(USE_NOF_URMA)
+            // Modified By Yida (v3): NoF GPU Direct——URMA NoF 副本 + CUDA
+            // 设备内存时，把 SSD 数据直接读进用户显存（ext I/O 携带 memory
+            // domain），省去 SSD→host→GPU 的整块中转拷贝。
+            if (replica.is_nof_replica() &&
+                NofEndpointIsUrma(
+                    replica.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                auto &manager = NofMemoryDomainManager::GetInstance();
+                auto info = manager.ResolveBuffer(dst, total_size);
+                if (info.type == NofMemoryType::kCuda) {
+                    std::vector<mooncake::Slice> slices;
+                    allocateSlices(slices, replica, dst);
+                    auto filtered_qr = FilterQueryResult(query_result,
+                                                         replica,
+                                                         verify_checksum);
+                    SpDiag::PerfPoint pt_read(
+                        PerfKey::GET_INTO_INTERNAL_MEM_READ,
+                        SpDiag::PerfLevel::MODULE);
+                    pt_read.Start();
+                    auto get_result = client_->Get(key, filtered_qr, slices);
+                    pt_read.End(get_result ? 0 : -1);
+                    if (!get_result) {
+                        LOG(ERROR) << "NoF GPU Direct Get failed for key: "
+                                   << key << " with error: "
+                                   << toString(get_result.error());
+                        return tl::unexpected(get_result.error());
+                    }
+                    VLOG(1) << "NoF GPU Direct read key=" << key
+                            << " device_id=" << info.device_id
+                            << " size=" << total_size;
+                    return static_cast<int64_t>(total_size);
+                }
+                // dst 已确认是设备内存但识别/域初始化失败：严格策略默认报错，
+                // 显式 MC_NOF_GPU_STAGING_FALLBACK=1 才回退 host staging
+                if (NofGpuStagingFallbackEnabled()) {
+                    manager.OnGpuStagingFallback();
+                    manager.AddPayloadStagedBytes(total_size);
+                    LOG(WARNING) << "NoF GPU Direct unavailable type="
+                                 << static_cast<int>(info.type)
+                                 << ", fallback to host staging key=" << key;
+                } else {
+                    LOG(ERROR) << "NoF GPU Direct resolve failed type="
+                               << static_cast<int>(info.type)
+                               << " for key=" << key
+                               << " — refusing host staging (set "
+                                  "MC_NOF_GPU_STAGING_FALLBACK=1 to allow)";
+                    return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+            }
+#endif
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);

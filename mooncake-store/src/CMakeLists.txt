@@ -273,6 +273,45 @@ if(USE_NOF)
       rdmacm
       ssl
       bsd)
+
+  # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
+  # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
+  # 挂到 mooncake_store 的 PUBLIC libs，位置在 nvme 之后满足符号解析）。
+  # 通过 -DUMDK_ROOT=/path/to/umdk-prefix 指定 UMDK 安装前缀。
+  if(USE_NOF_URMA)
+    set(UMDK_ROOT
+        ""
+        CACHE PATH "UMDK install prefix for the SPDK URMA transport")
+    find_path(
+      URMA_INCLUDE_DIR
+      NAMES urma_api.h
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES include/ub/umdk/urma include/ub/umdk include)
+    find_library(
+      URMA_LIBRARY
+      NAMES urma
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES lib64 lib build/lib)
+    if(NOT URMA_INCLUDE_DIR OR NOT URMA_LIBRARY)
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but UMDK (urma_api.h / liburma) not found; \
+pass -DUMDK_ROOT=/path/to/umdk-prefix")
+    endif()
+    message(STATUS "NoF URMA: include=${URMA_INCLUDE_DIR} lib=${URMA_LIBRARY}")
+    list(APPEND SPDK_STATIC_LIBS ${URMA_LIBRARY})
+  endif()
+
+  # Modified By Yida (v3): NoF GPU Direct —— provider 使用 CUDA driver API
+  # (cuMemGetAddressRange / DMA-BUF export)。提前探测 CUDAToolkit，供后段
+  # USE_CUDA 块复用（后续会统一加 USE_CUDA 宏、cudart 与 include 目录）。
+  if(USE_NOF_GPU_DIRECT)
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "NoF GPU Direct: CUDA driver library required for provider")
+    list(APPEND SPDK_STATIC_LIBS CUDA::cuda_driver)
+  endif()
 endif()
 
 # The cache_allocator library
@@ -289,6 +328,9 @@ target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})
+  if(USE_NOF_URMA)
+    target_include_directories(mooncake_store PRIVATE ${URMA_INCLUDE_DIR})
+  endif()
 endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
