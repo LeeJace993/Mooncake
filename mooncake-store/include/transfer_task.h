@@ -24,6 +24,10 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+// Modified By Yida (v3): GPU Direct 内存识别结果随 task 传递
+#ifdef USE_NOF_URMA
+#include "spdk/nof_memory_domain.h"
+#endif
 
 namespace mooncake {
 
@@ -380,6 +384,11 @@ struct SpdkNofTask {
     int64_t* io_count;
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
+// Modified By Yida (v3): buffer 类型识别结果（每个 task 解析一次，
+// 所有 sub_task 共用）；host 时 type=kHost、domain 可能为 system domain
+#ifdef USE_NOF_URMA
+    NofBufferInfo buffer_info;
+#endif
 
     SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
                 int op_code, std::shared_ptr<SpdkNofOperationState> s)
@@ -403,6 +412,11 @@ struct SpdkNofSubTask {
     SpdkNofTask* task;
     int submit_lba_count;
     std::stack<SpdkNofSubTask*>* sub_task_pool;
+// Modified By Yida (v3): ext I/O 选项。必须是成员而非栈变量——SPDK 要求
+// 在 I/O 完成前保持有效；host 路径不使用（io_opts 以 nullptr 提交）。
+#ifdef USE_NOF_URMA
+    spdk_nvme_ns_cmd_ext_io_opts io_opts{};
+#endif
 };
 
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k

@@ -483,6 +483,28 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 task->io_count = &total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
+#ifdef USE_NOF_URMA
+                // Modified By Yida (v3): 入队前识别 buffer 类型并解析 memory
+                // domain（每个 task 一次）。kError/kNotSupported 直接标记失败
+                // 走完成路径——严格错误策略，不静默回退 host staging。
+                {
+                    uint32_t blk = SpdkWrapper::GetInstance().GetBlockSize(
+                        task->seg_handle);
+                    task->buffer_info =
+                        NofMemoryDomainManager::GetInstance().ResolveBuffer(
+                            task->ptr,
+                            static_cast<uint64_t>(task->lba_count) * blk);
+                    if (task->buffer_info.type == NofMemoryType::kError ||
+                        task->buffer_info.type ==
+                            NofMemoryType::kNotSupported) {
+                        LOG(ERROR) << "NoF buffer resolve failed type="
+                                   << static_cast<int>(task->buffer_info.type)
+                                   << " ptr=" << task->ptr;
+                        task->failed = true;
+                        task->remaining_lba = 0;
+                    }
+                }
+#endif
                 nof_qos->PushTask(task);
                 task_queue.pop();
             }
@@ -518,10 +540,31 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         sub_task->task = task;
                         sub_task->submit_lba_count = submit_lba_count;
 
+#ifdef USE_NOF_URMA
+                        // Modified By Yida (v3): GPU Direct——CUDA buffer 走
+                        // ext I/O 携带 memory domain（domain 指向 cuda:
+                        // mooncake:<id>，SPDK URMA 侧据此做设备内存注册）；
+                        // host buffer 保持 io_opts=nullptr（经典 read/write，
+                        // 按 HOST 注册，行为与改造前一致）。
+                        const bool is_cuda_io =
+                            task->buffer_info.type == NofMemoryType::kCuda;
+                        if (is_cuda_io) {
+                            sub_task->io_opts = {};
+                            sub_task->io_opts.size =
+                                sizeof(sub_task->io_opts);
+                            sub_task->io_opts.memory_domain =
+                                task->buffer_info.domain;
+                        }
+                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
+                            task->seg_handle, submit_ptr, submit_lba,
+                            submit_lba_count, task->op, nvmf_io_complete,
+                            sub_task, is_cuda_io ? &sub_task->io_opts : nullptr);
+#else
                         int ret = SpdkWrapper::GetInstance().SubmitRequest(
                             task->seg_handle, submit_ptr, submit_lba,
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
+#endif
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
@@ -529,6 +572,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             task->remaining_lba = 0;
                         } else {
                             task->idx++;
+#ifdef USE_NOF_URMA
+                            // Modified By Yida (v3): 验收指标（host/cuda 分开计数）
+                            NofMemoryDomainManager::GetInstance().OnIoSubmitted(
+                                task->buffer_info);
+#endif
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
                             avail_blocks -= submit_lba_count;
