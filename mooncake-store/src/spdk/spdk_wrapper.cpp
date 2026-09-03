@@ -83,8 +83,14 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 }  // namespace
 
 struct nof_seg_handle {
-    struct spdk_nvme_qpair *qpair;
     struct spdk_nvme_ns *ns;
+    /* Modified By Yida (v3): 业务 worker 与 heartbeat 分离 qpair。SPDK URMA
+     * qpair 内部有 outstanding list 和同一条 TCP control socket，heartbeat
+     * 线程与 worker 同时 submit/poll 同一 qpair 会产生竞争。worker 只用
+     * io_qpair，heartbeat 只用 probe_qpair，probe_mutex 串行化并发 probe。 */
+    struct spdk_nvme_qpair *io_qpair;
+    struct spdk_nvme_qpair *probe_qpair;
+    std::mutex probe_mutex;
 };
 
 struct tr_info {
@@ -141,8 +147,14 @@ void SpdkWrapper::Cleanup() {
                 if (info) {
                     // Free all qpairs and segment handles
                     for (auto &[_, seg] : info->ns_seg) {
-                        if (seg && seg->qpair) {
-                            spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
+                        if (seg) {
+                            // Modified By Yida (v3): 分别释放业务与 probe qpair
+                            if (seg->io_qpair) {
+                                spdk_nvme_ctrlr_free_io_qpair(seg->io_qpair);
+                            }
+                            if (seg->probe_qpair) {
+                                spdk_nvme_ctrlr_free_io_qpair(seg->probe_qpair);
+                            }
                         }
                     }
                     // Detach controller
@@ -233,7 +245,11 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
-    return spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg);
+    if (!seg) {
+        return -1;
+    }
+    return spdk_nvme_qpair_process_completions(seg->io_qpair,
+                                               complete_per_seg);
 }
 
 int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
@@ -330,6 +346,7 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 
     nof_seg_handle *seg_handle = nullptr;
     struct spdk_nvme_qpair *qpair = nullptr;
+    struct spdk_nvme_qpair *probe_qpair = nullptr;
     struct spdk_nvme_ns *ns = nullptr;
     {
         auto &ns_seg = info->ns_seg;
@@ -352,9 +369,19 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             return nullptr;
         }
 
+        // Modified By Yida (v3): 每个 segment 额外分配一个 heartbeat 专用
+        // qpair，避免 heartbeat 复用业务 qpair 造成跨线程竞争
+        probe_qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+        if (!probe_qpair) {
+            LOG(ERROR) << "alloc probe spdk_nvme_qpair failed";
+            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            return nullptr;
+        }
+
         auto new_seg = std::make_unique<nof_seg_handle>();
-        new_seg->qpair = qpair;
         new_seg->ns = ns;
+        new_seg->io_qpair = qpair;
+        new_seg->probe_qpair = probe_qpair;
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
     }
@@ -370,24 +397,47 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     return spdk_nvme_ns_get_sector_size(seg_handle->ns);
 }
 
-int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
-                               uint64_t lba, uint32_t lba_count, int op,
-                               spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
-    if (!seg_handle || !ptr || !lba_count || !seg_handle->qpair ||
-        !seg_handle->ns) {
+int SpdkWrapper::SubmitRequestOnQpair(struct spdk_nvme_qpair *qpair,
+                                      struct spdk_nvme_ns *ns, void *ptr,
+                                      uint64_t lba, uint32_t lba_count, int op,
+                                      spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+                                      spdk_nvme_ns_cmd_ext_io_opts *io_opts) {
+    if (!qpair || !ns || !ptr || !lba_count) {
         return -1;
     }
 
-    struct spdk_nvme_qpair *qpair = seg_handle->qpair;
-    struct spdk_nvme_ns *ns = seg_handle->ns;
     if (op == kSpdkNofOpRead) {
+        if (io_opts != nullptr) {
+            // Modified By Yida (v3): 带 memory_domain 的 ext 提交，URMA 依据
+            // domain 选择 HOST/CUDA 等内存注册方式（GPU Direct 必需）
+            return spdk_nvme_ns_cmd_read_ext(ns, qpair, ptr, lba, lba_count,
+                                             cb_fn, cb_ctx, io_opts);
+        }
         return spdk_nvme_ns_cmd_read(ns, qpair, ptr, lba, lba_count, cb_fn,
                                      cb_ctx, 0);
     } else if (op == kSpdkNofOpWrite) {
+        if (io_opts != nullptr) {
+            return spdk_nvme_ns_cmd_write_ext(ns, qpair, ptr, lba, lba_count,
+                                              cb_fn, cb_ctx, io_opts);
+        }
         return spdk_nvme_ns_cmd_write(ns, qpair, ptr, lba, lba_count, cb_fn,
                                       cb_ctx, 0);
     }
     return -1;
+}
+
+int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
+                               uint64_t lba, uint32_t lba_count, int op,
+                               spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+                               spdk_nvme_ns_cmd_ext_io_opts *io_opts) {
+    if (!seg_handle) {
+        return -1;
+    }
+
+    // Modified By Yida (v3): 业务提交固定走 io_qpair；io_opts 由调用方
+    // (SpdkNofSubTask) 持有，生命周期覆盖整个异步 I/O。
+    return SubmitRequestOnQpair(seg_handle->io_qpair, seg_handle->ns, ptr, lba,
+                                lba_count, op, cb_fn, cb_ctx, io_opts);
 }
 
 SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
@@ -438,6 +488,10 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         return false;
     }
 
+    // Modified By Yida (v3): heartbeat 全程独占 probe_qpair，probe_mutex
+    // 串行化并发 probe；不触碰业务 io_qpair
+    std::lock_guard<std::mutex> probe_lock(seg_handle->probe_mutex);
+
     uint32_t block_size = GetBlockSize(seg_handle);
     if (block_size == INVALID_BLOCK_SIZE || block_size == 0) {
         if (error_reason) {
@@ -453,8 +507,9 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
-    int ret = SubmitRequest(seg_handle, probe_buffer->ptr, 0, 1, kSpdkNofOpRead,
-                            ProbeReadComplete, probe_ctx);
+    int ret = SubmitRequestOnQpair(
+        seg_handle->probe_qpair, seg_handle->ns, probe_buffer->ptr, 0, 1,
+        kSpdkNofOpRead, ProbeReadComplete, probe_ctx, nullptr);
     if (ret != 0) {
         RecycleProbeRequestContext(probe_ctx);
         if (error_reason) {
@@ -467,7 +522,8 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                     std::chrono::milliseconds(timeout_ms);
     while (!probe_ctx->done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
-        NvmePollProcessCompletion(seg_handle, 0);
+        // 只 poll probe_qpair，不 poll 业务 qpair
+        spdk_nvme_qpair_process_completions(seg_handle->probe_qpair, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 

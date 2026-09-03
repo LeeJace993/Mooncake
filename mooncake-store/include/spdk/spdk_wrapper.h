@@ -48,7 +48,8 @@ class SpdkWrapper {
 
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
                       uint32_t lba_count, int op, spdk_nvme_cmd_cb cb_fn,
-                      void *cb_ctx);
+                      void *cb_ctx,
+                      spdk_nvme_ns_cmd_ext_io_opts *io_opts = nullptr);
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
@@ -87,6 +88,13 @@ class SpdkWrapper {
     int ParseTransPortStr(const std::string &tr_str, tr_info *info);
     int ConnectController(const struct spdk_nvme_transport_id *trid,
                           ctrlr_info *info);
+    /* Modified By Yida (v3): qpair 级提交入口，业务(io_qpair)与 heartbeat
+     * (probe_qpair)共用实现；io_opts 非 NULL 时走 spdk_nvme_ns_cmd_*_ext。 */
+    int SubmitRequestOnQpair(struct spdk_nvme_qpair *qpair,
+                             struct spdk_nvme_ns *ns, void *ptr, uint64_t lba,
+                             uint32_t lba_count, int op, spdk_nvme_cmd_cb cb_fn,
+                             void *cb_ctx,
+                             spdk_nvme_ns_cmd_ext_io_opts *io_opts);
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
                                         uint32_t block_size,
                                         std::string *error_reason);
