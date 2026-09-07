@@ -111,10 +111,12 @@ int NofCudaExportDmabuf(void *provider_ctx, void *pin_handle, int *fd,
                    << static_cast<int>(rc);
         return -EIO;
     }
-    CUmemHandlePosixFileDescriptorStruct handle_struct{};
+    // Modified By Yida (v3): POSIX fd 类型的输出就是 int 文件描述符本身
+    // （驱动 API 规范用法），失败时（如闭源驱动）走 peer-memory 注册路径。
+    int dmabuf_fd = -1;
     rc = cuMemGetHandleForAddressRange(
-        &handle_struct, handle->alloc_base, handle->alloc_size,
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_STRUCT, 0);
+        &dmabuf_fd, handle->alloc_base, handle->alloc_size,
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
     CUcontext popped = nullptr;
     CUresult pop_rc = cuCtxPopCurrent(&popped);
     if (rc != CUDA_SUCCESS) {
@@ -129,7 +131,7 @@ int NofCudaExportDmabuf(void *provider_ctx, void *pin_handle, int *fd,
                    << static_cast<int>(pop_rc);
         return -EIO;
     }
-    *fd = handle_struct.fd;
+    *fd = dmabuf_fd;
     *offset = static_cast<uint64_t>(reinterpret_cast<CUdeviceptr>(handle->orig_addr) -
                                     handle->alloc_base);
     // Modified By Yida (v3): 验收指标——export 成功即一次 DMA-BUF 注册尝试
