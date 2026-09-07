@@ -111,12 +111,15 @@ int NofCudaExportDmabuf(void *provider_ctx, void *pin_handle, int *fd,
                    << static_cast<int>(rc);
         return -EIO;
     }
-    // Modified By Yida (v3): POSIX fd 类型的输出就是 int 文件描述符本身
-    // （驱动 API 规范用法），失败时（如闭源驱动）走 peer-memory 注册路径。
+    // Modified By Yida (v3): cuMemGetHandleForAddressRange 的 handleType 是
+    // CUmemRangeHandleType——注意与 cuMemExportToShareableHandle 用的
+    // CUmemAllocationHandleType 是两套语义不同的枚举，不能混用。
+    // DMA_BUF_FD 的输出是 Linux dma-buf fd（int）。失败时（如闭源驱动
+    // rc=801）走 peer-memory 注册路径——仍是 GPU Direct。
     int dmabuf_fd = -1;
     rc = cuMemGetHandleForAddressRange(
         &dmabuf_fd, handle->alloc_base, handle->alloc_size,
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
     CUcontext popped = nullptr;
     CUresult pop_rc = cuCtxPopCurrent(&popped);
     if (rc != CUDA_SUCCESS) {
