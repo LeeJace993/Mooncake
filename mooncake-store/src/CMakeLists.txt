@@ -215,10 +215,21 @@ if(USE_NOF)
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
 
+  # Modified By Yida (v3): SPDK 26.x 将 v23.01 的 libspdk_rdma.a 拆分为
+  # rdma_cm/rdma_provider/rdma_utils 三个库（CONFIG_RDMA 时 libspdk_nvme.a
+  # 中的 nvme_rdma.o 引用其符号）；SPDK 构建未开 --with-rdma 时这三个库
+  # 不存在，按文件存在与否条件引入，两种构建均可链接。
+  set(SPDK_RDMA_LIBS)
+  foreach(_rdma_lib rdma_cm rdma_provider rdma_utils)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_rdma_lib}.a")
+      list(APPEND SPDK_RDMA_LIBS ${SPDK_LIB_DIR}/libspdk_${_rdma_lib}.a)
+    endif()
+  endforeach()
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
       ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
+      ${SPDK_RDMA_LIBS}
       ${SPDK_LIB_DIR}/libspdk_nvme.a
       ${SPDK_LIB_DIR}/libspdk_sock_posix.a
       -Wl,--no-whole-archive
