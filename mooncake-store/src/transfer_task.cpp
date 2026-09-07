@@ -140,8 +140,11 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     }
 
     if (spdk_nvme_cpl_is_error(cpl)) {
-        LOG(ERROR) << "task_complete: I/O failed"
-                   << spdk_nvme_cpl_get_status_string(&cpl->status);
+        LOG(ERROR) << "task_complete: I/O failed "
+                   << mooncake::NofCplStatusString(
+                          cpl, op == mooncake::kSpdkNofOpRead
+                                   ? SPDK_NVME_OPC_READ
+                                   : SPDK_NVME_OPC_WRITE);
         task->remaining_lba = 0;
         task->failed = true;
     }
