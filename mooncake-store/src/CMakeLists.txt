@@ -215,41 +215,41 @@ if(USE_NOF)
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
 
-  # Modified By Yida (v3): SPDK 26.x 将 v23.01 的 libspdk_rdma.a 拆分为
-  # rdma_cm/rdma_provider/rdma_utils 三个库（CONFIG_RDMA 时 libspdk_nvme.a
-  # 中的 nvme_rdma.o 引用其符号）；SPDK 构建未开 --with-rdma 时这三个库
-  # 不存在，按文件存在与否条件引入，两种构建均可链接。
-  set(SPDK_RDMA_LIBS)
-  foreach(_rdma_lib rdma_cm rdma_provider rdma_utils)
-    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_rdma_lib}.a")
-      list(APPEND SPDK_RDMA_LIBS ${SPDK_LIB_DIR}/libspdk_${_rdma_lib}.a)
+  # Modified By Yida (v3): SPDK 版本兼容链接清单（v23.01 上游基线 / 26.x 本项目 fork）。
+  # - 核心库 event/nvme 任何版本都必须存在，缺失 = make install 没跑完，直接报错
+  # - 版本差异库按存在与否静默引入：26.x 将 lib/rdma 拆为 rdma_cm/rdma_provider/
+  #   rdma_utils（未开 --with-rdma 则无）、sock_posix 并入 libspdk_sock.a、
+  #   blobfs 已移除；v23.01 为单库 rdma
+  # - 其余库任何版本都应存在，缺失给 WARNING（多半是 install 不完整）
+  foreach(_lib event nvme)
+    if(NOT EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      message(FATAL_ERROR
+        "SPDK lib missing: ${SPDK_LIB_DIR}/libspdk_${_lib}.a — "
+        "回 SPDK 目录执行 sudo make install（部署文档阶段 2）")
+    endif()
+  endforeach()
+
+  set(SPDK_CORE_LIBS)
+  foreach(_lib event nvme sock_posix rdma rdma_cm rdma_provider rdma_utils)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_CORE_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    endif()
+  endforeach()
+
+  set(SPDK_OPTIONAL_LIBS)
+  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_OPTIONAL_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    else()
+      message(WARNING "SPDK lib not found (skipped): libspdk_${_lib}.a in ${SPDK_LIB_DIR}")
     endif()
   endforeach()
 
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_RDMA_LIBS}
-      ${SPDK_LIB_DIR}/libspdk_nvme.a
-      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      ${SPDK_CORE_LIBS}
       -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
+      ${SPDK_OPTIONAL_LIBS}
       ${DPDK_LIB_DIR}/librte_eal.a
       ${DPDK_LIB_DIR}/librte_mempool.a
       ${DPDK_LIB_DIR}/librte_ring.a
