@@ -10,6 +10,7 @@
 #include <vector>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
+#include <spdk/version.h>
 
 namespace mooncake {
 
@@ -18,6 +19,20 @@ namespace mooncake {
 constexpr int kSpdkNofOpRead = 0;
 constexpr int kSpdkNofOpWrite = 1;
 constexpr int kSpdkNofOpNum = 2;
+
+// Modified By Yida (v3): SPDK 2026-04 起（v26.05+ master）将 completion 状态
+// 转字符串的 API 改为 _ext 并增加 opc 参数，旧单参 API 在 26.x 被移除；
+// v23.01 等旧版本只有单参形式。按版本选择，兼容两种 SPDK。
+inline const char *NofCplStatusString(const struct spdk_nvme_cpl *cpl,
+                                      uint8_t opc) {
+#if SPDK_VERSION_MAJOR > 26 || \
+    (SPDK_VERSION_MAJOR == 26 && SPDK_VERSION_MINOR >= 5)
+    return spdk_nvme_cpl_get_status_string_ext(&cpl->status, opc);
+#else
+    (void)opc;
+    return spdk_nvme_cpl_get_status_string(&cpl->status);
+#endif
+}
 
 struct nof_seg_handle;
 struct tr_info;
