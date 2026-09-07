@@ -204,7 +204,7 @@ void SpdkWrapper::ProbeReadComplete(void *ctx,
             std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
             probe_ctx->error_reason =
                 std::string("completion_error:") +
-                spdk_nvme_cpl_get_status_string(&cpl->status);
+                NofCplStatusString(cpl, SPDK_NVME_OPC_READ);
         }
         probe_ctx->success.store(false, std::memory_order_release);
     } else {
