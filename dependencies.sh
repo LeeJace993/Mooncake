@@ -88,8 +88,11 @@ INSTALL_SPDK=false
 # Modified By Yida (v3): NoF/URMA 支持——SPDK 来源与 URMA transport 开关。
 # URMA 模式默认使用本项目 fork 的 SPDK，并固定到具体 commit（initiator/target
 # 两端 wire 版本必须一致，只固定分支名不够）。
+# Modified By Yida (v6): 默认引用升级到 urma_modified_v6（c44ccce27）。v6 与
+# v3 wire 兼容，但两端仍统一 v6：hdr+capsule 合并发送、TCP_NODELAY、poller
+# 批量排空、大 I/O 与 per-I/O trace 开关只在 v6 生效。
 SPDK_URMA_REPO_DEFAULT="https://github.com/yyyuanhao426-hash/spdk.git"
-SPDK_URMA_REF_DEFAULT="5509ef28c3b45fcd93d1385778dcbed3435f7cb4" # urma_modified_v3
+SPDK_URMA_REF_DEFAULT="c44ccce2765ace0567dcf696b69699db96a3c224" # urma_modified_v6
 SPDK_REPO_URL=""
 SPDK_REF="v23.01.1"
 WITH_URMA=false
@@ -476,9 +479,27 @@ if [ "$INSTALL_SPDK" = true ]; then
     check_success "Failed to build SPDK"
 
     # Install SPDK
+    # Modified By Yida (v6): SPDK 26.x 的 install 链末尾用 uv pip 打包
+    # spdk/python（PEP 517 需在线拉 hatchling）。出口受限或 sudo 剥离代理 env
+    # 时该步骤报 Error 2，但此时静态库与头文件已全部装完——Mooncake 只依赖
+    # /usr/local 下的库与头文件（ADR-0018）。因此退出码只作参考，判定收敛
+    # 为产物完整性检查。
     echo "Installing SPDK..."
-    make install
-    check_success "Failed to install SPDK"
+    if ! make install; then
+        echo -e "${YELLOW}make install exited nonzero (usually the spdk/python hatchling step); core artifacts may already be installed.${NC}"
+    fi
+
+    INSTALL_INCOMPLETE=""
+    for _f in libspdk_event.a libspdk_nvme.a; do
+        if [ ! -f "/usr/local/lib/${_f}" ]; then
+            echo -e "${RED}NOT INSTALLED: /usr/local/lib/${_f}${NC}"
+            INSTALL_INCOMPLETE=1
+        fi
+    done
+    if [ -n "$INSTALL_INCOMPLETE" ]; then
+        print_error "SPDK install incomplete. Rerun 'sudo -E make install' in $(pwd) (sudo -E keeps proxy env for the hatchling step; see ADR-0018)"
+    fi
+    print_success "SPDK core static libraries verified in /usr/local/lib"
 
     # Copy DPDK libraries to system library path
     if ls dpdk/build/lib/*.a >/dev/null 2>&1; then
