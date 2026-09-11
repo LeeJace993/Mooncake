@@ -290,6 +290,18 @@ if(USE_NOF)
   # 挂到 mooncake_store 的 PUBLIC libs，位置在 nvme 之后满足符号解析）。
   # 通过 -DUMDK_ROOT=/path/to/umdk-prefix 指定 UMDK 安装前缀。
   if(USE_NOF_URMA)
+    # Modified By Yida (v6): /usr/local 装的是不含 URMA transport 的 SPDK
+    # （如上游 v23.01 残留）时，缺符号/缺声明会拖到编译或链接期且难定位
+    # （系统遮蔽——报错路径含 /usr/local/include 即旧版遮蔽的指纹）。
+    # nvme_urma.h 是本项目 fork SPDK 的标志头文件，在此提前校验。
+    if(NOT EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h")
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but ${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h not found — "
+          "installed SPDK has no URMA transport. 确认 urma_modified_v6 分支产物"
+          "已 make install 到 /usr/local（部署文档阶段 2），或用 -DSPDK_INCLUDE_DIR="
+          "指向正确前缀")
+    endif()
     set(UMDK_ROOT
         ""
         CACHE PATH "UMDK install prefix for the SPDK URMA transport")
