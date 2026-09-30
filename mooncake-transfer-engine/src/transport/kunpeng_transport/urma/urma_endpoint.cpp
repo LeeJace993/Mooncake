@@ -1147,7 +1147,7 @@ int UrmaEndpoint::submitPostSend(
         if (queue_log) {
             const char* status =
                 jetty_before >= max_wr_depth_ ? "jetty_full" : "jfc_full";
-            MC_LOG(INFO)
+            MC_VLOG(1)
                 << "urma_queue_depth direction="
                 << (slice_list.front()->opcode ==
                             Transport::TransferRequest::READ
@@ -1281,7 +1281,7 @@ int UrmaEndpoint::submitPostSend(
             retry_count_max =
                 std::max(retry_count_max, slice_list[i]->ub.retry_cnt);
         }
-        MC_LOG(INFO)
+        MC_VLOG(1)
             << "urma_queue_depth direction="
             << (slice_list.front()->opcode == Transport::TransferRequest::READ
                     ? "read"
