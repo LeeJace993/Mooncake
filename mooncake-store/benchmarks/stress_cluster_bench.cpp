@@ -461,14 +461,24 @@ class BenchmarkStats {
                   << "========================================\n";
         std::cout << std::fixed << std::setprecision(2);
 
+        std::cout << "  Parameters:\n";
+        std::cout << "    Scenario:       " << FLAGS_scenario << "\n";
+        std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
+        std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
+        std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
+        std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
+        std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
+
         double wall = WallSeconds();
-        std::cout << "  Wall time:        " << wall << " s\n";
+        std::cout << "\n  Total time:        " << wall << " s\n";
         std::cout << "  Total queries:    " << total_queries_
                   << " (failed: " << total_failed_ << ")\n";
         std::cout << "  Total keys:       " << total_keys_ << "\n";
         std::cout << "  Total data:       " << FormatBytes(total_bytes_)
                   << "\n";
-        std::cout << "  Throughput:       " << ThroughputMBps() << " MB/s";
+        std::cout << "  Throughput (avg): " << ThroughputMBps() << " MB/s";
         if (ThroughputMBps() > 1024) {
             std::cout << " (" << ThroughputMBps() / 1024 << " GB/s)";
         }
@@ -492,6 +502,9 @@ class BenchmarkStats {
             std::cout << "\n";
             std::cout << "    P999:  " << std::setw(12) << PercentileUs(99.9);
             if (n < 1000) std::cout << "  (n<1000)";
+            std::cout << "\n";
+            std::cout << "    P9999: " << std::setw(12) << PercentileUs(99.99);
+            if (n < 10000) std::cout << "  (n<10000)";
             std::cout << "\n";
             std::cout << "    Max:   " << std::setw(12)
                       << NanosToUs(merged_latencies_ns_.back()) << "\n";
@@ -531,9 +544,14 @@ class StressBenchmark {
         }
 
         // Unregister and free thread buffers (these are allocated by this
-        // class)
+        // class). In gdr-peermem mode the thread buffers are sub-regions of the
+        // single GPU HBM block owned by buffer_, so they are skipped here.
         for (auto& tb : thread_buffers_) {
             if (tb.ptr) {
+                if (gpu_config_.mode == "gdr-peermem") {
+                    tb.ptr = nullptr;
+                    continue;
+                }
                 try {
                     client_->unregister_buffer(tb.ptr);
                 } catch (...) {
@@ -577,6 +595,12 @@ class StressBenchmark {
 
     int Setup() {
         gpu_config_ = ResolveGpuConfig();
+        if (gpu_config_.mode == "gdr-peermem" && FLAGS_global_segment_size > 0) {
+            LOG(INFO) << "gdr-peermem mode: forcing global_segment_size=0 "
+                      << "(host segment not needed, GPU buffer registered "
+                      << "separately)";
+            FLAGS_global_segment_size = 0;
+        }
         int ret = client_->setup_real(
             FLAGS_local_hostname, FLAGS_metadata_server,
             FLAGS_global_segment_size, FLAGS_local_buffer_size, FLAGS_protocol,
@@ -592,15 +616,24 @@ class StressBenchmark {
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
         if (gpu_config_.use_gpu_buffer) {
 #if defined(USE_CUDA) && defined(USE_UB)
+            size_t gpu_alloc_size = buffer_size_;
+            if (gpu_config_.mode == "gdr-peermem") {
+                gpu_alloc_size = (1 + FLAGS_num_threads) * buffer_size_;
+            }
             buffer_ = reinterpret_cast<char*>(
-                mooncake::ub_allocate_gpu_hbm(buffer_size_,
+                mooncake::ub_allocate_gpu_hbm(gpu_alloc_size,
                                               FLAGS_gpu_device));
             if (!buffer_) {
                 LOG(ERROR) << "Failed to allocate GPU buffer of "
-                           << buffer_size_ << " bytes";
+                           << gpu_alloc_size << " bytes";
                 return -1;
             }
             buffer_is_gpu_ = true;
+            VLOG(1) << "[bench] GPU buffer allocated mode="
+                    << gpu_config_.mode << " device=" << FLAGS_gpu_device
+                    << " addr=" << buffer_ << " alloc_size=" << gpu_alloc_size
+                    << " buf_size=" << buffer_size_
+                    << " is_gpu=" << buffer_is_gpu_;
 #else
             LOG(FATAL) << "gpu_mode requires USE_CUDA and USE_UB build";
 #endif
@@ -615,7 +648,13 @@ class StressBenchmark {
             std::memset(buffer_, 0, buffer_size_);
         }
 
-        ret = client_->register_buffer(buffer_, buffer_size_);
+        {
+            size_t register_size = buffer_size_;
+            if (gpu_config_.mode == "gdr-peermem") {
+                register_size = (1 + FLAGS_num_threads) * buffer_size_;
+            }
+            ret = client_->register_buffer(buffer_, register_size);
+        }
         if (ret != 0) {
             LOG(ERROR) << "register_buffer failed, ret=" << ret;
             return ret;
@@ -1429,20 +1468,40 @@ class StressBenchmark {
             !interval_stats_list.empty()
                 ? overall.throughput_mbps / interval_stats_list.size()
                 : 0;
+        double peak_throughput_mbps = 0;
+        for (const auto& stats : interval_stats_list) {
+            peak_throughput_mbps =
+                std::max(peak_throughput_mbps, stats.throughput_mbps);
+        }
+        double cur_throughput_mbps =
+            !interval_stats_list.empty()
+                ? interval_stats_list.back().throughput_mbps
+                : 0;
         size_t total_latency_samples = overall.total_samples;
 
         std::cout << "\n  FINAL SUMMARY\n";
-        std::cout << "  Total time:       " << total_sec << " s\n";
+        std::cout << "  Parameters:\n";
+        std::cout << "    Scenario:       " << FLAGS_scenario << "\n";
+        std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
+        std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
+        std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
+        std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
+        std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
+
+        std::cout << "\n  Total time:       " << total_sec << " s\n";
         std::cout << "  Total queries:    " << final_queries
                   << " (failed: " << final_failed << ")\n";
         std::cout << "  Total keys:       " << final_keys << "\n";
         std::cout << "  Total data:       " << FormatBytes(final_bytes) << "\n";
-        std::cout << "  Throughput:       " << final_throughput_mbps
-                  << " MB/s (avg: " << avg_throughput_mbps << " MB/s)";
+        std::cout << "  Throughput (peak): " << peak_throughput_mbps << " MB/s\n";
+        std::cout << "  Throughput (avg):  " << final_throughput_mbps << " MB/s";
         if (final_throughput_mbps > 1024) {
             std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
         }
         std::cout << "\n";
+        std::cout << "  Throughput (cur):  " << cur_throughput_mbps << " MB/s\n";
         std::cout << "  Keys/sec:         " << final_keys_per_sec << "\n";
         std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
 
@@ -1728,6 +1787,13 @@ class StressBenchmark {
             checkCudaError(cudaMemcpy(buffer_, shadow.data(), FLAGS_value_size,
                                       cudaMemcpyHostToDevice),
                            "FillBuffer H2D copy failed");
+            static std::atomic<uint64_t> fill_h2d_log_counter{0};
+            if (VLOG_IS_ON(2) && fill_h2d_log_counter.fetch_add(
+                    1, std::memory_order_relaxed) % 10000 == 0) {
+                VLOG(2) << "[bench] FillBuffer H2D seed=" << seed
+                        << " size=" << FLAGS_value_size
+                        << " dst=" << buffer_;
+            }
         }
 #endif
     }
@@ -1741,6 +1807,12 @@ class StressBenchmark {
             checkCudaError(cudaMemcpy(shadow.data(), data, size,
                                       cudaMemcpyDeviceToHost),
                            "CheckBuffer D2H copy failed");
+            static std::atomic<uint64_t> check_d2h_log_counter{0};
+            if (VLOG_IS_ON(2) && check_d2h_log_counter.fetch_add(
+                    1, std::memory_order_relaxed) % 10000 == 0) {
+                VLOG(2) << "[bench] CheckBuffer D2H seed=" << seed
+                        << " size=" << size << " src=" << data;
+            }
             compare_data = shadow.data();
         }
 #endif
@@ -2079,9 +2151,13 @@ class StressBenchmark {
             thread_buffers_[t].is_gpu = gpu_config_.use_gpu_buffer;
             if (gpu_config_.use_gpu_buffer) {
 #if defined(USE_CUDA) && defined(USE_UB)
-                thread_buffers_[t].ptr = reinterpret_cast<char*>(
-                    mooncake::ub_allocate_gpu_hbm(per_buf_size,
-                                                  FLAGS_gpu_device));
+                if (gpu_config_.mode == "gdr-peermem") {
+                    thread_buffers_[t].ptr = buffer_ + (1 + t) * per_buf_size;
+                } else {
+                    thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                        mooncake::ub_allocate_gpu_hbm(per_buf_size,
+                                                      FLAGS_gpu_device));
+                }
                 if (!thread_buffers_[t].ptr) {
                     LOG(ERROR) << "Failed to allocate GPU buffer for thread "
                                << t << " size=" << per_buf_size;
@@ -2100,12 +2176,18 @@ class StressBenchmark {
                 }
                 std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             }
-            int ret =
-                client_->register_buffer(thread_buffers_[t].ptr, per_buf_size);
-            if (ret != 0) {
-                LOG(ERROR) << "register_buffer failed for thread " << t
-                           << " on NUMA node " << node;
-                return ret;
+            if (gpu_config_.mode == "gdr-peermem") {
+                VLOG(1) << "[bench] gdr-peermem thread buffer " << t
+                        << " -> main GPU block offset "
+                        << (1 + t) * per_buf_size;
+            } else {
+                int ret = client_->register_buffer(thread_buffers_[t].ptr,
+                                                   per_buf_size);
+                if (ret != 0) {
+                    LOG(ERROR) << "register_buffer failed for thread " << t
+                               << " on NUMA node " << node;
+                    return ret;
+                }
             }
         }
         LOG(INFO) << "Allocated " << num_threads << " thread buffers, each "
@@ -2130,6 +2212,12 @@ int main(int argc, char* argv[]) {
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
     ValidateGpuDevice(gpu_config);
     ApplyGpuEnv(gpu_config);
+
+    const char* verbose_env = std::getenv("MC_VERBOSE");
+    if (verbose_env) {
+        FLAGS_v = std::atoi(verbose_env);
+        LOG(INFO) << "Verbose logging enabled: -v=" << FLAGS_v;
+    }
 
     if (std::getenv("MC_LOG_DIR") == nullptr) {
         FLAGS_logtostderr = true;
