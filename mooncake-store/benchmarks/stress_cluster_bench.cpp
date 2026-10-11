@@ -22,9 +22,11 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "cuda_alike.h"
 #include "master_client.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
+#include "ub_allocator.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -277,6 +279,74 @@ DEFINE_uint64(shuffle_seed, 0,
               "Seed for deterministic shuffle of segment_read keys "
               "(0 = disabled)");
 
+DEFINE_string(gpu_mode, "",
+              "GPU link mode: gdr-peermem | staging. Empty/host = CPU buffer. "
+              "writer ignores this (host only).");
+DEFINE_int32(gpu_device, 0,
+             "GPU device index for gpu_mode (gdr-peermem/staging). Default 0. "
+             "Ignored when gpu_mode is empty/host.");
+
+// MC_UB_GPU_MODE selects the GPU memory access path for UB transport.
+//   host        - CPU memory only; no GPU involvement (default when unset).
+//   staging     - GPU buffer + per-buffer host staging; NIC only sees host.
+//   gdr-peermem - NIC directly DMA GPU HBM via nvidia_peermem.
+//   gdr-direct  - (future) dma_buf fd path (urma_register_seg_dmabuf).
+//   proxy       - (future) HBM mapped to host VA, hardware-coherent migration.
+struct GpuRuntimeConfig {
+    std::string mode;      // "host" | "staging" | "gdr-peermem"
+    bool use_gpu_buffer;   // true for gdr-peermem / staging
+};
+
+static GpuRuntimeConfig ResolveGpuConfig() {
+    GpuRuntimeConfig cfg;
+    cfg.mode = FLAGS_gpu_mode.empty() ? "host" : FLAGS_gpu_mode;
+    if (cfg.mode == "gdr-direct" || cfg.mode == "proxy") {
+        LOG(FATAL) << "gpu_mode=" << cfg.mode
+                   << " is not yet implemented (reserved for future GDR types)";
+    }
+    if (cfg.mode != "host" && cfg.mode != "staging" &&
+        cfg.mode != "gdr-peermem") {
+        LOG(FATAL) << "Unknown gpu_mode: " << FLAGS_gpu_mode;
+    }
+    cfg.use_gpu_buffer = (cfg.mode == "gdr-peermem" || cfg.mode == "staging");
+    return cfg;
+}
+
+static void ValidateGpuDevice(const GpuRuntimeConfig& cfg) {
+    if (!cfg.use_gpu_buffer) return;
+#if defined(USE_CUDA)
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        LOG(FATAL) << "gpu_mode requires a CUDA device, none available";
+    }
+    if (FLAGS_gpu_device < 0 || FLAGS_gpu_device >= count) {
+        LOG(FATAL) << "gpu_device=" << FLAGS_gpu_device
+                   << " out of range [0," << count << ")";
+    }
+    if (cudaSetDevice(FLAGS_gpu_device) != cudaSuccess) {
+        LOG(FATAL) << "cudaSetDevice(" << FLAGS_gpu_device << ") failed";
+    }
+#else
+    LOG(FATAL) << "gpu_mode requires a USE_CUDA build";
+#endif
+}
+
+static void ApplyGpuEnv(const GpuRuntimeConfig& cfg) {
+    if (!FLAGS_gpu_mode.empty()) {
+        ::setenv("MC_UB_GPU_MODE", cfg.mode.c_str(), 1);
+        LOG(INFO) << "Set MC_UB_GPU_MODE=" << cfg.mode;
+    }
+}
+
+#if defined(USE_CUDA)
+static void checkCudaError(cudaError_t result, const char* message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << ": " << cudaGetErrorString(result);
+        std::exit(EXIT_FAILURE);
+    }
+}
+#endif
+
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
 
@@ -470,7 +540,15 @@ class StressBenchmark {
                     LOG(WARNING)
                         << "Failed to unregister thread buffer, ignoring";
                 }
-                numa_free(tb.ptr, tb.size);
+                if (tb.is_gpu) {
+#if defined(USE_UB)
+                    mooncake::ub_free_gpu_hbm(tb.ptr);
+#else
+                    LOG(ERROR) << "Cannot free GPU HBM in non-UB build";
+#endif
+                } else {
+                    numa_free(tb.ptr, tb.size);
+                }
                 tb.ptr = nullptr;
             }
         }
@@ -483,13 +561,22 @@ class StressBenchmark {
             } catch (...) {
                 LOG(WARNING) << "Failed to unregister main buffer, ignoring";
             }
-            numa_free(buffer_, buffer_size_);
+            if (buffer_is_gpu_) {
+#if defined(USE_UB)
+                mooncake::ub_free_gpu_hbm(buffer_);
+#else
+                LOG(ERROR) << "Cannot free GPU HBM in non-UB build";
+#endif
+            } else {
+                numa_free(buffer_, buffer_size_);
+            }
             buffer_ = nullptr;
         }
         client_ = nullptr;
     }
 
     int Setup() {
+        gpu_config_ = ResolveGpuConfig();
         int ret = client_->setup_real(
             FLAGS_local_hostname, FLAGS_metadata_server,
             FLAGS_global_segment_size, FLAGS_local_buffer_size, FLAGS_protocol,
@@ -503,13 +590,30 @@ class StressBenchmark {
                   << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
-        buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));
-        if (!buffer_) {
-            LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
-                       << " bytes";
-            return -1;
+        if (gpu_config_.use_gpu_buffer) {
+#if defined(USE_CUDA) && defined(USE_UB)
+            buffer_ = reinterpret_cast<char*>(
+                mooncake::ub_allocate_gpu_hbm(buffer_size_,
+                                              FLAGS_gpu_device));
+            if (!buffer_) {
+                LOG(ERROR) << "Failed to allocate GPU buffer of "
+                           << buffer_size_ << " bytes";
+                return -1;
+            }
+            buffer_is_gpu_ = true;
+#else
+            LOG(FATAL) << "gpu_mode requires USE_CUDA and USE_UB build";
+#endif
+        } else {
+            buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));
+            if (!buffer_) {
+                LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
+                           << " bytes";
+                return -1;
+            }
+            buffer_is_gpu_ = false;
+            std::memset(buffer_, 0, buffer_size_);
         }
-        std::memset(buffer_, 0, buffer_size_);
 
         ret = client_->register_buffer(buffer_, buffer_size_);
         if (ret != 0) {
@@ -1605,7 +1709,13 @@ class StressBenchmark {
     }
 
     void FillBuffer(size_t seed) {
-        uint64_t* ptr = reinterpret_cast<uint64_t*>(buffer_);
+        void* target = buffer_;
+        static thread_local std::vector<uint8_t> shadow;
+        if (buffer_is_gpu_) {
+            if (shadow.size() != buffer_size_) shadow.assign(buffer_size_, 0);
+            target = shadow.data();
+        }
+        uint64_t* ptr = reinterpret_cast<uint64_t*>(target);
         size_t num_words = FLAGS_value_size / sizeof(uint64_t);
         uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
         for (size_t w = 0; w < num_words; ++w) {
@@ -1613,10 +1723,29 @@ class StressBenchmark {
             pattern = (pattern ^ (pattern >> 27)) * 0x94D049BB133111EBULL;
             ptr[w] = pattern ^ (pattern >> 31);
         }
+#if defined(USE_CUDA)
+        if (buffer_is_gpu_) {
+            checkCudaError(cudaMemcpy(buffer_, shadow.data(), FLAGS_value_size,
+                                      cudaMemcpyHostToDevice),
+                           "FillBuffer H2D copy failed");
+        }
+#endif
     }
 
     bool CheckBuffer(size_t seed, const void* data, size_t size) const {
-        const uint64_t* ptr = reinterpret_cast<const uint64_t*>(data);
+        const void* compare_data = data;
+        static thread_local std::vector<uint8_t> shadow;
+#if defined(USE_CUDA)
+        if (buffer_is_gpu_) {
+            shadow.resize(size);
+            checkCudaError(cudaMemcpy(shadow.data(), data, size,
+                                      cudaMemcpyDeviceToHost),
+                           "CheckBuffer D2H copy failed");
+            compare_data = shadow.data();
+        }
+#endif
+        const uint64_t* ptr =
+            reinterpret_cast<const uint64_t*>(compare_data);
         size_t num_words = size / sizeof(uint64_t);
         uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
         for (size_t w = 0; w < num_words; ++w) {
@@ -1929,11 +2058,14 @@ class StressBenchmark {
     std::shared_ptr<mooncake::RealClient> client_;
     char* buffer_;
     size_t buffer_size_;
+    bool buffer_is_gpu_ = false;
+    GpuRuntimeConfig gpu_config_;
 
     struct ThreadBuffer {
         char* ptr = nullptr;
         size_t size = 0;
         int numa_node = -1;
+        bool is_gpu = false;
     };
     std::vector<ThreadBuffer> thread_buffers_;
 
@@ -1944,14 +2076,30 @@ class StressBenchmark {
             int node = t % NR_SOCKETS;
             thread_buffers_[t].size = per_buf_size;
             thread_buffers_[t].numa_node = node;
-            thread_buffers_[t].ptr =
-                reinterpret_cast<char*>(numa_alloc_onnode(per_buf_size, node));
-            if (!thread_buffers_[t].ptr) {
-                LOG(ERROR) << "Failed to allocate buffer for thread " << t
-                           << " on NUMA node " << node;
-                return -1;
+            thread_buffers_[t].is_gpu = gpu_config_.use_gpu_buffer;
+            if (gpu_config_.use_gpu_buffer) {
+#if defined(USE_CUDA) && defined(USE_UB)
+                thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                    mooncake::ub_allocate_gpu_hbm(per_buf_size,
+                                                  FLAGS_gpu_device));
+                if (!thread_buffers_[t].ptr) {
+                    LOG(ERROR) << "Failed to allocate GPU buffer for thread "
+                               << t << " size=" << per_buf_size;
+                    return -1;
+                }
+#else
+                LOG(FATAL) << "gpu_mode requires USE_CUDA and USE_UB build";
+#endif
+            } else {
+                thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                    numa_alloc_onnode(per_buf_size, node));
+                if (!thread_buffers_[t].ptr) {
+                    LOG(ERROR) << "Failed to allocate buffer for thread " << t
+                               << " on NUMA node " << node;
+                    return -1;
+                }
+                std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             }
-            std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             int ret =
                 client_->register_buffer(thread_buffers_[t].ptr, per_buf_size);
             if (ret != 0) {
@@ -1973,6 +2121,16 @@ int main(int argc, char* argv[]) {
     }
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+    if (FLAGS_role == "writer" && !FLAGS_gpu_mode.empty() &&
+        FLAGS_gpu_mode != "host") {
+        LOG(FATAL) << "writer role does not support --gpu_mode (host only); "
+                   << "got --gpu_mode=" << FLAGS_gpu_mode;
+    }
+
+    GpuRuntimeConfig gpu_config = ResolveGpuConfig();
+    ValidateGpuDevice(gpu_config);
+    ApplyGpuEnv(gpu_config);
+
     if (std::getenv("MC_LOG_DIR") == nullptr) {
         FLAGS_logtostderr = true;
     }
@@ -1981,6 +2139,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "Mooncake Stress Cluster Benchmark";
     LOG(INFO) << "  Scenario:       " << FLAGS_scenario;
     LOG(INFO) << "  Protocol:       " << FLAGS_protocol;
+    LOG(INFO) << "  GPU mode:       " << gpu_config.mode;
+    LOG(INFO) << "  GPU device:     " << FLAGS_gpu_device;
     LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MB";
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
