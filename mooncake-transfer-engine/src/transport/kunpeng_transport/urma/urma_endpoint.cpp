@@ -326,13 +326,29 @@ void* UrmaContext::localSegWithIndex(unsigned value) {
     return local_tseg_list_.at(value);
 }
 
-int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
+int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
+                                      UbMemoryRegionType type) {
     if (length > (size_t)globalConfig().max_seg_size) {
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+        if (type == UbMemoryRegionType::kGpu) {
+            LOG(ERROR) << "GPU segment length " << length
+                       << " exceeds device max_seg_size "
+                       << globalConfig().max_seg_size;
+            return ERR_INVALID_ARGUMENT;
+        }
+#endif
         PLOG(WARNING) << "The buffer length exceeds device max_seg_size, "
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
     }
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    const uint32_t is_gpu_seg =
+        (type == UbMemoryRegionType::kGpu) ? 1 : 0;
+    LOG(INFO) << "Register memory region " << va << " length " << length
+              << " is_gpu_seg=" << is_gpu_seg;
+#else
     LOG(INFO) << "Register memory region " << va << " length " << length;
+#endif
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;
     flag.bs.cacheable = URMA_NON_CACHEABLE;
@@ -348,6 +364,9 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         .flag = flag,
         .user_ctx = (uintptr_t)NULL,
         .iova = 0,
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+        .is_gpu_seg = (type == UbMemoryRegionType::kGpu) ? 1 : 0,
+#endif
     };
     urma_target_seg_t* seg = urma_register_seg(urma_context_, &seg_cfg);
     if (!seg) {

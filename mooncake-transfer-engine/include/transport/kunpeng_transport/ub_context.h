@@ -137,6 +137,13 @@ class UbSIEVEEndpointStore : public UbEndpointStore {
     size_t max_size_;
 };
 
+// Type of a locally registered memory region. kGpu marks a GPU segment
+// (seg_cfg.is_gpu_seg = 1) so URMA uses the peermem path on the receiver.
+enum class UbMemoryRegionType {
+    kHost,  // ordinary host memory, is_gpu_seg = 0
+    kGpu,   // GPU segment, is_gpu_seg = 1 (gdr-peermem)
+};
+
 // UbContext class
 class UbContext {
    public:
@@ -182,7 +189,9 @@ class UbContext {
     virtual int deconstruct() = 0;
 
    public:
-    virtual int registerMemoryRegion(uint64_t va, size_t length) = 0;
+    virtual int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) = 0;
 
     virtual int unregisterMemoryRegion(uint64_t va) = 0;
 
