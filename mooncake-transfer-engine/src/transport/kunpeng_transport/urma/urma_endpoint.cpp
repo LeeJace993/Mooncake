@@ -328,6 +328,16 @@ void* UrmaContext::localSegWithIndex(unsigned value) {
 
 int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
                                       UbMemoryRegionType type) {
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    // The NVIDIA P2P bridge (udma_nv_p2p_bridge.c) requires the registration
+    // length to be 64KB-aligned; nvidia_p2p_get_pages returns -EINVAL
+    // otherwise. Round up GPU segments before any length checks. Host
+    // segments keep the caller's length.
+    if (type == UbMemoryRegionType::kGpu) {
+        constexpr size_t kGpuSegAlign = 64 * 1024;
+        length = (length + kGpuSegAlign - 1) & ~(kGpuSegAlign - 1);
+    }
+#endif
     if (length > (size_t)globalConfig().max_seg_size) {
 #if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
         if (type == UbMemoryRegionType::kGpu) {

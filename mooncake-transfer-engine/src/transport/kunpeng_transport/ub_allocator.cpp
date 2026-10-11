@@ -83,6 +83,13 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
         return nullptr;
     }
 #if defined(USE_CUDA)
+    // The NVIDIA P2P bridge (udma_nv_p2p_bridge.c) rejects non-64KB-aligned
+    // lengths at nvidia_p2p_get_pages. Pad the allocation up to 64KB so
+    // non-aligned sizes (e.g. --value_size < 64KB) can still be registered.
+    // The returned VA is already GPU-page aligned by cuMemAlloc.
+    constexpr size_t kGpuHbmAlign = 64 * 1024;
+    const size_t alloc_size =
+        (total_size + kGpuHbmAlign - 1) & ~(kGpuHbmAlign - 1);
     CUresult init_ret = cuInit(0);
     if (init_ret != CUDA_SUCCESS) {
         const char* err_str = nullptr;
@@ -102,12 +109,12 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
     }
 
     CUdeviceptr dptr = 0;
-    CUresult cu_ret = cuMemAlloc(&dptr, total_size);
+    CUresult cu_ret = cuMemAlloc(&dptr, alloc_size);
     if (cu_ret != CUDA_SUCCESS) {
         const char* err_str = nullptr;
         (void)cuGetErrorString(cu_ret, &err_str);
         if (old_device >= 0) (void)cudaSetDevice(old_device);
-        LOG(ERROR) << "UB GPU HBM: cuMemAlloc failed for size " << total_size
+        LOG(ERROR) << "UB GPU HBM: cuMemAlloc failed for size " << alloc_size
                    << ", error=" << (err_str ? err_str : "unknown");
         return nullptr;
     }
@@ -132,8 +139,9 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
         std::lock_guard<std::mutex> gdr_lock(g_ub_gpu_hbm_mutex);
         g_ub_gpu_hbm_devices[ptr] = device_id;
     }
-    VLOG(1) << "UB GPU HBM: allocated size " << total_size
-            << ", device " << device_id << ", addr " << ptr;
+    VLOG(1) << "UB GPU HBM: allocated size " << alloc_size
+            << " (requested " << total_size << "), device " << device_id
+            << ", addr " << ptr;
     return ptr;
 #else
     (void)device_id;
