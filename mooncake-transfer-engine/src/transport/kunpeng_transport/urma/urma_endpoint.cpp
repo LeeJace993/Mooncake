@@ -518,7 +518,13 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        if (multipath()) {
+        static auto bondingModeSetEnabled = []() -> bool {
+            const char* env = std::getenv("MC_URMA_SET_BONDING_MODE");
+            return env && (std::string(env) == "1" || std::string(env) == "true" ||
+                           std::string(env) == "on");
+        };
+
+        if (bondingModeSetEnabled()) {
             // multipath on: BALANCE mode at IODIE level (chip-aware bonding).
             bondp_set_bonding_mode_in_t mode{
                 .bonding_mode = BONDP_BONDING_MODE_BALANCE,
@@ -539,26 +545,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         } else {
-            // multipath off: explicitly set the bondp default (STANDALONE/PORT)
-            // instead of leaving it implicit.
-            bondp_set_bonding_mode_in_t mode{
-                .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
-                .bonding_level = BONDP_BONDING_LEVEL_PORT};
-            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
-                                  .len = sizeof(mode),
-                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
-            urma_user_ctl_out_t out;
-            memset(&out, 0, sizeof(out));
-            auto ret = urma_user_ctl(context, &in, &out);
-            if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding STANDALONE/PORT mode, ret = "
-                           << ret;
-                return ERR_CONTEXT;
-            }
-            LOG(INFO) << "[multipath OFF] bonding mode set on " << device_name
-                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
-                      << " bonding_level="
-                      << bondingLevelToString(mode.bonding_level);
+            LOG(WARNING) << "Skipping urma_user_ctl SET_BONDING_MODE on " << device_name
+                         << " (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)";
         }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {

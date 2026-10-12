@@ -237,7 +237,7 @@ if(USE_NOF)
   endforeach()
 
   set(SPDK_OPTIONAL_LIBS)
-  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc)
+  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc keyring keyring_file keyring_linux fuse_dispatcher)
     if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
       list(APPEND SPDK_OPTIONAL_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
     else()
@@ -269,6 +269,13 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
+      ${DPDK_LIB_DIR}/librte_log.a
+      ${DPDK_LIB_DIR}/librte_argparse.a
+      ${DPDK_LIB_DIR}/librte_bus_vdev.a
+      ${DPDK_LIB_DIR}/librte_cmdline.a
+      ${DPDK_LIB_DIR}/librte_dmadev.a
+      ${DPDK_LIB_DIR}/librte_meter.a
+      ${DPDK_LIB_DIR}/librte_stack.a
       pthread
       dl
       numa
@@ -283,7 +290,8 @@ if(USE_NOF)
       ibverbs
       rdmacm
       ssl
-      bsd)
+      bsd
+      fuse3)
 
   # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
   # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
@@ -316,7 +324,7 @@ if(USE_NOF)
       NAMES urma
       HINTS ${UMDK_ROOT}
       PATHS /usr /usr/local
-      PATH_SUFFIXES lib64 lib build/lib)
+      PATH_SUFFIXES lib64 lib build/lib lib)
     if(NOT URMA_INCLUDE_DIR OR NOT URMA_LIBRARY)
       message(
         FATAL_ERROR

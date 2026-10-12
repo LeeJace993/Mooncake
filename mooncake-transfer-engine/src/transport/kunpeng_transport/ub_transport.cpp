@@ -95,7 +95,7 @@ bool UbTransport::stagingEnabled() const {
     return staging_enabled_;
 }
 
-UbGpuMode UbTransport::gpuMode() const {
+UbTransport::UbGpuMode UbTransport::gpuMode() const {
     std::call_once(gpu_mode_once_, [this] {
         const char* env = std::getenv("MC_UB_GPU_MODE");
         if (env) {
