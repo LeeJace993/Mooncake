@@ -97,6 +97,7 @@ ss -tlnp | grep -E '50061|9998|9004|50062|50071|50072'
 # node4：master / bench / 任何创建 URMA context 的进程都要设
 export SPDK_URMA_DEV_NAME=udmac0d1e2        # 指定传输设备；否则错选 bonding_dev_0 → LOC_ACCESS_ERR (status=4)（ADR-003）
 export SPDK_URMA_CAPSULE_TRANSPORT=urma     # 指定 capsule 传输；否则发 tcp capsule → 对端握手失败 -104/-93（ADR-002）
+export SPDK_URMA_MAX_IO_SIZE=4194304        # 大 I/O 路径：与 target -O 4194304 配套（协商取小值，不设则按默认 135168 协商，>135168 的 I/O 下发失败）
 
 # node3：target 侧同样需要 SPDK_URMA_DEV_NAME=udmac0d1e2（nvmf_tgt 启动脚本已设）；
 #        capsule_transport 在子系统 JSON 里设为 urma，不是 env。
@@ -106,6 +107,7 @@ export SPDK_URMA_CAPSULE_TRANSPORT=urma     # 指定 capsule 传输；否则发 
 |---|---|---|---|
 | `SPDK_URMA_DEV_NAME` | ✅ 必设 | 选传输设备 `udmac0d1e2` | 错选 `bonding_dev_0` → attach `status=4` LOC_ACCESS_ERR（ADR-003） |
 | `SPDK_URMA_CAPSULE_TRANSPORT` | ✅ 必设 | capsule 走 urma | initiator 发 tcp capsule，target 侧 `capsule mismatch local=urma remote=tcp rc=-93`，attach `-104`（ADR-002） |
+| `SPDK_URMA_MAX_IO_SIZE` | 大 I/O 路径必设 | initiator 侧大 I/O 上限，与 target `-O` 协商取小值 | 不设则按默认 135168 协商，>135168 的 I/O 下发失败；target 用 `-O 4194304` 时 initiator 须设 `=4194304` |
 | `MC_URMA_SET_BONDING_MODE` | ⛔ **不要设** | ADR-001 段错误守卫 | **默认关闭=跳过崩溃调用**；若设为 `1` 会重新触发 `urma_user_ctl(SET_BONDING_MODE)` → `udma_u_delete_jetty` 空指针段错误 |
 
 > `MC_URMA_SET_BONDING_MODE` 的守卫逻辑已编译进 `00b31e3`（三分支结构，默认 skip）。**保持不设**即正确；
@@ -157,21 +159,48 @@ cmake --build build -j64 --target mooncake_master stress_cluster_bench
 
 ## 6. 部署：node3 target（nvmf_tgt，5 盘 URMA_RAID0）
 
-node3 用 SPDK `urma_enable_v2` 分支的编译产物起 target：
+node3 用 SPDK `urma_enable_v2` 分支自带的 **`target_nvme_takeover.sh`** 一键拉起 target——
+它一条命令干完：vfio-pci noiommu 接管 → `nvmf_tgt` 启动 → iobuf 池配置 → raid0 → URMA transport
++ subsystem + namespace + listener（内置根分区 rw 自检、上次残留还原、hugepages 自动上调、core mask 占用检测）。
+
+**第 1 步：先无 `-d` 跑一次，看系统盘和空闲候选盘**（脚本只分析、不做任何变更）：
 
 ```bash
-# node3，SPDK urma_enable_v2 编译产物
-cd /home/yin/nof/spdk/build/bin
-SPDK_URMA_DEV_NAME=udmac0d1e2 ./nvmf_tgt -m 0x3 --wait-for-rpc &
+# node3（root），SPDK urma_enable_v2 树
+cd /home/yin/nof/spdk
+sudo ./target_nvme_takeover.sh
 ```
 
-随后通过 RPC 创建 bdev raid0 + URMA transport 子系统（`--wait-for-rpc` 流程：先 RPC 配 iobuf 等再 `framework_start_init`）：
+输出列出所有 `nvmeXn1` 的 BDF / 状态（空闲/禁碰）/ 说明。**盘名每次开机重排，旧记录不可信，
+必须现查**——从「空闲」行里选 5 块。
 
-- 子系统：`nqn.2026-01.io.spdk:urma-gpu-test`，监听 `141.61.84.149:4420`
-- 5×NVMe 组 raid0（`URMA_RAID0`，~34.93 TiB / 38407505182720 B）
-- 子系统 JSON 里设 `capsule_transport=urma`（target 侧靠这个，不是 env）
+**第 2 步：接管 5 块空闲盘 → 起 target**（把上一步选的 5 块盘名填进 `-d`）：
 
-验收：node3 `ss -tlnp | grep 4420` 有监听。
+```bash
+cd /home/yin/nof/spdk
+sudo ./target_nvme_takeover.sh \
+  -d nvmeXn1,nvmeYn1,nvmeZn1,nvmeUn1,nvmeVn1 \   # ← 现查的 5 块空闲盘名（逗号分隔）
+  -p urma \                  # capsule 走 urma，与 initiator SPDK_URMA_CAPSULE_TRANSPORT=urma 一致（ADR-002）
+  -R 4096 \                  # 5 盘合 raid0（strip 4MB）→ 单 namespace nsid 1（URMA_RAID0）
+  -I 8192,8192,640,4194304 \ # iobuf 池：small 8192×8192B / large 640×4MB
+  -O 4194304 \               # transport max_io_size=4MB（大 I/O 路径）→ initiator 也要 SPDK_URMA_MAX_IO_SIZE=4194304
+  -C 64 \                    # 每 PG large iobuf 缓存 64（钉地址，防注册缓存崩塌）
+  -m 0x3f \                  # nvmf_tgt core mask（6 核）
+  -s 10 \                    # target 每 10s 打点一次
+  -N udmac0d1e2 \            # URMA 设备名
+  -L /home/tong/umdk_gpu_isolated/lib \  # URMA 库目录（须成套含 liburma + liburma_common）
+  -i 141.61.84.149           # listener IP（node3）
+```
+
+脚本跑完打印 `Target 就绪` + subsystem / listener / iobuf 汇总，产物：
+- subsystem `nqn.2026-01.io.spdk:urma-gpu-test`，listener `141.61.84.149:4420 (URMA)`，capsule `urma`
+- 5×NVMe → `URMA_RAID0`（raid0）→ 单 namespace nsid 1，~34.93 TiB
+- nvmf_tgt 后台运行，日志 `/tmp/nvmf_tgt.log`，PID `/var/tmp/nvmf_tgt.pid`
+
+验收：脚本末尾 `Target 就绪` + `ss -tlnp | grep 4420` 有监听。
+
+停止：`kill $(cat /var/tmp/nvmf_tgt.pid)`。RPC 配置不持久化，**node3 重启后重跑本脚本**。
+失败中断后补救：`sudo ./target_nvme_takeover.sh -r`（把残留盘还原回 nvme 驱动后退出）。
 
 ---
 
@@ -182,7 +211,7 @@ SPDK_URMA_DEV_NAME=udmac0d1e2 ./nvmf_tgt -m 0x3 --wait-for-rpc &
 ```bash
 cd /home/yin/nof/mooncake/mooncake-store/build/mooncake-store/src
 
-SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma ./mooncake_master \
+SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma SPDK_URMA_MAX_IO_SIZE=4194304 ./mooncake_master \
   --rpc_port=50061 \
   --enable_http_metadata_server --http_metadata_server_port=9998 \
   --metrics_port=9004 \
@@ -240,14 +269,14 @@ curl -s http://127.0.0.1:9998/metadata | head    # 200 响应即可
 cd /home/yin/nof/mooncake/mooncake-store/build/mooncake-store/benchmarks
 
 # 首次（无 hard_pin，约 253 MB/s —— 仅冒烟，不作为吞吐基准）
-SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma ./stress_cluster_bench \
+SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma SPDK_URMA_MAX_IO_SIZE=4194304 ./stress_cluster_bench \
   --scenario=segment_write --protocol=tcp \
   --local_hostname=141.61.84.151:50071 --remote_hostname=141.61.84.151:50061 \
   --segment_name=test_nof_segment --num_keys=256 --value_size=4194304 \
   --nof_replica_num=1 --wait_seconds=300
 
 # 正式（--hard_pin=true，约 2.0~2.3 GB/s）
-SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma ./stress_cluster_bench \
+SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma SPDK_URMA_MAX_IO_SIZE=4194304 ./stress_cluster_bench \
   --scenario=segment_write --protocol=tcp \
   --local_hostname=141.61.84.151:50071 --remote_hostname=141.61.84.151:50061 \
   --segment_name=test_nof_segment --num_keys=256 --value_size=4194304 \
@@ -276,7 +305,7 @@ Total data: 1.00 GB | Throughput (avg): 2015.02 MB/s (1.97 GB/s)
 ### 10.1 单 key warmup 读（验证 NoF 读通路）
 
 ```bash
-SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma ./stress_cluster_bench \
+SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma SPDK_URMA_MAX_IO_SIZE=4194304 ./stress_cluster_bench \
   --scenario=segment_read --protocol=tcp \
   --local_hostname=141.61.84.151:50072 --remote_hostname=141.61.84.151:50061 \
   --segment_name=test_nof_segment --num_keys=256 --value_size=4194304 \
@@ -317,7 +346,7 @@ batch_get_into_breakdown ... read_us[35654637] mem_ops[32] disk_ops[0] success[0
 ## 11. 冒烟：list_segments
 
 ```bash
-SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma ./stress_cluster_bench \
+SPDK_URMA_DEV_NAME=udmac0d1e2 SPDK_URMA_CAPSULE_TRANSPORT=urma SPDK_URMA_MAX_IO_SIZE=4194304 ./stress_cluster_bench \
   --scenario=list_segments --protocol=tcp \
   --local_hostname=141.61.84.151:50071 --remote_hostname=141.61.84.151:50061
 ```
