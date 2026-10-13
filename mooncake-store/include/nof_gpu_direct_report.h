@@ -31,12 +31,16 @@ bool NofGpuDirectAvailable();
  *     计数口径：cuda_io_submitted 是**提交口径**（SubmitRequest 返回成功
  *     即计数），>0 仅说明 SPDK 接受过 CUDA memory-domain I/O 提交，不证明
  *     请求最终完成成功；cuda_io_success 是**完成口径**（SPDK completion
- *     无错误计数），是 GPU I/O 真正成功的证据。两者不可混用。
+ *     无错误计数），是 GPU I/O 真正成功的证据。两者不可混用。注意
+ *     cuda_io_success 按 SPDK 子任务 chunk 计，不是完整 value/object 数，
+ *     验收时结合 bench 的操作成功/失败统计解读。
  *   - GPU Direct 过程统计：dmabuf_exports（CUDA DMA-BUF 导出成功次数，
  *     导出后 SPDK 注册仍可能失败或回退 peer-memory，注册结果看
  *     spdk_urma_regs.dmabuf）/ gpu_staging_fallbacks / staged_bytes
- *   - SPDK URMA 注册统计：host / accelerator / dmabuf / peer_memory /
- *     failures
+ *   - SPDK URMA 注册统计：host / accelerator_attempts（**尝试数**——
+ *     SPDK 在 provider 检查与注册之前即递增，nvme_urma_common.c:368；
+ *     注册成功 = dmabuf + peer_memory，失败看 failures）/
+ *     dmabuf / peer_memory / failures
  */
 std::string NofGpuDirectAcceptanceReport();
 

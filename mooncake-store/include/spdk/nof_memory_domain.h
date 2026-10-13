@@ -97,6 +97,9 @@ class NofMemoryDomainManager {
         }
     }
     /// SPDK completion 处调用；仅统计 CUDA I/O 的无错误完成。
+    /// 注意粒度：按 SPDK 子任务 chunk 计（每次 chunk completion 一次，
+    /// 与 OnIoSubmitted 的粒度对称），不是完整 value/object 数——验收时
+    /// 需结合 bench 的操作成功/失败统计解读。
     void OnIoCompleted(const NofBufferInfo &info, bool success) {
         if (success && info.type == NofMemoryType::kCuda) {
             cuda_io_success_total_.fetch_add(1, std::memory_order_relaxed);

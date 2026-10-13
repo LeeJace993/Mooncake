@@ -327,10 +327,11 @@ std::string NofGpuDirectAcceptanceReport() {
     oss << "\ngpu_direct_io: dmabuf_exports=" << mgr.dmabuf_export_total()
         << " gpu_staging_fallbacks=" << mgr.gpu_staging_fallback_total()
         << " staged_bytes=" << mgr.payload_staged_bytes();
-    // SPDK URMA 注册统计：accelerator_registrations 是 GPU 内存经 URMA
-    // 注册（peer-memory 或 dmabuf）成功的次数。
+    // SPDK URMA 注册统计。注意 accelerator 是**尝试数**：SPDK 在 provider
+    // 检查与 URMA 注册之前就递增（nvme_urma_common.c:368），注册成功 =
+    // dmabuf + peer_memory（:408/:431），失败看 failures（:379/:386/:435）。
     oss << "\nspdk_urma_regs: host=" << stats.host_registrations
-        << " accelerator=" << stats.accelerator_registrations
+        << " accelerator_attempts=" << stats.accelerator_registrations
         << " dmabuf=" << stats.dmabuf_registrations
         << " peer_memory=" << stats.peer_memory_registrations
         << " failures=" << stats.registration_failures;

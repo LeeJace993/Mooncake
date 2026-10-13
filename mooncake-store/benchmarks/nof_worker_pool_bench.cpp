@@ -875,6 +875,9 @@ int ReportUrmaMemoryStats(bool require_dmabuf) {
     mooncake::NofMemoryDomainManager::GetUrmaMemoryStats(&stats);
     auto &manager = mooncake::NofMemoryDomainManager::GetInstance();
     std::cout << "urma_host_registrations=" << stats.host_registrations << "\n";
+    // accelerator_registrations 是注册尝试数（SPDK 在 provider 检查与
+    // 注册之前即递增，nvme_urma_common.c:368）；成功看 dmabuf +
+    // peer_memory，失败看 urma_registration_failures。
     std::cout << "urma_accelerator_registrations="
               << stats.accelerator_registrations << "\n";
     std::cout << "urma_dmabuf_registrations=" << stats.dmabuf_registrations
