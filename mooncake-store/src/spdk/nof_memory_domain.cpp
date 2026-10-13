@@ -3,6 +3,7 @@
  * Modified By Yida (v3): NoF GPU Direct 实现，见 nof_memory_domain.h。
  */
 #include "spdk/nof_memory_domain.h"
+#include "nof_gpu_direct_report.h"
 
 #include <glog/logging.h>
 
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <sstream>
 #include <strings.h>
 
 #include "device/accelerator_device.h"
@@ -292,6 +294,42 @@ NofBufferInfo NofMemoryDomainManager::ResolveBuffer(void *ptr, size_t length) {
 void NofMemoryDomainManager::GetUrmaMemoryStats(
     struct spdk_nvme_urma_memory_stats *stats) {
     spdk_nvme_urma_get_memory_stats(stats);
+}
+
+bool NofGpuDirectAvailable() {
+    return NofMemoryDomainManager::GetInstance().IsGpuDirectAvailable();
+}
+
+std::string NofGpuDirectAcceptanceReport() {
+    const auto &mgr = NofMemoryDomainManager::GetInstance();
+    struct spdk_nvme_urma_memory_stats stats {};
+    NofMemoryDomainManager::GetUrmaMemoryStats(&stats);
+
+    std::ostringstream oss;
+    oss << "gpu_direct_available="
+        << (mgr.IsGpuDirectAvailable() ? "yes" : "no");
+#if defined(USE_NOF_GPU_DIRECT)
+    oss << " reg_mode=" << GetRegModeFromEnv();
+#endif
+    // buffer-domain 识别结果：cuda_io>0 才是 SPDK 以 CUDA memory domain
+    // 提交过 I/O 的直接证据（审阅 #3：不能凭 bench 打印 gdr-peermem 认定）。
+    oss << "\nbuffer_domain: host_io=" << mgr.host_io_total()
+        << " cuda_io=" << mgr.cuda_io_total()
+        << " classify_fail=" << mgr.classify_fail_total();
+    // GPU Direct 过程统计：staging 回退与 staged 字节应恒为 0（严格错误
+    // 策略下出现即异常）。
+    oss << "\ngpu_direct_io: dmabuf_registrations="
+        << mgr.dmabuf_registration_total()
+        << " gpu_staging_fallbacks=" << mgr.gpu_staging_fallback_total()
+        << " staged_bytes=" << mgr.payload_staged_bytes();
+    // SPDK URMA 注册统计：accelerator_registrations 是 GPU 内存经 URMA
+    // 注册（peer-memory 或 dmabuf）成功的次数。
+    oss << "\nspdk_urma_regs: host=" << stats.host_registrations
+        << " accelerator=" << stats.accelerator_registrations
+        << " dmabuf=" << stats.dmabuf_registrations
+        << " peer_memory=" << stats.peer_memory_registrations
+        << " failures=" << stats.registration_failures;
+    return oss.str();
 }
 
 }  // namespace mooncake

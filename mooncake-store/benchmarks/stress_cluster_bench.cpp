@@ -25,6 +25,7 @@
 #include "cuda_alike.h"
 #include "master_client.h"
 #include "mooncake_logging.h"
+#include "nof_gpu_direct_report.h"
 #include "real_client.h"
 #include "ub_allocator.h"
 
@@ -281,7 +282,9 @@ DEFINE_uint64(shuffle_seed, 0,
 
 DEFINE_string(gpu_mode, "",
               "GPU link mode: gdr-peermem | staging. Empty/host = CPU buffer. "
-              "writer ignores this (host only).");
+              "Supported for both roles: reader gets into the GPU buffer; "
+              "writer (and segment_write/remove prefill) puts from it "
+              "(GPU-source writes).");
 DEFINE_int32(gpu_device, 0,
              "GPU device index for gpu_mode (gdr-peermem/staging). Default 0. "
              "Ignored when gpu_mode is empty/host.");
@@ -990,8 +993,25 @@ class StressBenchmark {
         std::vector<size_t> seg_failed(segments.size(), 0);
         std::vector<mooncake::ReplicateConfig> configs(segments.size());
         for (size_t s = 0; s < segments.size(); ++s) {
-            configs[s] = MakeReplicateConfig();
-            SetPreferredSegment(configs[s], segments[s]);
+            configs[s] = MakeSegmentReplicateConfig(segments[s]);
+        }
+
+        {
+            size_t memory_cnt = 0;
+            size_t nof_cnt = 0;
+            for (const auto& segment : segments) {
+                if (segment.kind == SegmentKind::NOF) {
+                    ++nof_cnt;
+                } else {
+                    ++memory_cnt;
+                }
+            }
+            LOG(INFO) << "Replica isolation active: memory segment put -> "
+                      << "memory replicas only (--replica_num="
+                      << FLAGS_replica_num << ", nof=0); NoF segment put -> "
+                      << "NoF replicas only (--nof_replica_num="
+                      << FLAGS_nof_replica_num << ", mem=0). Segments: "
+                      << memory_cnt << " memory, " << nof_cnt << " NoF";
         }
 
         BenchmarkStats put_stats;
@@ -1572,11 +1592,11 @@ class StressBenchmark {
         }
 
         // Phase 1: prefill each segment with the same key layout and placement
-        // preferences as RunSegmentWrite.
+        // preferences as RunSegmentWrite (with the same per-segment replica
+        // isolation so prefill matches segment_write measurements).
         std::vector<mooncake::ReplicateConfig> configs(remove_segments.size());
         for (size_t s = 0; s < remove_segments.size(); ++s) {
-            configs[s] = MakeReplicateConfig();
-            SetPreferredSegment(configs[s], remove_segments[s]);
+            configs[s] = MakeSegmentReplicateConfig(remove_segments[s]);
         }
 
         BenchmarkStats put_stats;
@@ -1749,6 +1769,27 @@ class StressBenchmark {
         } else {
             config.preferred_segments = {segment.name};
         }
+    }
+
+    // External review #1: segment 场景的副本隔离。全局 --replica_num /
+    // --nof_replica_num 若同时生效于每个 put，memory segment 的 put 也会申请
+    // NoF 副本、NoF segment 的 put 也会申请 memory 副本，按 segment 统计的
+    // PUT latency/成功数就无法按单一存储路径解释。这里按 segment 类型强制
+    // 只保留对应类型的副本数：memory segment → 仅 memory 副本，NoF segment
+    // → 仅 NoF SSD 副本（master 侧 replica_num/nof_replica_num 为 0 时跳过
+    // 对应类型的分配，语义安全）。因此既可一次运行同时覆盖两类 segment，
+    // 也可按审阅建议分开运行（--replica_num=1 --nof_replica_num=0 测
+    // memory，--replica_num=0 --nof_replica_num=1 测 NoF），结果等价。
+    static mooncake::ReplicateConfig MakeSegmentReplicateConfig(
+        const BenchmarkSegment& segment) {
+        mooncake::ReplicateConfig config = MakeReplicateConfig();
+        SetPreferredSegment(config, segment);
+        if (segment.kind == SegmentKind::NOF) {
+            config.replica_num = 0;
+        } else {
+            config.nof_replica_num = 0;
+        }
+        return config;
     }
 
     static void RecordPutResult(ThreadResult& result, int64_t latency_ns,
@@ -2203,15 +2244,19 @@ int main(int argc, char* argv[]) {
     }
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (FLAGS_role == "writer" && !FLAGS_gpu_mode.empty() &&
-        FLAGS_gpu_mode != "host") {
-        LOG(FATAL) << "writer role does not support --gpu_mode (host only); "
-                   << "got --gpu_mode=" << FLAGS_gpu_mode;
-    }
-
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
     ValidateGpuDevice(gpu_config);
     ApplyGpuEnv(gpu_config);
+
+    // External review #2: GPU 写入是显式路径，不靠 role 绕行。writer（含
+    // segment_write/remove 预填等直接写场景）带 --gpu_mode 时即从 GPU buffer
+    // 发起 put（GPU-source write），Setup/FillBuffer/put 路径均已支持。
+    if (gpu_config.use_gpu_buffer && FLAGS_role == "writer") {
+        LOG(INFO) << "GPU-source write path enabled: writer role with "
+                  << "gpu_mode=" << gpu_config.mode
+                  << " will put from a GPU buffer (scenario="
+                  << FLAGS_scenario << ")";
+    }
 
     const char* verbose_env = std::getenv("MC_VERBOSE");
     if (verbose_env) {
@@ -2254,6 +2299,42 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
     LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
               << "s";
+    {
+        // External review #3: 编译开关进入验收输出。SPDK 侧 GPU Direct 依赖
+        // USE_NOF_URMA/USE_NOF_GPU_DIRECT 独立构建，与 UB transport 的
+        // --gpu_mode（USE_CUDA/USE_UB）是两套路径。
+        std::string build_flags;
+#if defined(USE_NOF)
+        build_flags += " USE_NOF=ON";
+#else
+        build_flags += " USE_NOF=OFF";
+#endif
+#if defined(USE_NOF_URMA)
+        build_flags += " USE_NOF_URMA=ON";
+#else
+        build_flags += " USE_NOF_URMA=OFF";
+#endif
+#if defined(USE_NOF_GPU_DIRECT)
+        build_flags += " USE_NOF_GPU_DIRECT=ON";
+#else
+        build_flags += " USE_NOF_GPU_DIRECT=OFF";
+#endif
+#if defined(USE_CUDA)
+        build_flags += " USE_CUDA=ON";
+#else
+        build_flags += " USE_CUDA=OFF";
+#endif
+#if defined(USE_UB)
+        build_flags += " USE_UB=ON";
+#else
+        build_flags += " USE_UB=OFF";
+#endif
+        LOG(INFO) << "  Build switches:" << build_flags;
+    }
+#if defined(USE_NOF_URMA)
+    LOG(INFO) << "  NoF GPU Direct available: "
+              << (mooncake::NofGpuDirectAvailable() ? "yes" : "no");
+#endif
 
     // Listing is read-only. Do not mount the benchmark's own memory segment
     // before taking a snapshot of the segments already registered with Master.
@@ -2299,5 +2380,12 @@ int main(int argc, char* argv[]) {
     }
 
     ret = bench.Run();
+#if defined(USE_NOF_URMA)
+    // External review #3: 验收输出——buffer-domain 识别结果与 SPDK URMA
+    // 统计。判定 SPDK 真正用了 GPU I/O 的证据是 cuda_io>0 且 urma
+    // accelerator_registrations>0，而不是 bench 打印了 gdr-peermem。
+    LOG(INFO) << "NoF GPU Direct acceptance report:\n"
+              << mooncake::NofGpuDirectAcceptanceReport();
+#endif
     return ret;
 }
