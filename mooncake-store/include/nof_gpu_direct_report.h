@@ -24,12 +24,17 @@ bool NofGpuDirectAvailable();
 /**
  * @brief 一次性验收输出（多行，无尾随换行）。
  *
- * 内容（对应审阅意见 #3）：
+ * 内容（对应审阅意见 #3 及其复审）：
  *   - gpu_direct_available / reg_mode（MC_NOF_GPU_REG_MODE）
- *   - buffer-domain 识别统计：host_io / cuda_io / classify_fail
- *     （cuda_io>0 才是 SPDK 真正以 CUDA memory domain 提交过 I/O 的证据）
- *   - GPU Direct 过程统计：dmabuf_registrations / gpu_staging_fallbacks /
- *     staged_bytes
+ *   - buffer-domain 识别统计：host_io / cuda_io_submitted /
+ *     cuda_io_success / classify_fail。
+ *     计数口径：cuda_io_submitted 是**提交口径**（SubmitRequest 返回成功
+ *     即计数），>0 仅说明 SPDK 接受过 CUDA memory-domain I/O 提交，不证明
+ *     请求最终完成成功；cuda_io_success 是**完成口径**（SPDK completion
+ *     无错误计数），是 GPU I/O 真正成功的证据。两者不可混用。
+ *   - GPU Direct 过程统计：dmabuf_exports（CUDA DMA-BUF 导出成功次数，
+ *     导出后 SPDK 注册仍可能失败或回退 peer-memory，注册结果看
+ *     spdk_urma_regs.dmabuf）/ gpu_staging_fallbacks / staged_bytes
  *   - SPDK URMA 注册统计：host / accelerator / dmabuf / peer_memory /
  *     failures
  */

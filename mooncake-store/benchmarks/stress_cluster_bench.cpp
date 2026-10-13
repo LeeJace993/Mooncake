@@ -2382,8 +2382,9 @@ int main(int argc, char* argv[]) {
     ret = bench.Run();
 #if defined(USE_NOF_URMA)
     // External review #3: 验收输出——buffer-domain 识别结果与 SPDK URMA
-    // 统计。判定 SPDK 真正用了 GPU I/O 的证据是 cuda_io>0 且 urma
-    // accelerator_registrations>0，而不是 bench 打印了 gdr-peermem。
+    // 统计。cuda_io_submitted>0 且 urma accelerator_registrations>0 说明
+    // SPDK 接受过 GPU memory-domain I/O 提交（提交口径，不等于完成成功）；
+    // 提交≠完成，最终成功以 cuda_io_success 为准。
     LOG(INFO) << "NoF GPU Direct acceptance report:\n"
               << mooncake::NofGpuDirectAcceptanceReport();
 #endif

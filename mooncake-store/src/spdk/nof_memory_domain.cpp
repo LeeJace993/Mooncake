@@ -139,8 +139,10 @@ int NofCudaExportDmabuf(void *provider_ctx, void *pin_handle, int *fd,
     *fd = dmabuf_fd;
     *offset = static_cast<uint64_t>(reinterpret_cast<CUdeviceptr>(handle->orig_addr) -
                                     handle->alloc_base);
-    // Modified By Yida (v3): 验收指标——export 成功即一次 DMA-BUF 注册尝试
-    NofMemoryDomainManager::GetInstance().OnDmabufRegistration();
+    // Modified By Yida (v3): 验收指标——export 成功即一次 DMA-BUF 导出
+    // （注意：导出后 SPDK 注册仍可能失败或回退 peer-memory，注册结果看
+    // spdk_urma_regs.dmabuf，见外部审阅计数口径复审）
+    NofMemoryDomainManager::GetInstance().OnDmabufExport();
     return 0;
 }
 
@@ -311,15 +313,18 @@ std::string NofGpuDirectAcceptanceReport() {
 #if defined(USE_NOF_GPU_DIRECT)
     oss << " reg_mode=" << GetRegModeFromEnv();
 #endif
-    // buffer-domain 识别结果：cuda_io>0 才是 SPDK 以 CUDA memory domain
-    // 提交过 I/O 的直接证据（审阅 #3：不能凭 bench 打印 gdr-peermem 认定）。
+    // buffer-domain 识别结果（计数口径，外部审阅 #3 复审）：
+    // cuda_io_submitted>0 仅说明 SPDK 接受过 CUDA memory-domain I/O 提交
+    // （SubmitRequest 返回成功）；提交≠完成，最终成功以 cuda_io_success
+    // （completion 无错误计数）为准。
     oss << "\nbuffer_domain: host_io=" << mgr.host_io_total()
-        << " cuda_io=" << mgr.cuda_io_total()
+        << " cuda_io_submitted=" << mgr.cuda_io_submitted_total()
+        << " cuda_io_success=" << mgr.cuda_io_success_total()
         << " classify_fail=" << mgr.classify_fail_total();
     // GPU Direct 过程统计：staging 回退与 staged 字节应恒为 0（严格错误
-    // 策略下出现即异常）。
-    oss << "\ngpu_direct_io: dmabuf_registrations="
-        << mgr.dmabuf_registration_total()
+    // 策略下出现即异常）。dmabuf_exports 是 CUDA DMA-BUF 导出成功次数，
+    // 注册是否成功看 spdk_urma_regs.dmabuf。
+    oss << "\ngpu_direct_io: dmabuf_exports=" << mgr.dmabuf_export_total()
         << " gpu_staging_fallbacks=" << mgr.gpu_staging_fallback_total()
         << " staged_bytes=" << mgr.payload_staged_bytes();
     // SPDK URMA 注册统计：accelerator_registrations 是 GPU 内存经 URMA

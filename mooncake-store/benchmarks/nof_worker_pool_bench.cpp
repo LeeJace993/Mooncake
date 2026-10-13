@@ -884,11 +884,16 @@ int ReportUrmaMemoryStats(bool require_dmabuf) {
     std::cout << "urma_registration_failures=" << stats.registration_failures
               << "\n";
     std::cout << "nof_host_io_total=" << manager.host_io_total() << "\n";
-    std::cout << "nof_cuda_io_total=" << manager.cuda_io_total() << "\n";
+    // 计数口径（外部审阅 #3 复审）：submitted=提交口径（SubmitRequest
+    // 返回成功），success=完成口径（SPDK completion 无错误）。
+    std::cout << "nof_cuda_io_submitted=" << manager.cuda_io_submitted_total()
+              << "\n";
+    std::cout << "nof_cuda_io_success=" << manager.cuda_io_success_total()
+              << "\n";
     std::cout << "nof_classify_fail_total=" << manager.classify_fail_total()
               << "\n";
-    std::cout << "nof_dmabuf_registration_total="
-              << manager.dmabuf_registration_total() << "\n";
+    std::cout << "nof_dmabuf_export_total=" << manager.dmabuf_export_total()
+              << "\n";
     std::cout << "nof_gpu_staging_fallback_total="
               << manager.gpu_staging_fallback_total() << "\n";
     std::cout << "nof_payload_staged_bytes=" << manager.payload_staged_bytes()

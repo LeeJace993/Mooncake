@@ -63,12 +63,24 @@ class NofMemoryDomainManager {
     /// GPU Direct 是否可用（CUDA provider + 至少一张可用 GPU）
     bool IsGpuDirectAvailable() const;
 
-    /// 验收指标（8.9.7）
+    /// 验收指标（8.9.7）。计数口径（外部审阅 #3 复审）：
+    ///   - host_io_total / cuda_io_submitted_total：**提交口径**——
+    ///     SubmitRequest 返回成功即计数，证明 SPDK 接受过对应 memory
+    ///     domain 的 I/O 提交，不证明请求最终完成成功。
+    ///   - cuda_io_success_total：**完成口径**——SPDK completion 无错误
+    ///     时计数（nvmf_io_complete），是 GPU I/O 真正成功的证据。
     uint64_t host_io_total() const { return host_io_total_.load(std::memory_order_relaxed); }
-    uint64_t cuda_io_total() const { return cuda_io_total_.load(std::memory_order_relaxed); }
+    uint64_t cuda_io_submitted_total() const {
+        return cuda_io_submitted_total_.load(std::memory_order_relaxed);
+    }
+    uint64_t cuda_io_success_total() const {
+        return cuda_io_success_total_.load(std::memory_order_relaxed);
+    }
     uint64_t classify_fail_total() const { return classify_fail_total_.load(std::memory_order_relaxed); }
-    uint64_t dmabuf_registration_total() const {
-        return dmabuf_registration_total_.load(std::memory_order_relaxed);
+    /// CUDA DMA-BUF 导出成功次数（导出后 SPDK 注册仍可能失败或回退
+    /// peer-memory，注册结果看 SPDK URMA 统计的 dmabuf_registrations）。
+    uint64_t dmabuf_export_total() const {
+        return dmabuf_export_total_.load(std::memory_order_relaxed);
     }
     uint64_t gpu_staging_fallback_total() const {
         return gpu_staging_fallback_total_.load(std::memory_order_relaxed);
@@ -79,14 +91,20 @@ class NofMemoryDomainManager {
 
     void OnIoSubmitted(const NofBufferInfo &info) {
         if (info.type == NofMemoryType::kCuda) {
-            cuda_io_total_.fetch_add(1, std::memory_order_relaxed);
+            cuda_io_submitted_total_.fetch_add(1, std::memory_order_relaxed);
         } else if (info.type == NofMemoryType::kHost) {
             host_io_total_.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    /// SPDK completion 处调用；仅统计 CUDA I/O 的无错误完成。
+    void OnIoCompleted(const NofBufferInfo &info, bool success) {
+        if (success && info.type == NofMemoryType::kCuda) {
+            cuda_io_success_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     void OnClassifyFail() { classify_fail_total_.fetch_add(1, std::memory_order_relaxed); }
-    void OnDmabufRegistration() {
-        dmabuf_registration_total_.fetch_add(1, std::memory_order_relaxed);
+    void OnDmabufExport() {
+        dmabuf_export_total_.fetch_add(1, std::memory_order_relaxed);
     }
     void OnGpuStagingFallback() {
         gpu_staging_fallback_total_.fetch_add(1, std::memory_order_relaxed);
@@ -109,9 +127,10 @@ class NofMemoryDomainManager {
     bool provider_registered_ = false;
 
     std::atomic<uint64_t> host_io_total_{0};
-    std::atomic<uint64_t> cuda_io_total_{0};
+    std::atomic<uint64_t> cuda_io_submitted_total_{0};
+    std::atomic<uint64_t> cuda_io_success_total_{0};
     std::atomic<uint64_t> classify_fail_total_{0};
-    std::atomic<uint64_t> dmabuf_registration_total_{0};
+    std::atomic<uint64_t> dmabuf_export_total_{0};
     std::atomic<uint64_t> gpu_staging_fallback_total_{0};
     std::atomic<uint64_t> payload_staged_bytes_{0};
 };
