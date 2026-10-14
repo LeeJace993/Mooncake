@@ -2883,6 +2883,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -2892,6 +2903,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -2908,7 +2920,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
+        if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
         auto results = BatchPutWhenPreferSameNode(ops);
+        if (breakdown_log) {
+            transfer_end = std::chrono::steady_clock::now();
+            put_end_end = transfer_end;
+        }
         const bool any_succeeded =
             std::any_of(results.begin(), results.end(),
                         [](const auto& result) { return result.has_value(); });
@@ -2916,6 +2933,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return results;
     }
     StartBatchPut(ops, client_cfg);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -2926,12 +2944,46 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     FinalizeBatchPut(ops);
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
     auto results = CollectResults(ops);
     const bool any_succeeded =
         std::any_of(results.begin(), results.end(),
                     [](const auto& result) { return result.has_value(); });
+    if (breakdown_log) {
+        size_t total_bytes = 0;
+        size_t success_count = 0;
+        for (const auto& slices : batched_slices) {
+            for (const auto& slice : slices) total_bytes += slice.size;
+        }
+        for (const auto& result : results) {
+            if (result.has_value()) ++success_count;
+        }
+        const char* status = success_count == results.size() ? "ok"
+                             : success_count == 0            ? "err"
+                                                             : "partial";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_batch_put_breakdown trace_id=" << trace_id
+                     << " keys=" << keys.size() << " bytes=" << total_bytes
+                     << " prepare_us="
+                     << elapsed_us(breakdown_start, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us="
+                     << elapsed_us(transfer_end, put_end_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, put_end_end)
+                     << " success=" << success_count
+                     << " status=" << status;
+    }
     pt_full.End(any_succeeded ? 0 : -1);
     return results;
 }

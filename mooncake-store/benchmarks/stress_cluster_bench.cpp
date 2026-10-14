@@ -938,8 +938,13 @@ class StressBenchmark {
         LOG(INFO) << "Write phase complete";
         FinishMeasurement("local_memory_write");
         put_stats.Finalize();
-        put_stats.Print("LOCAL MEMORY PUT BENCHMARK", 1,
-                        "put_from / automatic per-object strategy");
+        put_stats.Print(
+            "LOCAL MEMORY PUT BENCHMARK",
+            MaxEffectiveBatchSize(FLAGS_num_keys, FLAGS_num_threads,
+                                  FLAGS_batch_size),
+            FLAGS_batch_size > 1
+                ? "batch_put_from / automatic batch strategy"
+                : "put_from / automatic per-object strategy");
         if (put_stats.total_failed() != 0) return 1;
 
         int warmup_ret = DoWarmup();
@@ -2418,28 +2423,80 @@ class StressBenchmark {
             threads.emplace_back([&, t, my_keys, key_offset, key_func]() {
                 bindToSocket(t % NR_SOCKETS);
                 ThreadResult& result = stats.GetThreadResult(t);
-                result.latencies_ns.reserve(my_keys);
+                result.latencies_ns.reserve(
+                    (my_keys + FLAGS_batch_size - 1) / FLAGS_batch_size);
                 char* write_buffer = thread_buffers_[t].ptr;
 
                 if (!FLAGS_verify) FillBuffer(write_buffer, t);
                 ready_latch.count_down();
                 start_latch.arrive_and_wait();
-                for (size_t i = 0; i < my_keys; ++i) {
-                    const size_t key_idx = key_offset + i;
-                    const std::string key = key_func(key_idx);
-                    if (FLAGS_verify) FillBuffer(write_buffer, key_idx);
+                if (FLAGS_batch_size <= 1) {
+                    for (size_t i = 0; i < my_keys; ++i) {
+                        const size_t key_idx = key_offset + i;
+                        const std::string key = key_func(key_idx);
+                        if (FLAGS_verify) FillBuffer(write_buffer, key_idx);
 
-                    const auto t0 = Clock::now();
-                    const int ret = client_->put_from(
-                        key, write_buffer, FLAGS_value_size, config);
-                    const auto t1 = Clock::now();
-                    if (ret == 0) {
-                        AccountMeasuredIo(key, FLAGS_value_size, true);
-                    } else {
-                        LOG(ERROR) << "put_from failed for key=" << key
-                                   << " ret=" << ret;
+                        const auto t0 = Clock::now();
+                        const int ret = client_->put_from(
+                            key, write_buffer, FLAGS_value_size, config);
+                        const auto t1 = Clock::now();
+                        if (ret == 0) {
+                            AccountMeasuredIo(key, FLAGS_value_size, true);
+                        } else {
+                            LOG(ERROR) << "put_from failed for key=" << key
+                                       << " ret=" << ret;
+                        }
+                        RecordPutResult(result, ElapsedNanos(t0, t1), ret);
                     }
-                    RecordPutResult(result, ElapsedNanos(t0, t1), ret);
+                } else {
+                    size_t i = 0;
+                    while (i < my_keys) {
+                        const size_t batch_end =
+                            std::min(i + FLAGS_batch_size, my_keys);
+                        std::vector<std::string> keys;
+                        std::vector<void*> buffers;
+                        std::vector<size_t> sizes;
+                        keys.reserve(batch_end - i);
+                        buffers.reserve(batch_end - i);
+                        sizes.reserve(batch_end - i);
+
+                        for (size_t j = i; j < batch_end; ++j) {
+                            const size_t key_idx = key_offset + j;
+                            char* key_buffer =
+                                write_buffer + (j - i) * FLAGS_value_size;
+                            if (FLAGS_verify) {
+                                FillBuffer(key_buffer, key_idx);
+                            }
+                            keys.emplace_back(key_func(key_idx));
+                            buffers.emplace_back(key_buffer);
+                            sizes.emplace_back(FLAGS_value_size);
+                        }
+
+                        const auto t0 = Clock::now();
+                        const auto results = client_->batch_put_from(
+                            keys, buffers, sizes, config);
+                        const auto t1 = Clock::now();
+                        result.latencies_ns.emplace_back(
+                            ElapsedNanos(t0, t1));
+                        ++result.total_queries;
+
+                        for (size_t k = 0; k < keys.size(); ++k) {
+                            const int ret =
+                                k < results.size() ? results[k] : -1;
+                            ++result.total_keys;
+                            if (ret == 0) {
+                                result.total_bytes += FLAGS_value_size;
+                                AccountMeasuredIo(keys[k], FLAGS_value_size,
+                                                  true);
+                            } else {
+                                ++result.failed_ops;
+                                LOG(ERROR)
+                                    << "batch_put_from failed for key="
+                                    << keys[k] << " ret=" << ret;
+                            }
+                        }
+                        i = batch_end;
+                    }
                 }
                 done_latch.arrive_and_wait();
             });
