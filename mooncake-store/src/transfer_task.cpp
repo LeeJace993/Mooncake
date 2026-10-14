@@ -1281,35 +1281,107 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
-    for (size_t i = 0; i < replicas.size(); ++i) {
-        auto& replica = replicas[i];
-        auto& slices = all_slices[i];
-        auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
-            return std::nullopt;
-        }
-        auto& handle = mem_desc.buffer_descriptor;
-        uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
-        for (auto slice : slices) {
-            TransferRequest request;
-            request.opcode = op_code;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = handle.buffer_address_ + offset;
-            request.length = slice.size;
-            requests.emplace_back(request);
-            offset += slice.size;
-        }
+    if (replicas.empty() || replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Invalid batch transfer: replicas=" << replicas.size()
+                   << " slice_groups=" << all_slices.size();
+        return std::nullopt;
     }
-    future = submitTransfer(requests);
+
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    bool use_local_memcpy = memcpy_enabled_ && memcpy_pool_ != nullptr;
+    size_t total_slices = 0;
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        const auto& replica = replicas[i];
+        const auto& slices = all_slices[i];
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << "Batch transfer only supports memory replicas";
+            return std::nullopt;
+        }
+        const auto& handle =
+            replica.get_memory_descriptor().buffer_descriptor;
+        for (const auto& slice : slices) {
+            if (slice.ptr == nullptr) {
+                LOG(ERROR) << "Batch transfer contains a null slice pointer";
+                return std::nullopt;
+            }
+        }
+        if (!validateTransferParams(handle, slices)) {
+            return std::nullopt;
+        }
+        use_local_memcpy =
+            use_local_memcpy &&
+            selectStrategy(handle, slices) == TransferStrategy::LOCAL_MEMCPY;
+        total_slices += slices.size();
+        for (const auto& slice : slices) total_bytes += slice.size;
+    }
+
+    std::optional<TransferFuture> future;
+    if (use_local_memcpy) {
+        auto state = std::make_shared<MemcpyOperationState>(trace_id);
+        std::vector<MemcpyOperation> operations;
+        operations.reserve(total_slices);
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            uint64_t offset = 0;
+            for (const auto& slice : all_slices[i]) {
+                void* dest = nullptr;
+                const void* src = nullptr;
+                if (op_code == TransferRequest::READ) {
+                    dest = slice.ptr;
+                    src = reinterpret_cast<const void*>(
+                        handle.buffer_address_ + offset);
+                } else {
+                    dest = reinterpret_cast<void*>(handle.buffer_address_ +
+                                                   offset);
+                    src = slice.ptr;
+                }
+                operations.emplace_back(dest, src, slice.size);
+                offset += slice.size;
+            }
+        }
+        MemcpyTask task(std::move(operations), state, trace_id);
+        memcpy_pool_->submitTask(std::move(task));
+        future = TransferFuture(state);
+    } else {
+        std::vector<TransferRequest> requests;
+        requests.reserve(total_slices);
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            uint64_t offset = 0;
+            SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            for (const auto& slice : all_slices[i]) {
+                TransferRequest request;
+                request.opcode = op_code;
+                request.source = static_cast<char*>(slice.ptr);
+                request.target_id = seg;
+                request.target_offset = handle.buffer_address_ + offset;
+                request.length = slice.size;
+                requests.emplace_back(request);
+                offset += slice.size;
+            }
+        }
+        future = submitTransfer(requests);
+    }
+
+    if (mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "batch_transfer_strategy trace_id=" << trace_id
+                     << " strategy="
+                     << (use_local_memcpy ? TransferStrategy::LOCAL_MEMCPY
+                                          : TransferStrategy::TRANSFER_ENGINE)
+                     << " objects=" << replicas.size()
+                     << " slices=" << total_slices << " bytes=" << total_bytes
+                     << " op="
+                     << (op_code == TransferRequest::READ ? "read" : "write");
+    }
+
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {

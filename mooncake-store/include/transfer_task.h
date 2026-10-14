@@ -599,6 +599,8 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset);
 
+    // Co-located memory replicas are combined into one MemcpyTask when local
+    // memcpy is enabled. Mixed or remote batches use TransferEngine.
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
