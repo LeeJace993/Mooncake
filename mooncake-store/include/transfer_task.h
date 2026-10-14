@@ -325,10 +325,15 @@ struct MemcpyTask {
     std::vector<MemcpyOperation> operations;
     std::shared_ptr<MemcpyOperationState> state;
     uint64_t trace_id;
+    std::chrono::steady_clock::time_point submitted_at;
+    size_t queued_ahead = 0;
 
     MemcpyTask(std::vector<MemcpyOperation> ops,
                std::shared_ptr<MemcpyOperationState> s, uint64_t trace)
-        : operations(std::move(ops)), state(std::move(s)), trace_id(trace) {}
+        : operations(std::move(ops)),
+          state(std::move(s)),
+          trace_id(trace),
+          submitted_at(std::chrono::steady_clock::now()) {}
 };
 
 /**

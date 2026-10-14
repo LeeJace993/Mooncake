@@ -789,6 +789,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
+        task.queued_ahead = task_queue_.size();
         task_queue_.push(std::move(task));
     }
     queue_cv_.notify_one();
@@ -820,18 +821,45 @@ void MemcpyWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             mooncake::logging::ScopedTraceId trace(task.trace_id);
+            const bool breakdown_log =
+                mooncake::logging::ShouldSampleHiFreqLog(task.trace_id);
+            const auto worker_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto registry_end = worker_start;
+            int64_t pointer_lookup_us = 0;
+            int64_t copy_us = 0;
+            size_t copied_bytes = 0;
+            ErrorCode result = ErrorCode::TRANSFER_FAIL;
             try {
                 bool ok = true;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
+                if (breakdown_log) {
+                    registry_end = std::chrono::steady_clock::now();
+                }
                 for (const auto& op : task.operations) {
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
+                    const auto lookup_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
                     auto* src_device = runtime_accelerator.FindDeviceForPointer(
                         op.src, &src_info);
                     auto* dst_device = runtime_accelerator.FindDeviceForPointer(
                         op.dest, &dst_info);
+                    if (breakdown_log) {
+                        const auto lookup_end =
+                            std::chrono::steady_clock::now();
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                lookup_end - lookup_start)
+                                .count();
+                    }
 
+                    const auto copy_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
                     if (!src_device && !dst_device) {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
@@ -873,16 +901,47 @@ void MemcpyWorkerPool::workerThread() {
                             break;
                         }
                     }
+                    copied_bytes += op.size;
+                    if (breakdown_log) {
+                        const auto copy_end = std::chrono::steady_clock::now();
+                        copy_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                copy_end - copy_start)
+                                .count();
+                    }
                 }
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
-                task.state->set_completed(ok ? ErrorCode::OK
-                                             : ErrorCode::TRANSFER_FAIL);
+                result = ok ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
+                task.state->set_completed(result);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            }
+            if (breakdown_log) {
+                const auto worker_end = std::chrono::steady_clock::now();
+                auto elapsed_us = [](auto begin, auto end) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(
+                               end - begin)
+                        .count();
+                };
+                MC_LOG(INFO)
+                    << "memcpy_worker_breakdown trace_id=" << task.trace_id
+                    << " operations=" << task.operations.size()
+                    << " bytes=" << copied_bytes
+                    << " queued_ahead=" << task.queued_ahead
+                    << " queue_wait_us="
+                    << elapsed_us(task.submitted_at, worker_start)
+                    << " registry_us="
+                    << elapsed_us(worker_start, registry_end)
+                    << " pointer_lookup_us=" << pointer_lookup_us
+                    << " copy_us=" << copy_us
+                    << " execute_us=" << elapsed_us(worker_start, worker_end)
+                    << " total_us="
+                    << elapsed_us(task.submitted_at, worker_end)
+                    << " status=" << static_cast<int>(result);
             }
         }
     }
