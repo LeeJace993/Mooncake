@@ -25,6 +25,7 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "cuda_alike.h"
+#include "device/accelerator_registry.h"
 #include "master_client.h"
 #include "mooncake_logging.h"
 #include "nof_gpu_direct_report.h"
@@ -90,6 +91,19 @@ static size_t MaxEffectiveBatchSize(size_t total_keys, size_t num_threads,
     const size_t max_keys_per_thread =
         (total_keys + num_threads - 1) / num_threads;
     return std::min(configured_batch_size, max_keys_per_thread);
+}
+
+static void PrewarmAcceleratorDiscovery() {
+    const auto start = std::chrono::steady_clock::now();
+    const auto runtime =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    LOG(INFO) << "Accelerator discovery prewarm complete: devices="
+              << runtime.Devices().size() << " elapsed_ms=" << elapsed_ms
+              << " (excluded from benchmark timing)";
 }
 
 static std::optional<std::string> FetchMasterAdminBody(
@@ -342,6 +356,9 @@ DEFINE_uint64(read_segment_nums, 0,
 DEFINE_uint64(duration, 0,
               "Duration in seconds for continuous reading in local_memory and "
               "segment_read scenarios (0 = read num_keys once)");
+DEFINE_bool(prewarm_accelerator, true,
+            "Probe accelerator availability after client setup and before "
+            "performance timing");
 DEFINE_uint64(statis_interval, 5,
               "Statistics print interval in seconds for segment_read scenario");
 DEFINE_uint64(shuffle_seed, 0,
@@ -3235,6 +3252,10 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(
             std::chrono::seconds(FLAGS_client_init_wait_seconds));
         LOG(INFO) << "Client init wait complete";
+    }
+
+    if (FLAGS_prewarm_accelerator) {
+        PrewarmAcceleratorDiscovery();
     }
 
     ret = bench.Run();
