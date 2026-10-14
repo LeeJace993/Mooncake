@@ -750,6 +750,30 @@ static int GetMemcpyWorkerCount() {
     return worker_count;
 }
 
+static bool IsInlineHostMemcpyEnabled() {
+    static const bool enabled = [] {
+        const char* raw_value = std::getenv("MC_STORE_MEMCPY_INLINE");
+        if (!raw_value || raw_value[0] == '\0') return true;
+
+        std::string normalized(raw_value);
+        std::transform(
+            normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (normalized == "1" || normalized == "true" ||
+            normalized == "yes" || normalized == "on") {
+            return true;
+        }
+        if (normalized == "0" || normalized == "false" ||
+            normalized == "no" || normalized == "off") {
+            return false;
+        }
+        LOG(WARNING) << "Invalid MC_STORE_MEMCPY_INLINE=" << raw_value
+                     << ", defaulting to enabled";
+        return true;
+    }();
+    return enabled;
+}
+
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     const int worker_count = GetMemcpyWorkerCount();
     LOG(INFO) << "Creating MemcpyWorkerPool with " << worker_count
@@ -1209,15 +1233,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
         }
     }
 
-    // Non-local and explicitly disabled configurations do not need idle
-    // memcpy workers. submitMemcpyOperation is reachable only when the local
-    // memcpy strategy is enabled.
+    // Keep workers for accelerator copies and for deployments that explicitly
+    // disable inline host copies.
     if (memcpy_enabled_) {
         memcpy_pool_ = std::make_unique<MemcpyWorkerPool>();
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
+            << memcpy_enabled_
+            << " inline_host_memcpy=" << IsInlineHostMemcpyEnabled();
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -1318,7 +1342,6 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 
     std::optional<TransferFuture> future;
     if (use_local_memcpy) {
-        auto state = std::make_shared<MemcpyOperationState>(trace_id);
         std::vector<MemcpyOperation> operations;
         operations.reserve(total_slices);
         for (size_t i = 0; i < replicas.size(); ++i) {
@@ -1341,9 +1364,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
                 offset += slice.size;
             }
         }
-        MemcpyTask task(std::move(operations), state, trace_id);
-        memcpy_pool_->submitTask(std::move(task));
-        future = TransferFuture(state);
+        future = submitMemcpyOperations(std::move(operations), trace_id);
     } else {
         std::vector<TransferRequest> requests;
         requests.reserve(total_slices);
@@ -1479,8 +1500,6 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         return std::nullopt;
     }
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto state = std::make_shared<MemcpyOperationState>(trace_id);
-
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
@@ -1509,13 +1528,110 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         operations.emplace_back(dest, src, slice.size);
     }
 
-    // Submit memcpy operations to worker pool for async execution
+    return submitMemcpyOperations(std::move(operations), trace_id);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
+    std::vector<MemcpyOperation> operations, uint64_t trace_id) {
+    if (!memcpy_pool_) {
+        LOG(ERROR) << "Memcpy operation selected while memcpy is disabled";
+        return std::nullopt;
+    }
+
+    auto state = std::make_shared<MemcpyOperationState>(trace_id);
+    if (IsInlineHostMemcpyEnabled()) {
+        const bool breakdown_log =
+            mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+        const auto inline_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        auto registry_end = inline_start;
+        int64_t pointer_lookup_us = 0;
+        int64_t copy_us = 0;
+        size_t copied_bytes = 0;
+        bool host_only = true;
+
+        try {
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (breakdown_log) {
+                registry_end = std::chrono::steady_clock::now();
+            }
+            if (!runtime_accelerator.Devices().empty()) {
+                for (const auto& op : operations) {
+                    const auto lookup_start =
+                        breakdown_log
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    auto* src_device =
+                        runtime_accelerator.FindDeviceForPointer(op.src);
+                    auto* dst_device =
+                        runtime_accelerator.FindDeviceForPointer(op.dest);
+                    if (breakdown_log) {
+                        pointer_lookup_us += std::chrono::duration_cast<
+                                                 std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() -
+                                                 lookup_start)
+                                                 .count();
+                    }
+                    if (src_device || dst_device) {
+                        host_only = false;
+                        break;
+                    }
+                }
+            }
+
+            if (host_only) {
+                const auto copy_start =
+                    breakdown_log
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                for (const auto& op : operations) {
+                    std::memcpy(op.dest, op.src, op.size);
+                    copied_bytes += op.size;
+                }
+                const auto inline_end =
+                    breakdown_log
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                if (breakdown_log) {
+                    copy_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            inline_end - copy_start)
+                            .count();
+                }
+                state->set_completed(ErrorCode::OK);
+                if (breakdown_log) {
+                    auto elapsed_us = [](auto begin, auto end) {
+                        return std::chrono::duration_cast<
+                                   std::chrono::microseconds>(end - begin)
+                            .count();
+                    };
+                    MC_LOG(INFO)
+                        << "memcpy_inline_breakdown trace_id=" << trace_id
+                        << " operations=" << operations.size()
+                        << " bytes=" << copied_bytes
+                        << " registry_us="
+                        << elapsed_us(inline_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " total_us="
+                        << elapsed_us(inline_start, inline_end)
+                        << " status=" << static_cast<int>(ErrorCode::OK);
+                }
+                return TransferFuture(state);
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Exception while classifying memcpy pointers: "
+                       << e.what();
+            state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return TransferFuture(state);
+        }
+    }
+
     MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
-
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
-
+    VLOG(1) << "Memcpy transfer submitted to worker pool";
     return TransferFuture(state);
 }
 

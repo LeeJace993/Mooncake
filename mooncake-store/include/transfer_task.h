@@ -339,8 +339,9 @@ struct MemcpyTask {
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a bounded worker pool that executes memcpy operations
- * asynchronously. MC_STORE_MEMCPY_WORKERS controls the worker count.
+ * This class manages a bounded worker pool for accelerator copies and for
+ * host copies when MC_STORE_MEMCPY_INLINE is disabled.
+ * MC_STORE_MEMCPY_WORKERS controls the worker count.
  */
 class MemcpyWorkerPool {
    public:
@@ -668,12 +669,18 @@ class TransferSubmitter {
                                 const std::vector<Slice>& slices) const;
 
     /**
-     * @brief Submit memcpy operation asynchronously
+     * @brief Build and submit a memcpy operation
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
+
+    /**
+     * @brief Execute host-only copies inline or enqueue accelerator copies
+     */
+    std::optional<TransferFuture> submitMemcpyOperations(
+        std::vector<MemcpyOperation> operations, uint64_t trace_id);
 
 #ifdef USE_NOF
     /**
