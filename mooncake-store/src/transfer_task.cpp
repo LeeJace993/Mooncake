@@ -715,16 +715,49 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
+// A single worker serializes otherwise independent local-memory puts. Four
+// workers are enough to expose several cores of memcpy bandwidth without
+// creating an unbounded number of background threads. Deployments can tune
+// this with MC_STORE_MEMCPY_WORKERS.
+constexpr int kDefaultMemcpyWorkers = 4;
+constexpr int kMaxMemcpyWorkers = 64;
+
+static int GetMemcpyWorkerCount() {
+    static const int worker_count = [] {
+        const unsigned int hardware_threads =
+            std::thread::hardware_concurrency();
+        const int automatic_default =
+            hardware_threads == 0
+                ? kDefaultMemcpyWorkers
+                : std::max(1, std::min(kDefaultMemcpyWorkers,
+                                       static_cast<int>(hardware_threads)));
+
+        const char* raw_value = std::getenv("MC_STORE_MEMCPY_WORKERS");
+        if (!raw_value || raw_value[0] == '\0') return automatic_default;
+
+        errno = 0;
+        char* end_ptr = nullptr;
+        const long parsed = std::strtol(raw_value, &end_ptr, 10);
+        if (errno != 0 || end_ptr == raw_value ||
+            (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
+            parsed > kMaxMemcpyWorkers) {
+            LOG(WARNING) << "Invalid MC_STORE_MEMCPY_WORKERS=" << raw_value
+                         << ", using " << automatic_default;
+            return automatic_default;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return worker_count;
+}
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int worker_count = GetMemcpyWorkerCount();
+    LOG(INFO) << "Creating MemcpyWorkerPool with " << worker_count
+              << " workers; tune with MC_STORE_MEMCPY_WORKERS";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }
@@ -1081,7 +1114,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      int numa_socket_id)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
-      memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
+      memcpy_pool_(nullptr),
 #ifdef USE_NOF
       spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
 #endif
@@ -1115,6 +1148,13 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                          << ", defaulting to enabled";
             memcpy_enabled_ = true;
         }
+    }
+
+    // Non-local and explicitly disabled configurations do not need idle
+    // memcpy workers. submitMemcpyOperation is reachable only when the local
+    // memcpy strategy is enabled.
+    if (memcpy_enabled_) {
+        memcpy_pool_ = std::make_unique<MemcpyWorkerPool>();
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
@@ -1303,6 +1343,10 @@ TransferSubmitter::submit_batch_push_offload_object(
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    if (!memcpy_pool_) {
+        LOG(ERROR) << "Memcpy operation selected while memcpy is disabled";
+        return std::nullopt;
+    }
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto state = std::make_shared<MemcpyOperationState>(trace_id);
 

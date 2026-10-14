@@ -3950,6 +3950,13 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto transfer_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+
     std::optional<TransferFuture> future;
     if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
@@ -3969,9 +3976,40 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    const TransferStrategy strategy = future->strategy();
+    VLOG(1) << "Using transfer strategy: " << strategy;
 
-    return future->get();
+    const ErrorCode result = future->get();
+    if (breakdown_log) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        size_t bytes = 0;
+        for (const auto& slice : slices) bytes += slice.size;
+        const char* replica_kind = replica_descriptor.is_memory_replica()
+                                       ? "memory"
+                                   : replica_descriptor.is_nof_replica()
+                                       ? "nof"
+                                       : "other";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "transfer_data_breakdown trace_id=" << trace_id
+                     << " op="
+                     << (op_code == TransferRequest::WRITE ? "write" : "read")
+                     << " replica=" << replica_kind << " strategy=" << strategy
+                     << " slices=" << slices.size() << " bytes=" << bytes
+                     << " submit_us="
+                     << elapsed_us(transfer_start, submit_end)
+                     << " wait_us=" << elapsed_us(submit_end, wait_end)
+                     << " total_us=" << elapsed_us(transfer_start, wait_end)
+                     << " status=" << static_cast<int>(result);
+    }
+
+    return result;
 }
 
 ErrorCode Client::TransferReadInternal(

@@ -334,8 +334,8 @@ struct MemcpyTask {
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a single worker thread that executes memcpy operations
- * asynchronously.
+ * This class manages a bounded worker pool that executes memcpy operations
+ * asynchronously. MC_STORE_MEMCPY_WORKERS controls the worker count.
  */
 class MemcpyWorkerPool {
    public:
