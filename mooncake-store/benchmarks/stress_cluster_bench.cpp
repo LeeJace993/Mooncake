@@ -286,8 +286,10 @@ DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
 DEFINE_uint64(num_keys, 100, "Number of keys to write/read");
-DEFINE_uint64(batch_size, 32, "Batch size for put/get operations");
-DEFINE_uint64(num_threads, 1, "Number of concurrent reader threads");
+DEFINE_uint64(batch_size, 32,
+              "Batch size for reads and per-thread buffer sizing");
+DEFINE_uint64(num_threads, 1,
+              "Number of concurrent benchmark worker threads");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
 DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
@@ -874,35 +876,35 @@ class StressBenchmark {
         mooncake::ReplicateConfig config = MakeReplicateConfig();
 
         BenchmarkStats put_stats;
-        put_stats.InitThreads(1, FLAGS_num_keys);
-        ThreadResult& put_result = put_stats.GetThreadResult(0);
-        put_result.latencies_ns.reserve(FLAGS_num_keys);
+        put_stats.InitThreads(
+            FLAGS_num_threads,
+            (FLAGS_num_keys + FLAGS_num_threads - 1) / FLAGS_num_threads);
 
-        LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys << " keys...";
-        int put_ret = 0;
+        LOG(INFO) << "Phase 1: Concurrent writes with " << FLAGS_num_threads
+                  << " threads for " << FLAGS_num_keys << " keys";
         if (!BeginMeasurement()) return 1;
-        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-            std::string key = MakeKey(i);
-            FillBuffer(i);
-            auto t0 = Clock::now();
-            int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
-            auto t1 = Clock::now();
-            if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
-            RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
-            if (ret != 0) {
-                LOG(ERROR) << "put_from failed for key=" << key;
-                put_ret = ret;
-                break;
-            }
-            if ((i + 1) % 50 == 0) {
-                LOG(INFO) << "  Written " << (i + 1) << "/" << FLAGS_num_keys;
-            }
+        put_stats.StartTimer();
+
+        std::latch put_start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch put_done_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads));
+        auto put_threads = LaunchPutWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, config, put_stats,
+            put_start_latch, put_done_latch,
+            [](size_t idx) { return MakeKey(idx); });
+
+        put_done_latch.wait();
+        put_stats.StopTimer();
+        for (auto& thread : put_threads) {
+            thread.join();
         }
+
         LOG(INFO) << "Write phase complete";
         FinishMeasurement("local_memory_write");
-        put_stats.FinalizeSequential();
+        put_stats.Finalize();
         put_stats.Print("LOCAL MEMORY PUT BENCHMARK");
-        if (put_ret != 0) return put_ret;
+        if (put_stats.total_failed() != 0) return 1;
 
         int warmup_ret = DoWarmup();
         if (warmup_ret != 0) {
@@ -2113,17 +2115,20 @@ class StressBenchmark {
         return "bench_key_" + std::to_string(idx);
     }
 
-    void FillBuffer(size_t seed) {
-        void* target = buffer_;
+    void FillBuffer(void* destination, size_t seed) {
+        void* target = destination;
         static thread_local std::vector<uint8_t> shadow;
         if (buffer_is_gpu_) {
-            if (shadow.size() != buffer_size_) shadow.assign(buffer_size_, 0);
+            if (shadow.size() != FLAGS_value_size) {
+                shadow.assign(FLAGS_value_size, 0);
+            }
             target = shadow.data();
         }
         mooncake::bench::FillPattern(target, FLAGS_value_size, seed);
 #if defined(USE_CUDA)
         if (buffer_is_gpu_) {
-            checkCudaError(cudaMemcpy(buffer_, shadow.data(), FLAGS_value_size,
+            checkCudaError(cudaMemcpy(destination, shadow.data(),
+                                      FLAGS_value_size,
                                       cudaMemcpyHostToDevice),
                            "FillBuffer H2D copy failed");
             static std::atomic<uint64_t> fill_h2d_log_counter{0};
@@ -2131,11 +2136,13 @@ class StressBenchmark {
                     1, std::memory_order_relaxed) % 10000 == 0) {
                 VLOG(2) << "[bench] FillBuffer H2D seed=" << seed
                         << " size=" << FLAGS_value_size
-                        << " dst=" << buffer_;
+                        << " dst=" << destination;
             }
         }
 #endif
     }
+
+    void FillBuffer(size_t seed) { FillBuffer(buffer_, seed); }
 
     bool CheckBuffer(size_t seed, const void* data, size_t size) const {
         if (size != FLAGS_value_size) return false;
@@ -2286,6 +2293,51 @@ class StressBenchmark {
             threads.emplace_back([&, t, my_keys, key_offset]() {
                 BatchReadWorker(t, my_keys, key_offset, stats, start_latch,
                                 done_latch, key_func);
+            });
+        }
+        return threads;
+    }
+
+    std::vector<std::thread> LaunchPutWorkers(
+        size_t num_threads, size_t total_keys,
+        const mooncake::ReplicateConfig& config, BenchmarkStats& stats,
+        std::latch& start_latch, std::latch& done_latch,
+        const std::function<std::string(size_t)>& key_func) {
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        const size_t keys_per_thread = total_keys / num_threads;
+        const size_t remainder = total_keys % num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            const size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
+            const size_t key_offset =
+                t * keys_per_thread + std::min(t, remainder);
+
+            threads.emplace_back([&, t, my_keys, key_offset]() {
+                bindToSocket(t % NR_SOCKETS);
+                ThreadResult& result = stats.GetThreadResult(t);
+                result.latencies_ns.reserve(my_keys);
+                char* write_buffer = thread_buffers_[t].ptr;
+
+                start_latch.arrive_and_wait();
+                for (size_t i = 0; i < my_keys; ++i) {
+                    const size_t key_idx = key_offset + i;
+                    const std::string key = key_func(key_idx);
+                    FillBuffer(write_buffer, key_idx);
+
+                    const auto t0 = Clock::now();
+                    const int ret = client_->put_from(
+                        key, write_buffer, FLAGS_value_size, config);
+                    const auto t1 = Clock::now();
+                    if (ret == 0) {
+                        AccountMeasuredIo(key, FLAGS_value_size, true);
+                    } else {
+                        LOG(ERROR) << "put_from failed for key=" << key
+                                   << " ret=" << ret;
+                    }
+                    RecordPutResult(result, ElapsedNanos(t0, t1), ret);
+                }
+                done_latch.arrive_and_wait();
             });
         }
         return threads;
@@ -2832,6 +2884,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Stats interval: " << FLAGS_statis_interval << "s";
     LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
               << "s";
+    LOG(INFO) << "  Request trace sample rate: "
+              << mooncake::logging::HiFreqLogSampleRate();
     {
         // External review #3: 编译开关进入验收输出。SPDK 侧 GPU Direct 依赖
         // USE_NOF_URMA/USE_NOF_GPU_DIRECT 独立构建，与 UB transport 的

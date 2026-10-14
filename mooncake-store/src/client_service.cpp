@@ -1698,6 +1698,19 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto checksum_end = breakdown_start;
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+    auto revoke_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -1711,6 +1724,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
+    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -1726,9 +1740,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
 
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1791,6 +1807,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     const auto finalize_decision =
         DetermineFinalizeDecision(config, transfer_summary);
@@ -1809,6 +1826,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(err);
         }
     }
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
 
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
@@ -1819,10 +1837,34 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(revoke_result.error());
         }
     }
+    if (breakdown_log) revoke_end = std::chrono::steady_clock::now();
 
     if (!finalize_decision.success) {
         pt_full.End(-1);
         return tl::unexpected(finalize_decision.error);
+    }
+
+    if (breakdown_log) {
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_put_breakdown trace_id=" << trace_id
+                     << " key=" << key << " slices=" << slices.size()
+                     << " replicas=" << start_result.value().size()
+                     << " checksum_us="
+                     << elapsed_us(breakdown_start, checksum_end)
+                     << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us=" << elapsed_us(transfer_end, put_end_end)
+                     << " revoke_us=" << elapsed_us(put_end_end, revoke_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, revoke_end)
+                     << " status=ok";
     }
 
     pt_full.End(0);
