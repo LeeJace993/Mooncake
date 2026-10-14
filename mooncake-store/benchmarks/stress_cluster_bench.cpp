@@ -252,6 +252,18 @@ YLT_REFL(MemorySegmentsDetail, segments);
 static const char* SegmentKindName(SegmentKind kind) {
     return kind == SegmentKind::MEMORY ? "memory" : "NoF";
 }
+
+static bool NofWholePoolRegistrationDefault() {
+    const char* raw = std::getenv("MC_NOF_WHOLE_POOL_REGISTER");
+    if (!raw) return true;
+
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+}
 }  // namespace
 
 DEFINE_string(local_hostname, "localhost",
@@ -294,10 +306,11 @@ DEFINE_bool(require_gpu_direct, false,
             "Fail unless the requested direct GPU path is supported and "
             "NoF GPU I/O completes with successful GPU registrations.");
 DEFINE_bool(nof_whole_pool_register,
-            std::getenv("MC_NOF_WHOLE_POOL_REGISTER") &&
-                std::string(std::getenv("MC_NOF_WHOLE_POOL_REGISTER")) == "1",
-            "Register complete benchmark buffers with each selected URMA NoF "
-            "endpoint; requires SPDK whole-pool registry support.");
+            NofWholePoolRegistrationDefault(),
+            "Automatically register complete benchmark buffers with selected "
+            "URMA NoF endpoints when SPDK supports whole-pool registration. "
+            "Set false (or MC_NOF_WHOLE_POOL_REGISTER=0) for compatibility "
+            "testing with per-I/O registration.");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_uint64(nof_replica_num, 0,
               "Number of NoF SSD replicas for each object");
@@ -1211,9 +1224,10 @@ class StressBenchmark {
             std::min(static_cast<size_t>(FLAGS_warmup_keys), all_keys.size());
         if (warmup_end > 0) {
             LOG(INFO) << "Warmup: reading " << warmup_end << " keys...";
+            char* warmup_buffer = GetWarmupBuffer();
             for (size_t i = 0; i < warmup_end; ++i) {
-                int64_t ret =
-                    client_->get_into(all_keys[i], buffer_, FLAGS_value_size);
+                int64_t ret = client_->get_into(all_keys[i], warmup_buffer,
+                                                FLAGS_value_size);
                 if (ret < 0) {
                     LOG(WARNING)
                         << "Warmup get_into failed for key=" << all_keys[i]
@@ -1869,10 +1883,17 @@ class StressBenchmark {
             return true;
         }
 #if defined(USE_NOF_URMA)
-        if (!mooncake::NofWholePoolRegistrationAvailable() ||
-            !EnsurePlacementClient()) {
-            LOG(ERROR) << "NoF whole-pool registration requires a compatible "
-                          "URMA SPDK";
+        if (!mooncake::NofWholePoolRegistrationAvailable()) {
+            if (!nof_pool_fallback_logged_) {
+                LOG(WARNING)
+                    << "NoF whole-pool registration is unavailable in this "
+                       "SPDK build; falling back to per-I/O registration. "
+                       "Large batches may exceed the URMA registration cache";
+                nof_pool_fallback_logged_ = true;
+            }
+            return true;
+        }
+        if (!EnsurePlacementClient()) {
             return false;
         }
         auto segments = placement_client_->GetAllNoFSegments();
@@ -1894,9 +1915,10 @@ class StressBenchmark {
                 continue;
             }
             if (!IsUrmaEndpoint(segment.te_endpoint)) {
-                LOG(ERROR) << "Whole-pool registration requires URMA: "
-                           << segment.name;
-                return false;
+                VLOG(1) << "Skipping whole-pool registration for non-URMA NoF "
+                           "segment "
+                        << segment.name;
+                continue;
             }
             for (const auto& [buffer, requested_size] : buffers) {
                 const auto id = segment.te_endpoint + ":buffer=" +
@@ -1908,16 +1930,39 @@ class StressBenchmark {
                                       : requested_size;
                 auto token = mooncake::RegisterNofMemoryPool(
                     segment.te_endpoint, buffer, size);
-                if (!token) return false;
+                if (!token) {
+                    LOG(ERROR)
+                        << "NoF whole-pool registration was available but "
+                           "failed; refusing unsafe per-I/O fallback for "
+                        << segment.name;
+                    return false;
+                }
                 nof_pool_tokens_.push_back(std::move(token));
                 registered_nof_pools_.insert(id);
+                LOG(INFO) << "NoF whole-pool registered segment="
+                          << segment.name << " size=" << size;
             }
         }
         return true;
 #else
-        LOG(ERROR) << "NoF whole-pool registration requires USE_NOF_URMA=ON";
-        return false;
+        if (!nof_pool_fallback_logged_) {
+            LOG(WARNING) << "NoF whole-pool registration requested without "
+                            "USE_NOF_URMA; using per-I/O registration";
+            nof_pool_fallback_logged_ = true;
+        }
+        return true;
 #endif
+    }
+
+    char* GetWarmupBuffer() const {
+        // Reuse an address that the measured reads will use. A separate
+        // warmup buffer creates another set of per-chunk URMA registrations
+        // and can consume the fixed registration cache before measurement.
+        if (!thread_buffers_.empty() && thread_buffers_.front().ptr &&
+            thread_buffers_.front().size >= FLAGS_value_size) {
+            return thread_buffers_.front().ptr;
+        }
+        return buffer_;
     }
 
     bool BeginMeasurement() {
@@ -2121,9 +2166,11 @@ class StressBenchmark {
 
         size_t warmup_end = std::min(static_cast<size_t>(FLAGS_warmup_keys),
                                      static_cast<size_t>(FLAGS_num_keys));
+        char* warmup_buffer = GetWarmupBuffer();
         for (size_t i = 0; i < warmup_end; ++i) {
             std::string key = MakeKey(i);
-            int64_t ret = client_->get_into(key, buffer_, FLAGS_value_size);
+            int64_t ret =
+                client_->get_into(key, warmup_buffer, FLAGS_value_size);
             if (ret < 0) {
                 LOG(WARNING) << "Warmup get_into failed for key=" << key
                              << " ret=" << ret;
@@ -2631,6 +2678,7 @@ class StressBenchmark {
     GpuRuntimeConfig gpu_config_;
     std::vector<std::shared_ptr<void>> nof_pool_tokens_;
     std::unordered_set<std::string> registered_nof_pools_;
+    bool nof_pool_fallback_logged_ = false;
     bool direct_acceptance_passed_ = true;
     std::array<std::atomic<uint64_t>, 2> measured_memory_bytes_{};
     std::array<std::atomic<uint64_t>, 2> measured_nof_bytes_{};
@@ -2710,6 +2758,12 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
+#if defined(USE_NOF_URMA)
+    const bool nof_whole_pool_available =
+        mooncake::NofWholePoolRegistrationAvailable();
+#else
+    const bool nof_whole_pool_available = false;
+#endif
 
     // External review #2: GPU 写入是显式路径，不靠 role 绕行。writer（含
     // segment_write/remove 预填等直接写场景）带 --gpu_mode 时即从 GPU buffer
@@ -2754,6 +2808,11 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
     LOG(INFO) << "  Memory replicas: " << FLAGS_replica_num;
     LOG(INFO) << "  NoF replicas:   " << FLAGS_nof_replica_num;
+    LOG(INFO) << "  NoF whole-pool: "
+              << (!FLAGS_nof_whole_pool_register
+                      ? "disabled"
+                      : (nof_whole_pool_available ? "auto/available"
+                                                  : "auto/unavailable"));
     LOG(INFO) << "  Hard pin:       " << (FLAGS_hard_pin ? "yes" : "no");
     LOG(INFO) << "  SSD offload:    "
               << (FLAGS_enable_ssd_offload ? "yes" : "no");
@@ -2894,9 +2953,11 @@ int main(int argc, char* argv[]) {
         const auto chunk = byte_limit("MC_NOF_SUBMIT_CHUNK_BYTES", 128 * 1024);
         const auto window =
             byte_limit("MC_NOF_INFLIGHT_BYTES_LIMIT", 32 * 1024 * 1024);
+        const bool whole_pool_active =
+            FLAGS_nof_whole_pool_register && nof_whole_pool_available;
         if (chunk == 0 || window == 0 ||
             !mooncake::bench::NofGpuLayoutSupported(FLAGS_value_size, chunk, window,
-                                                   FLAGS_nof_whole_pool_register)) {
+                                                   whole_pool_active)) {
             LOG(ERROR) << "NoF peer-memory requires 64 KiB-aligned "
                           "value/chunk/window sizes, or "
                           "--nof_whole_pool_register=true with compatible SPDK";
