@@ -331,6 +331,17 @@ if(USE_NOF)
 pass -DUMDK_ROOT=/path/to/umdk-prefix")
     endif()
     message(STATUS "NoF URMA: include=${URMA_INCLUDE_DIR} lib=${URMA_LIBRARY}")
+    include(CheckCXXSourceCompiles)
+    set(_NOF_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+    set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR}
+                                ${URMA_INCLUDE_DIR})
+    check_cxx_source_compiles("
+#include <spdk/nvme_urma.h>
+static_assert(sizeof(decltype(&spdk_nvme_urma_register_memory_for_qpair)) > 0);
+int main() { return 0; }
+" HAVE_SPDK_URMA_WHOLE_POOL)
+    set(CMAKE_REQUIRED_INCLUDES ${_NOF_REQUIRED_INCLUDES})
+    unset(_NOF_REQUIRED_INCLUDES)
     list(APPEND SPDK_STATIC_LIBS ${URMA_LIBRARY})
   endif()
 
@@ -360,6 +371,9 @@ if(USE_NOF)
                                                     ${DPDK_INCLUDE_DIR})
   if(USE_NOF_URMA)
     target_include_directories(mooncake_store PRIVATE ${URMA_INCLUDE_DIR})
+    if(HAVE_SPDK_URMA_WHOLE_POOL)
+      target_compile_definitions(mooncake_store PRIVATE HAVE_SPDK_URMA_WHOLE_POOL=1)
+    endif()
   endif()
 endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})

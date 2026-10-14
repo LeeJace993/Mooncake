@@ -1,6 +1,7 @@
 #include "../benchmarks/stress_bench_validation.h"
 #include "nof_gpu_direct_report.h"
 #include "gpu_direct_read.h"
+#include "../../mooncake-transfer-engine/include/ub_gpu_direct_stats.h"
 
 #include <array>
 #include <iostream>
@@ -107,6 +108,55 @@ void TestPayloadAndExitStatus() {
             "verification failure must propagate to the process exit status");
 }
 
+void TestMeasuredEvidence() {
+    Require(mooncake::bench::KeySeed("nof_seg_endpoint_key_17") == 17,
+            "segment keys must preserve the payload seed after shuffling");
+    Require(mooncake::bench::KeySeed("bench_key_3") == 3,
+            "ordinary keys must resolve their seed");
+    Require(!mooncake::bench::KeySeed("bench_key_3garbage"),
+            "malformed keys must never pass payload verification");
+    Require(!mooncake::bench::NofGpuLayoutSupported(4096, 131072, 33554432, false),
+            "4 KiB NoF GPU requests need full allocation registration");
+    Require(mooncake::bench::NofGpuLayoutSupported(4096, 131072, 33554432, true),
+            "a GPU page registered as a pool can serve subpage I/O");
+    Require(!mooncake::bench::NofGpuLayoutSupported(65536, 4096, 33554432, false),
+            "a subpage SPDK chunk must not enter peer-memory registration");
+    mooncake::NofGpuDirectStats warmup;
+    warmup.available = true;
+    warmup.reads = {32, 32, 0, 4194304, 4194304};
+    warmup.peer_memory_registrations = 1;
+    auto delta = mooncake::NofGpuDirectDelta(warmup, warmup);
+    Require(!mooncake::NofGpuDirectPassed(delta, true, false),
+            "warmup/verification I/O cannot satisfy a measured phase");
+    auto after = warmup;
+    after.reads = {64, 64, 0, 8388608, 8388608};
+    delta = mooncake::NofGpuDirectDelta(warmup, after);
+    Require(mooncake::NofGpuDirectPassed(delta, true, false) &&
+                delta.reads.success_bytes == 4194304,
+            "cached registration must remain valid for measured GPU byte evidence");
+    delta.host_io = 1;
+    Require(!mooncake::NofGpuDirectPassed(delta, true, false),
+            "a measured host I/O must fail strict GPU acceptance");
+    mooncake::UbGpuDirectCounters counters;
+    counters.Submit(false, 4096);
+    counters.Complete(false, true, 4096);
+    const auto before = counters.Snapshot();
+    Require(!mooncake::UbGpuDirectPassed(
+                mooncake::UbGpuDirectDelta(before, before), 4096, 0),
+            "UB warmup cannot count as measured DMA");
+    counters.Submit(false, 4096);
+    counters.Complete(false, true, 4096);
+    const auto measured = mooncake::UbGpuDirectDelta(before, counters.Snapshot());
+    Require(mooncake::UbGpuDirectPassed(measured, 4096, 0),
+            "all measured UB bytes must complete directly");
+    Require(!mooncake::UbGpuDirectPassed(measured, 8192, 0),
+            "partial direct transfer evidence cannot cover all measured bytes");
+    counters.Stage(4096);
+    Require(!mooncake::UbGpuDirectPassed(
+                mooncake::UbGpuDirectDelta(before, counters.Snapshot()), 4096, 0),
+            "UB staging must be visible to acceptance");
+}
+
 void TestGpuAcceptance() {
     mooncake::NofGpuDirectStats stats;
     stats.available = true;
@@ -148,6 +198,7 @@ int main() {
         TestPlacement();
         TestPayloadAndExitStatus();
         TestGpuAcceptance();
+        TestMeasuredEvidence();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

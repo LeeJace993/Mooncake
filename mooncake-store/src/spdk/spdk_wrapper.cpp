@@ -5,8 +5,12 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <sstream>
 #include <thread>
 #include "spdk/spdk_wrapper.h"
+#ifdef USE_NOF_URMA
+#include "spdk/nof_memory_domain.h"
+#endif
 
 namespace mooncake {
 namespace {
@@ -245,12 +249,73 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
-    if (!seg) {
+    if (!seg || !seg->io_qpair) {
         return -1;
     }
     return spdk_nvme_qpair_process_completions(seg->io_qpair,
                                                complete_per_seg);
 }
+
+void SpdkWrapper::DrainFailedNofSegment(nof_seg_handle *seg) {
+    if (!seg || !seg->io_qpair) return;
+    auto* qpair = seg->io_qpair;
+    seg->io_qpair = nullptr;
+    spdk_nvme_ctrlr_free_io_qpair(qpair);
+}
+
+#ifdef USE_NOF_URMA
+bool NofWholePoolRegistrationAvailable() {
+#ifdef HAVE_SPDK_URMA_WHOLE_POOL
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::shared_ptr<void> RegisterNofMemoryPool(const std::string& endpoint,
+                                           void* buffer, size_t size) {
+#ifdef HAVE_SPDK_URMA_WHOLE_POOL
+    if (!buffer || size == 0) return {};
+    std::istringstream fields(endpoint);
+    std::string field;
+    bool urma = false;
+    while (fields >> field) {
+        if (field == "trtype:URMA") urma = true;
+    }
+    if (!urma) {
+        LOG(ERROR) << "NoF whole-pool registration only supports URMA endpoints";
+        return {};
+    }
+    auto* segment = SpdkWrapper::GetInstance().OpenNofSegment(endpoint);
+    if (!segment || !segment->io_qpair) return {};
+    const auto info =
+        NofMemoryDomainManager::GetInstance().ResolveBuffer(buffer, size);
+    if (info.type != NofMemoryType::kHost && info.type != NofMemoryType::kCuda) {
+        return {};
+    }
+    spdk_nvme_urma_memory_region* region = nullptr;
+    const auto type = info.type == NofMemoryType::kCuda
+                          ? SPDK_NVME_URMA_MEM_CUDA : SPDK_NVME_URMA_MEM_HOST;
+    const int rc = spdk_nvme_urma_register_memory_for_qpair(
+        segment->io_qpair, buffer, size, type, &region);
+    if (rc != 0 || !region) {
+        LOG(ERROR) << "NoF whole-pool registration failed endpoint=" << endpoint
+                   << " buffer=" << buffer << " size=" << size << " rc=" << rc;
+        return {};
+    }
+    return {region, [](void* value) {
+        spdk_nvme_urma_unregister_memory(
+            static_cast<spdk_nvme_urma_memory_region*>(value));
+    }};
+#else
+    (void)endpoint;
+    (void)buffer;
+    (void)size;
+    LOG(ERROR) << "SPDK does not expose URMA whole-pool registration";
+    return {};
+#endif
+}
+#endif
 
 int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
     std::memset(&info->trid, 0, sizeof(info->trid));

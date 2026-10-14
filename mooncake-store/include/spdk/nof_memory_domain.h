@@ -86,7 +86,9 @@ class NofMemoryDomainManager {
         const size_t index = write ? 1 : 0;
         return {cuda_io_submitted_[index].load(std::memory_order_relaxed),
                 cuda_io_success_[index].load(std::memory_order_relaxed),
-                cuda_io_failed_[index].load(std::memory_order_relaxed)};
+                cuda_io_failed_[index].load(std::memory_order_relaxed),
+                cuda_submitted_bytes_[index].load(std::memory_order_relaxed),
+                cuda_success_bytes_[index].load(std::memory_order_relaxed)};
     }
     uint64_t classify_fail_total() const { return classify_fail_total_.load(std::memory_order_relaxed); }
     /// CUDA DMA-BUF 导出成功次数（导出后 SPDK 注册仍可能失败或回退
@@ -101,10 +103,12 @@ class NofMemoryDomainManager {
         return payload_staged_bytes_.load(std::memory_order_relaxed);
     }
 
-    void OnIoSubmitted(const NofBufferInfo &info, bool write) {
+    void OnIoSubmitted(const NofBufferInfo &info, bool write, uint64_t bytes) {
         if (info.type == NofMemoryType::kCuda) {
             cuda_io_submitted_[write ? 1 : 0].fetch_add(
                 1, std::memory_order_relaxed);
+            cuda_submitted_bytes_[write ? 1 : 0].fetch_add(
+                bytes, std::memory_order_relaxed);
         } else if (info.type == NofMemoryType::kHost) {
             host_io_total_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -113,11 +117,22 @@ class NofMemoryDomainManager {
     /// 注意粒度：按 SPDK 子任务 chunk 计（每次 chunk completion 一次，
     /// 与 OnIoSubmitted 的粒度对称），不是完整 value/object 数——验收时
     /// 需结合 bench 的操作成功/失败统计解读。
-    void OnIoCompleted(const NofBufferInfo &info, bool success, bool write) {
+    void OnIoCompleted(const NofBufferInfo &info, bool success, bool write,
+                       uint64_t bytes) {
         if (info.type == NofMemoryType::kCuda) {
             auto& counter = success ? cuda_io_success_[write ? 1 : 0]
                                     : cuda_io_failed_[write ? 1 : 0];
             counter.fetch_add(1, std::memory_order_relaxed);
+            if (success) {
+                cuda_success_bytes_[write ? 1 : 0].fetch_add(
+                    bytes, std::memory_order_relaxed);
+            }
+        }
+    }
+    void OnIoAborted(const NofBufferInfo &info, bool write, uint64_t count) {
+        if (info.type == NofMemoryType::kCuda) {
+            cuda_io_failed_[write ? 1 : 0].fetch_add(
+                count, std::memory_order_relaxed);
         }
     }
     void OnClassifyFail() { classify_fail_total_.fetch_add(1, std::memory_order_relaxed); }
@@ -148,6 +163,8 @@ class NofMemoryDomainManager {
     std::array<std::atomic<uint64_t>, 2> cuda_io_submitted_{};
     std::array<std::atomic<uint64_t>, 2> cuda_io_success_{};
     std::array<std::atomic<uint64_t>, 2> cuda_io_failed_{};
+    std::array<std::atomic<uint64_t>, 2> cuda_submitted_bytes_{};
+    std::array<std::atomic<uint64_t>, 2> cuda_success_bytes_{};
     std::atomic<uint64_t> classify_fail_total_{0};
     std::atomic<uint64_t> dmabuf_export_total_{0};
     std::atomic<uint64_t> gpu_staging_fallback_total_{0};

@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <charconv>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace mooncake::bench {
 
@@ -95,6 +98,28 @@ inline bool CheckPattern(const void* data, size_t actual_size,
 
 inline int ExitCode(size_t failed_operations, int verification_result = 0) {
     return failed_operations == 0 && verification_result == 0 ? 0 : 1;
+}
+
+inline std::optional<size_t> KeySeed(std::string_view key) {
+    const auto marker = key.rfind("_key_");
+    if (marker == std::string_view::npos) return std::nullopt;
+    const auto suffix = key.substr(marker + 5);
+    size_t seed = 0;
+    const auto result =
+        std::from_chars(suffix.data(), suffix.data() + suffix.size(), seed);
+    if (result.ec != std::errc{} || result.ptr != suffix.data() + suffix.size()) {
+        return std::nullopt;
+    }
+    return seed;
+}
+
+inline bool NofGpuLayoutSupported(uint64_t value_size, uint64_t chunk_size,
+                                  uint64_t inflight_size, bool whole_pool) {
+    constexpr uint64_t gpu_page = 64 * 1024;
+    return value_size > 0 && chunk_size > 0 && inflight_size > 0 &&
+           (whole_pool || (value_size % gpu_page == 0 &&
+                           chunk_size % gpu_page == 0 &&
+                           inflight_size % gpu_page == 0));
 }
 
 }  // namespace mooncake::bench

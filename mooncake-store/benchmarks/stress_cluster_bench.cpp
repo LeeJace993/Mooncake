@@ -1,6 +1,7 @@
 #include <numa.h>
 #include <sched.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -29,6 +30,7 @@
 #include "nof_gpu_direct_report.h"
 #include "real_client.h"
 #include "ub_allocator.h"
+#include "ub_gpu_direct_stats.h"
 #include "stress_bench_validation.h"
 
 #include <ylt/struct_json/json_reader.h>
@@ -281,13 +283,21 @@ DEFINE_uint64(client_init_wait_seconds, 0,
               "Seconds to wait after RealClient setup succeeds and before "
               "benchmark run starts. This can give asynchronous RPC/transfer "
               "warmup and background initialization time to settle.");
-DEFINE_bool(verify, true, "Verify full values after read/write (before remove)");
+DEFINE_bool(verify, true,
+            "Verify each measured read before buffer reuse and stored values "
+            "after writes. API latency excludes verification; read wall "
+            "throughput includes verification.");
 DEFINE_bool(strict_segment_placement, true,
             "Check actual placement after segment PUTs; require one replica "
             "per selected type. False permits preferred-placement fallback.");
 DEFINE_bool(require_gpu_direct, false,
             "Fail unless the requested direct GPU path is supported and "
             "NoF GPU I/O completes with successful GPU registrations.");
+DEFINE_bool(nof_whole_pool_register,
+            std::getenv("MC_NOF_WHOLE_POOL_REGISTER") &&
+                std::string(std::getenv("MC_NOF_WHOLE_POOL_REGISTER")) == "1",
+            "Register complete benchmark buffers with each selected URMA NoF "
+            "endpoint; requires SPDK whole-pool registry support.");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_uint64(nof_replica_num, 0,
               "Number of NoF SSD replicas for each object");
@@ -582,6 +592,10 @@ class StressBenchmark {
             return;
         }
 
+        // Run() has drained all I/O. Release SPDK registrations while their
+        // device contexts and buffer allocations are still alive.
+        nof_pool_tokens_.clear();
+
         // Unregister and free thread buffers (these are allocated by this
         // class). In gdr-peermem mode the thread buffers are sub-regions of the
         // single GPU HBM block owned by buffer_, so they are skipped here.
@@ -744,6 +758,7 @@ class StressBenchmark {
         size_t written = 0;
         size_t failed = 0;
 
+        if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             FillBuffer(i);
@@ -751,6 +766,7 @@ class StressBenchmark {
             auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
             auto t1 = Clock::now();
+            if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
             RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
 
             if (ret != 0) {
@@ -770,6 +786,7 @@ class StressBenchmark {
 
         LOG(INFO) << "Write complete: " << written << " succeeded, " << failed
                   << " failed";
+        FinishMeasurement("writer");
         put_stats.FinalizeSequential();
         put_stats.Print("PUT BENCHMARK [" + FLAGS_scenario + "]");
         const int verification = FLAGS_verify ? VerifyData() : 0;
@@ -789,6 +806,7 @@ class StressBenchmark {
 
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
+        if (!EnsureNofPools()) return 1;
 
         if (FLAGS_scenario == "remote_memory" ||
             FLAGS_scenario == "remote_disk") {
@@ -807,6 +825,7 @@ class StressBenchmark {
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
+        if (!BeginMeasurement()) return 1;
         stats.StartTimer();
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
@@ -827,6 +846,7 @@ class StressBenchmark {
         std::string title = "READ BENCHMARK [" + FLAGS_scenario + "]";
         stats.Print(title);
 
+        FinishMeasurement("reader");
         const int verification = FLAGS_verify ? VerifyData() : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
@@ -836,6 +856,7 @@ class StressBenchmark {
 
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
+        if (!EnsureNofPools()) return 1;
 
         mooncake::ReplicateConfig config = MakeReplicateConfig();
 
@@ -846,12 +867,14 @@ class StressBenchmark {
 
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys << " keys...";
         int put_ret = 0;
+        if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             FillBuffer(i);
             auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
             auto t1 = Clock::now();
+            if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
             RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
             if (ret != 0) {
                 LOG(ERROR) << "put_from failed for key=" << key;
@@ -863,6 +886,7 @@ class StressBenchmark {
             }
         }
         LOG(INFO) << "Write phase complete";
+        FinishMeasurement("local_memory_write");
         put_stats.FinalizeSequential();
         put_stats.Print("LOCAL MEMORY PUT BENCHMARK");
         if (put_ret != 0) return put_ret;
@@ -878,6 +902,7 @@ class StressBenchmark {
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
+        if (!BeginMeasurement()) return 1;
         stats.StartTimer();
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
@@ -896,6 +921,7 @@ class StressBenchmark {
         stats.Finalize();
         stats.Print("LOCAL MEMORY READ BENCHMARK");
 
+        FinishMeasurement("local_memory_read");
         const int verification = FLAGS_verify ? VerifyData() : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
@@ -907,6 +933,7 @@ class StressBenchmark {
 
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
+        if (!EnsureNofPools()) return 1;
 
         mooncake::ReplicateConfig config = MakeReplicateConfig();
 
@@ -918,12 +945,14 @@ class StressBenchmark {
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys
                   << " keys (data may be offloaded to SSD)...";
         int put_ret = 0;
+        if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             FillBuffer(i);
             auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
             auto t1 = Clock::now();
+            if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
             RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
             if (ret != 0) {
                 LOG(ERROR) << "put_from failed for key=" << key;
@@ -935,6 +964,7 @@ class StressBenchmark {
             }
         }
         LOG(INFO) << "Write phase complete";
+        FinishMeasurement("local_disk_write");
         put_stats.FinalizeSequential();
         put_stats.Print("LOCAL DISK PUT BENCHMARK");
         if (put_ret != 0) return put_ret;
@@ -954,6 +984,7 @@ class StressBenchmark {
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
+        if (!BeginMeasurement()) return 1;
         stats.StartTimer();
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
@@ -972,6 +1003,7 @@ class StressBenchmark {
         stats.Finalize();
         stats.Print("LOCAL DISK READ BENCHMARK");
 
+        FinishMeasurement("local_disk_read");
         const int verification = FLAGS_verify ? VerifyData() : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
@@ -1031,6 +1063,8 @@ class StressBenchmark {
                   << " segments from master";
 
         LOG(INFO) << "=== SEGMENT WRITE MODE ===";
+        LOG(INFO) << "PUT measurement uses one serial API stream; --num_threads "
+                     "controls concurrent reads/removes, not PUT concurrency";
         LOG(INFO) << "Writing to " << segments.size() << " segments, "
                   << FLAGS_num_keys << " keys per segment (interleaved), each "
                   << FLAGS_value_size / MB << " MB";
@@ -1068,6 +1102,7 @@ class StressBenchmark {
         size_t total_written = 0;
         size_t total_failed = 0;
 
+        if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (size_t s = 0; s < segments.size(); ++s) {
                 const auto& segment = segments[s];
@@ -1078,6 +1113,7 @@ class StressBenchmark {
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
                 auto t1 = Clock::now();
+                if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
                 if (ret == 0 && FLAGS_strict_segment_placement &&
                     !VerifyPlacement(key, segment)) {
                     ret = -1;
@@ -1112,6 +1148,7 @@ class StressBenchmark {
 
         LOG(INFO) << "All segments write complete: " << total_written
                   << " succeeded, " << total_failed << " failed";
+        FinishMeasurement("segment_write");
         put_stats.FinalizeSequential();
         put_stats.Print("SEGMENT PUT BENCHMARK");
         const int verification = FLAGS_verify ? VerifySegments(segments) : 0;
@@ -1154,6 +1191,7 @@ class StressBenchmark {
 
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
+        if (!EnsureNofPools()) return 1;
 
         std::vector<std::string> all_keys;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
@@ -1200,6 +1238,7 @@ class StressBenchmark {
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
                           all_keys.size() / FLAGS_num_threads);
+        if (!BeginMeasurement()) return 1;
         stats.StartTimer();
 
         std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
@@ -1222,6 +1261,7 @@ class StressBenchmark {
         std::string title = "SEGMENT READ BENCHMARK [segments=" +
                             std::to_string(read_segments.size()) + "]";
         stats.Print(title);
+        FinishMeasurement("segment_read");
         const int verification = FLAGS_verify ? VerifySegments(read_segments) : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
@@ -1302,6 +1342,7 @@ class StressBenchmark {
                   << " threads for " << FLAGS_duration << "s, stats every "
                   << FLAGS_statis_interval << "s";
 
+        if (!BeginMeasurement()) return 1;
         std::atomic<bool> stop_flag{false};
         std::atomic<size_t> global_keys{0};
         std::atomic<size_t> global_queries{0};
@@ -1343,7 +1384,8 @@ class StressBenchmark {
                             thread_latencies[t].push_back(latency_ns);
                         }
 
-                        if (ret != static_cast<int64_t>(FLAGS_value_size)) {
+                        AccountMeasuredIo(key, ret, false);
+                        if (!ValidateMeasuredRead(key, my_buf, ret)) {
                             global_failed.fetch_add(1,
                                                     std::memory_order_relaxed);
                         } else {
@@ -1386,9 +1428,9 @@ class StressBenchmark {
                         }
 
                         for (size_t k = 0; k < keys.size(); ++k) {
-                            if (k >= results.size() ||
-                                results[k] !=
-                                    static_cast<int64_t>(FLAGS_value_size)) {
+                            const int64_t ret = k < results.size() ? results[k] : -1;
+                            AccountMeasuredIo(keys[k], ret, false);
+                            if (!ValidateMeasuredRead(keys[k], bufs[k], ret)) {
                                 global_failed.fetch_add(
                                     1, std::memory_order_relaxed);
                             } else {
@@ -1609,6 +1651,7 @@ class StressBenchmark {
         std::cout << "========================================"
                   << "========================================\n\n";
 
+        FinishMeasurement("segment_read_duration");
         const int verification = FLAGS_verify ? VerifySegments(read_segments) : 0;
         return mooncake::bench::ExitCode(final_failed, verification);
     }
@@ -1664,6 +1707,7 @@ class StressBenchmark {
                   << " keys to " << remove_segment_nums
                   << " segments (interleaved), each "
                   << FLAGS_value_size / MB << " MB";
+        if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (size_t s = 0; s < remove_segments.size(); ++s) {
                 const auto& segment = remove_segments[s];
@@ -1673,6 +1717,7 @@ class StressBenchmark {
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
                 auto t1 = Clock::now();
+                if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
                 if (ret == 0 && FLAGS_strict_segment_placement &&
                     !VerifyPlacement(key, segment)) {
                     ret = -1;
@@ -1694,6 +1739,7 @@ class StressBenchmark {
                           << " segments";
             }
         }
+        FinishMeasurement("remove_prefill");
         LOG(INFO) << "Prefill phase complete";
         put_stats.FinalizeSequential();
         put_stats.Print("REMOVE PREFILL PUT BENCHMARK");
@@ -1815,7 +1861,159 @@ class StressBenchmark {
         }
     }
 
+    bool DirectAcceptancePassed() const { return direct_acceptance_passed_; }
+
    private:
+    bool EnsureNofPools() {
+        if (!FLAGS_nof_whole_pool_register || FLAGS_nof_replica_num == 0) {
+            return true;
+        }
+#if defined(USE_NOF_URMA)
+        if (!mooncake::NofWholePoolRegistrationAvailable() ||
+            !EnsurePlacementClient()) {
+            LOG(ERROR) << "NoF whole-pool registration requires a compatible "
+                          "URMA SPDK";
+            return false;
+        }
+        auto segments = placement_client_->GetAllNoFSegments();
+        if (!segments || segments->empty()) return false;
+        const auto requested = ParseSegments(FLAGS_nof_segments);
+        std::vector<std::pair<void*, size_t>> buffers;
+        buffers.emplace_back(buffer_, gpu_config_.mode == "gdr-peermem"
+                                          ? (1 + FLAGS_num_threads) * buffer_size_
+                                          : buffer_size_);
+        if (gpu_config_.mode != "gdr-peermem") {
+            for (const auto& buffer : thread_buffers_) {
+                if (buffer.ptr) buffers.emplace_back(buffer.ptr, buffer.size);
+            }
+        }
+        for (const auto& segment : *segments) {
+            if (!requested.empty() && FLAGS_strict_segment_placement &&
+                std::find(requested.begin(), requested.end(), segment.name) ==
+                    requested.end()) {
+                continue;
+            }
+            if (!IsUrmaEndpoint(segment.te_endpoint)) {
+                LOG(ERROR) << "Whole-pool registration requires URMA: "
+                           << segment.name;
+                return false;
+            }
+            for (const auto& [buffer, requested_size] : buffers) {
+                const auto id = segment.te_endpoint + ":buffer=" +
+                                std::to_string(reinterpret_cast<uintptr_t>(buffer));
+                if (registered_nof_pools_.count(id)) continue;
+                // ub_allocate_gpu_hbm owns a padded 64 KiB allocation.
+                const auto size = gpu_config_.use_gpu_buffer
+                                      ? (requested_size + 65535) & ~size_t{65535}
+                                      : requested_size;
+                auto token = mooncake::RegisterNofMemoryPool(
+                    segment.te_endpoint, buffer, size);
+                if (!token) return false;
+                nof_pool_tokens_.push_back(std::move(token));
+                registered_nof_pools_.insert(id);
+            }
+        }
+        return true;
+#else
+        LOG(ERROR) << "NoF whole-pool registration requires USE_NOF_URMA=ON";
+        return false;
+#endif
+    }
+
+    bool BeginMeasurement() {
+        if (!EnsureNofPools()) return false;
+        for (auto& bytes : measured_memory_bytes_) bytes.store(0);
+        for (auto& bytes : measured_nof_bytes_) bytes.store(0);
+        ub_before_ = mooncake::GetUbGpuDirectCounters().Snapshot();
+#if defined(USE_NOF_URMA)
+        nof_before_ = mooncake::GetNofGpuDirectStats();
+#endif
+        return true;
+    }
+
+    void AccountMeasuredIo(const std::string& key, int64_t bytes, bool write) {
+        if (bytes != static_cast<int64_t>(FLAGS_value_size)) return;
+        const bool segment_key = key.starts_with("nof_seg_") ||
+                                 key.starts_with("nof_rmv_") ||
+                                 key.starts_with("seg_") || key.starts_with("rmv_");
+        if (write && !segment_key) {
+            measured_memory_bytes_[1].fetch_add(bytes * FLAGS_replica_num,
+                                               std::memory_order_relaxed);
+            measured_nof_bytes_[1].fetch_add(bytes * FLAGS_nof_replica_num,
+                                            std::memory_order_relaxed);
+            return;
+        }
+        const bool nof = key.starts_with("nof_seg_") ||
+                         key.starts_with("nof_rmv_") ||
+                         (!segment_key && FLAGS_replica_num == 0);
+        const uint64_t replicas = write ? (nof ? FLAGS_nof_replica_num
+                                              : FLAGS_replica_num) : 1;
+        auto& counter = nof ? measured_nof_bytes_[write ? 1 : 0]
+                            : measured_memory_bytes_[write ? 1 : 0];
+        counter.fetch_add(static_cast<uint64_t>(bytes) * replicas,
+                          std::memory_order_relaxed);
+    }
+
+    bool ValidateMeasuredRead(const std::string& key, const void* data,
+                              int64_t bytes) const {
+        if (bytes != static_cast<int64_t>(FLAGS_value_size)) return false;
+        if (!FLAGS_verify) return true;
+        const auto seed = mooncake::bench::KeySeed(key);
+        if (!seed || !CheckBuffer(*seed, data, FLAGS_value_size)) {
+            LOG(ERROR) << "Measured read payload mismatch key=" << key;
+            return false;
+        }
+        return true;
+    }
+
+    void FinishMeasurement(const char* phase) {
+        const auto memory_read = measured_memory_bytes_[0].load();
+        const auto memory_write = measured_memory_bytes_[1].load();
+        const auto nof_read = measured_nof_bytes_[0].load();
+        const auto nof_write = measured_nof_bytes_[1].load();
+        bool passed = memory_read > 0 || memory_write > 0 ||
+                      nof_read > 0 || nof_write > 0;
+        if (gpu_config_.use_gpu_buffer && (memory_read > 0 || memory_write > 0)) {
+            const auto stats = mooncake::UbGpuDirectDelta(
+                ub_before_, mooncake::GetUbGpuDirectCounters().Snapshot());
+            LOG(INFO) << "Measurement phase=" << phase
+                      << " path=ub expected_read_bytes=" << memory_read
+                      << " expected_write_bytes=" << memory_write
+                      << " direct_read_submitted_bytes="
+                      << stats.reads.submitted_bytes
+                      << " direct_read_success_bytes=" << stats.reads.success_bytes
+                      << " direct_read_failed_bytes=" << stats.reads.failed_bytes
+                      << " direct_write_submitted_bytes="
+                      << stats.writes.submitted_bytes
+                      << " direct_write_success_bytes=" << stats.writes.success_bytes
+                      << " direct_write_failed_bytes=" << stats.writes.failed_bytes
+                      << " staged_bytes=" << stats.staged_bytes;
+            passed = passed &&
+                     mooncake::UbGpuDirectPassed(stats, memory_read, memory_write);
+        }
+#if defined(USE_NOF_URMA)
+        if (nof_read > 0 || nof_write > 0) {
+            const auto stats = mooncake::NofGpuDirectDelta(
+                nof_before_, mooncake::GetNofGpuDirectStats());
+            LOG(INFO) << "Measurement phase=" << phase
+                      << " path=nof expected_read_bytes=" << nof_read
+                      << " expected_write_bytes=" << nof_write
+                      << " (I/O scoped to measurement; registrations cumulative)\n"
+                      << mooncake::NofGpuDirectAcceptanceReport(stats);
+            passed = passed &&
+                     mooncake::NofGpuDirectPassed(stats, nof_read > 0, nof_write > 0) &&
+                     stats.reads.submitted_bytes == nof_read &&
+                     stats.reads.success_bytes == nof_read &&
+                     stats.writes.submitted_bytes == nof_write &&
+                     stats.writes.success_bytes == nof_write;
+        }
+#endif
+        if (FLAGS_require_gpu_direct && !passed) {
+            direct_acceptance_passed_ = false;
+            LOG(ERROR) << "Measured GPU Direct acceptance FAILED phase=" << phase;
+        }
+    }
+
     static mooncake::ReplicateConfig MakeReplicateConfig() {
         mooncake::ReplicateConfig config;
         config.replica_num = FLAGS_replica_num;
@@ -1964,7 +2162,8 @@ class StressBenchmark {
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
 
-                if (ret != static_cast<int64_t>(FLAGS_value_size)) {
+                AccountMeasuredIo(key, ret, false);
+                if (!ValidateMeasuredRead(key, my_buf, ret)) {
                     ++failed;
                     LOG_EVERY_N(ERROR, 100)
                         << "get_into failed key=" << key << " ret=" << ret;
@@ -2002,8 +2201,9 @@ class StressBenchmark {
                 result.latencies_ns.push_back(lat_ns);
 
                 for (size_t k = 0; k < key_list.size(); ++k) {
-                    if (k >= results.size() ||
-                        results[k] != static_cast<int64_t>(FLAGS_value_size)) {
+                    const int64_t ret = k < results.size() ? results[k] : -1;
+                    AccountMeasuredIo(key_list[k], ret, false);
+                    if (!ValidateMeasuredRead(key_list[k], bufs[k], ret)) {
                         ++failed;
                     } else {
                         bytes += static_cast<size_t>(results[k]);
@@ -2429,6 +2629,15 @@ class StressBenchmark {
     size_t buffer_size_;
     bool buffer_is_gpu_ = false;
     GpuRuntimeConfig gpu_config_;
+    std::vector<std::shared_ptr<void>> nof_pool_tokens_;
+    std::unordered_set<std::string> registered_nof_pools_;
+    bool direct_acceptance_passed_ = true;
+    std::array<std::atomic<uint64_t>, 2> measured_memory_bytes_{};
+    std::array<std::atomic<uint64_t>, 2> measured_nof_bytes_{};
+    mooncake::UbGpuDirectStats ub_before_;
+#if defined(USE_NOF_URMA)
+    mooncake::NofGpuDirectStats nof_before_;
+#endif
 
     struct ThreadBuffer {
         char* ptr = nullptr;
@@ -2505,9 +2714,20 @@ int main(int argc, char* argv[]) {
     // External review #2: GPU 写入是显式路径，不靠 role 绕行。writer（含
     // segment_write/remove 预填等直接写场景）带 --gpu_mode 时即从 GPU buffer
     // 发起 put（GPU-source write），Setup/FillBuffer/put 路径均已支持。
-    if (gpu_config.use_gpu_buffer && FLAGS_role == "writer") {
-        LOG(INFO) << "GPU-source write path enabled: writer role with "
-                  << "gpu_mode=" << gpu_config.mode
+    const bool remote_scenario = FLAGS_scenario == "remote_memory" ||
+                                 FLAGS_scenario == "remote_disk";
+    const bool writes_gpu_source = FLAGS_scenario == "segment_write" ||
+                                   FLAGS_scenario == "remove" ||
+                                   FLAGS_scenario == "batch_remove" ||
+                                   FLAGS_scenario == "local_memory" ||
+                                   FLAGS_scenario == "local_disk" ||
+                                   (remote_scenario && FLAGS_role == "writer");
+    if (remote_scenario && FLAGS_role != "writer" && FLAGS_role != "reader") {
+        LOG(ERROR) << "Remote scenarios require --role=writer or --role=reader";
+        return 1;
+    }
+    if (gpu_config.use_gpu_buffer && writes_gpu_source) {
+        LOG(INFO) << "GPU-source write path enabled: gpu_mode=" << gpu_config.mode
                   << " will put from a GPU buffer (scenario="
                   << FLAGS_scenario << ")";
     }
@@ -2631,6 +2851,13 @@ int main(int argc, char* argv[]) {
                       "use --strict_segment_placement=false for replica tests";
         return 1;
     }
+    if (FLAGS_require_gpu_direct && !segment_scenario &&
+        FLAGS_replica_num > 0 && FLAGS_nof_replica_num > 0) {
+        LOG(ERROR) << "Direct acceptance of mixed replicas requires segment "
+                      "scenarios; "
+                      "select one replica type for remote/local memory scenarios";
+        return 1;
+    }
     mooncake::bench::GpuPathOptions path;
     path.mode = gpu_config.mode;
     path.protocol = FLAGS_protocol;
@@ -2652,6 +2879,30 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << path_error;
         return 1;
     }
+    if (gpu_config.use_gpu_buffer && FLAGS_nof_replica_num > 0) {
+        const auto byte_limit = [](const char* name, uint64_t default_value) {
+            const char* raw = std::getenv(name);
+            if (!raw) return default_value;
+            char* end = nullptr;
+            const auto value = std::strtoull(raw, &end, 10);
+            if (*raw == '-' || raw == end || *end != '\0' || value == 0 ||
+                value > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                return uint64_t{0};
+            }
+            return static_cast<uint64_t>(value);
+        };
+        const auto chunk = byte_limit("MC_NOF_SUBMIT_CHUNK_BYTES", 128 * 1024);
+        const auto window =
+            byte_limit("MC_NOF_INFLIGHT_BYTES_LIMIT", 32 * 1024 * 1024);
+        if (chunk == 0 || window == 0 ||
+            !mooncake::bench::NofGpuLayoutSupported(FLAGS_value_size, chunk, window,
+                                                   FLAGS_nof_whole_pool_register)) {
+            LOG(ERROR) << "NoF peer-memory requires 64 KiB-aligned "
+                          "value/chunk/window sizes, or "
+                          "--nof_whole_pool_register=true with compatible SPDK";
+            return 1;
+        }
+    }
     if (FLAGS_require_gpu_direct &&
         (!FLAGS_verify || FLAGS_enable_ssd_offload ||
          FLAGS_scenario == "local_disk" || FLAGS_scenario == "remote_disk")) {
@@ -2661,8 +2912,8 @@ int main(int argc, char* argv[]) {
     }
     ValidateGpuDevice(gpu_config);
     ApplyGpuEnv(gpu_config);
-    if (FLAGS_require_gpu_direct && FLAGS_replica_num > 0) {
-        // A host hot-cache hit would measure a local copy instead of URMA DMA.
+    if (FLAGS_require_gpu_direct) {
+        // A host hot-cache hit would measure a local copy instead of UB/NoF DMA.
         ::setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0", 1);
         LOG(INFO) << "Local hot cache disabled for direct GPU acceptance";
     }
@@ -2717,23 +2968,10 @@ int main(int argc, char* argv[]) {
     // SPDK 子任务 chunk 计，结合本 bench 的操作成功/失败统计解读）；
     // accelerator_attempts 是注册尝试数，注册成功看 dmabuf+peer_memory。
     const auto gpu_stats = mooncake::GetNofGpuDirectStats();
-    LOG(INFO) << "NoF GPU Direct acceptance report:\n"
+    LOG(INFO) << "NoF cumulative diagnostics (includes warmup/verification):\n"
               << mooncake::NofGpuDirectAcceptanceReport(gpu_stats);
-    if (FLAGS_require_gpu_direct && FLAGS_nof_replica_num > 0) {
-        const bool local = FLAGS_scenario == "local_memory";
-        const bool remote = FLAGS_scenario == "remote_memory";
-        const bool require_write = local || FLAGS_scenario == "segment_write" ||
-                                   FLAGS_scenario == "remove" ||
-                                   FLAGS_scenario == "batch_remove" ||
-                                   (remote && FLAGS_role == "writer");
-        const bool require_read = local || FLAGS_scenario == "segment_read" ||
-                                  (remote && FLAGS_role == "reader");
-        if (!mooncake::NofGpuDirectPassed(gpu_stats, require_read,
-                                         require_write)) {
-            LOG(ERROR) << "NoF GPU Direct acceptance FAILED";
-            ret = 1;
-        }
-    }
+
 #endif
+    if (FLAGS_require_gpu_direct && !bench.DirectAcceptancePassed()) ret = 1;
     return ret;
 }

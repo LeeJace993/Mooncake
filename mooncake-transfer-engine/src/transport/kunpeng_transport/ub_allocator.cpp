@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 #include <glog/logging.h>
@@ -88,6 +89,10 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
     // non-aligned sizes (e.g. --value_size < 64KB) can still be registered.
     // The returned VA is already GPU-page aligned by cuMemAlloc.
     constexpr size_t kGpuHbmAlign = 64 * 1024;
+    if (total_size > std::numeric_limits<size_t>::max() - (kGpuHbmAlign - 1)) {
+        LOG(ERROR) << "UB GPU HBM: allocation size overflow";
+        return nullptr;
+    }
     const size_t alloc_size =
         (total_size + kGpuHbmAlign - 1) & ~(kGpuHbmAlign - 1);
     CUresult init_ret = cuInit(0);
@@ -153,18 +158,16 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
 void ub_free_gpu_hbm(void* ptr) {
     if (!ptr) return;
 #if defined(USE_CUDA)
-    int device_id = -1;
-    {
-        std::lock_guard<std::mutex> gdr_lock(g_ub_gpu_hbm_mutex);
-        auto it = g_ub_gpu_hbm_devices.find(ptr);
-        if (it == g_ub_gpu_hbm_devices.end()) {
-            LOG(ERROR) << "UB GPU HBM: pointer " << ptr
-                       << " not found in GPU HBM allocation table";
-            return;
-        }
-        device_id = it->second;
-        g_ub_gpu_hbm_devices.erase(it);
+    // Serialize frees of the same allocation and retain ownership on failure
+    // so callers can retry after correcting the CUDA device/context error.
+    std::unique_lock<std::mutex> gdr_lock(g_ub_gpu_hbm_mutex);
+    auto it = g_ub_gpu_hbm_devices.find(ptr);
+    if (it == g_ub_gpu_hbm_devices.end()) {
+        LOG(ERROR) << "UB GPU HBM: pointer " << ptr
+                   << " not found in GPU HBM allocation table";
+        return;
     }
+    const int device_id = it->second;
 
     int old_device = -1;
     if (cudaGetDevice(&old_device) != cudaSuccess) old_device = -1;
@@ -182,6 +185,8 @@ void ub_free_gpu_hbm(void* ptr) {
                    << ", error=" << (err_str ? err_str : "unknown");
         return;
     }
+    g_ub_gpu_hbm_devices.erase(it);
+    gdr_lock.unlock();
     VLOG(1) << "UB GPU HBM: freed bytes at " << ptr;
 #else
     (void)ptr;

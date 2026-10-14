@@ -14,6 +14,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include <memory>
 #include <string>
 
 namespace mooncake {
@@ -22,10 +24,17 @@ namespace mooncake {
 /// 仅在 USE_NOF_URMA 构建中有定义。
 bool NofGpuDirectAvailable();
 
+bool NofWholePoolRegistrationAvailable();
+// Caller must drain I/O, release this token, then unregister/free the buffer.
+std::shared_ptr<void> RegisterNofMemoryPool(const std::string& endpoint,
+                                           void* buffer, size_t size);
+
 struct NofGpuIoStats {
     uint64_t submitted = 0;
     uint64_t success = 0;
     uint64_t failed = 0;
+    uint64_t submitted_bytes = 0;
+    uint64_t success_bytes = 0;
 };
 
 // Read after draining I/O for a consistent acceptance result. Registrations
@@ -50,6 +59,30 @@ struct NofGpuDirectStats {
 NofGpuDirectStats GetNofGpuDirectStats();
 std::string NofGpuDirectAcceptanceReport(const NofGpuDirectStats& stats);
 
+// I/O and failures are scoped to a drained measurement phase. Successful
+// registration counts remain cumulative because cached registrations may
+// have been created before the phase.
+inline NofGpuDirectStats NofGpuDirectDelta(const NofGpuDirectStats& before,
+                                           const NofGpuDirectStats& after) {
+    auto result = after;
+    const auto io = [](const NofGpuIoStats& first, const NofGpuIoStats& last) {
+        return NofGpuIoStats{last.submitted - first.submitted,
+                             last.success - first.success,
+                             last.failed - first.failed,
+                             last.submitted_bytes - first.submitted_bytes,
+                             last.success_bytes - first.success_bytes};
+    };
+    result.reads = io(before.reads, after.reads);
+    result.writes = io(before.writes, after.writes);
+    result.host_io -= before.host_io;
+    result.classify_fail -= before.classify_fail;
+    result.dmabuf_exports -= before.dmabuf_exports;
+    result.staging_fallbacks -= before.staging_fallbacks;
+    result.staged_bytes -= before.staged_bytes;
+    result.registration_failures -= before.registration_failures;
+    return result;
+}
+
 // Pure predicate, also usable without SPDK by acceptance tools and tests.
 inline bool NofGpuDirectPassed(const NofGpuDirectStats& stats,
                                bool require_read, bool require_write) {
@@ -61,7 +94,7 @@ inline bool NofGpuDirectPassed(const NofGpuDirectStats& stats,
            (!require_write || writes.submitted > 0) &&
            reads.success == reads.submitted &&
            writes.success == writes.submitted && reads.failed == 0 &&
-           writes.failed == 0 && stats.classify_fail == 0 &&
+           writes.failed == 0 && stats.host_io == 0 && stats.classify_fail == 0 &&
            stats.staging_fallbacks == 0 && stats.staged_bytes == 0 &&
            stats.dmabuf_registrations + stats.peer_memory_registrations > 0 &&
            stats.registration_failures == 0;

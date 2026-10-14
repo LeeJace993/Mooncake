@@ -43,7 +43,6 @@ struct NofCudaPinHandle {
 int NofCudaPin(void *provider_ctx, void *addr, size_t length,
                void **pin_handle) {
     (void)provider_ctx;
-    (void)length;
     if (addr == nullptr || pin_handle == nullptr) {
         return -EINVAL;
     }
@@ -76,9 +75,10 @@ int NofCudaPin(void *provider_ctx, void *addr, size_t length,
                    << static_cast<int>(pop_rc);
         return -EIO;
     }
-    if (reinterpret_cast<CUdeviceptr>(addr) < base ||
-        reinterpret_cast<CUdeviceptr>(addr) >= base + size) {
-        LOG(ERROR) << "NoF CUDA provider pin: pointer outside owning range";
+    const auto address = reinterpret_cast<CUdeviceptr>(addr);
+    if (address < base || address - base >= size || length == 0 ||
+        length > size - (address - base)) {
+        LOG(ERROR) << "NoF CUDA provider pin: request outside owning range";
         return -EIO;
     }
     auto *handle = new (std::nothrow) NofCudaPinHandle{
@@ -342,10 +342,14 @@ std::string NofGpuDirectAcceptanceReport(const NofGpuDirectStats& stats) {
         << " classify_fail=" << stats.classify_fail;
     oss << "\ncuda_read: submitted=" << stats.reads.submitted
         << " success=" << stats.reads.success
-        << " failed=" << stats.reads.failed;
+        << " failed=" << stats.reads.failed
+        << " submitted_bytes=" << stats.reads.submitted_bytes
+        << " success_bytes=" << stats.reads.success_bytes;
     oss << "\ncuda_write: submitted=" << stats.writes.submitted
         << " success=" << stats.writes.success
-        << " failed=" << stats.writes.failed;
+        << " failed=" << stats.writes.failed
+        << " submitted_bytes=" << stats.writes.submitted_bytes
+        << " success_bytes=" << stats.writes.success_bytes;
     // GPU Direct 过程统计：staging 回退与 staged 字节应恒为 0（严格错误
     // 策略下出现即异常）。dmabuf_exports 是 CUDA DMA-BUF 导出成功次数，
     // 注册是否成功看 spdk_urma_regs.dmabuf。

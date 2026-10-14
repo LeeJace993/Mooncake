@@ -105,13 +105,15 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
 }
 
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
+    // A failed completion may leave a task on the QoS queue. Publish only
+    // after it is popped, so the queue and callback cannot complete it twice.
+    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0 &&
+        !task->on_chain) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK);
-        if (!task->on_chain) {
-            delete task;
-        }
+        if (task->live_registry) task->live_registry->erase(task);
+        delete task;
     }
 }
 
@@ -155,10 +157,14 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     // completion 无错误处另计（cuda_io_success），两者不可混用。
     mooncake::NofMemoryDomainManager::GetInstance().OnIoCompleted(
         task->buffer_info, !spdk_nvme_cpl_is_error(cpl),
-        op == mooncake::kSpdkNofOpWrite);
+        op == mooncake::kSpdkNofOpWrite,
+        static_cast<uint64_t>(sub_task->submit_lba_count) *
+            mooncake::SpdkWrapper::GetInstance().GetBlockSize(task->seg_handle));
 #endif
 
-    SpdkNofTaskCompletion(task);
+    // During explicit qpair teardown, abort callbacks reclaim sub-tasks but
+    // do not publish completion until SPDK has quiesced the DMA resources.
+    if (!nof_qos->poisoned) SpdkNofTaskCompletion(task);
 
     sub_task->sub_task_pool->push(sub_task);
 }
@@ -432,6 +438,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
+    std::set<SpdkNofTask*> live_tasks;
+    const auto io_timeout = std::chrono::milliseconds(
+        GetPositiveEnvOrDefault("MC_NOF_IO_TIMEOUT_MS", 60000));
     auto& task_queue = task_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
@@ -495,6 +504,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 task->io_count = &total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
+                task->live_registry = &live_tasks;
+                live_tasks.insert(task);
 #ifdef USE_NOF_URMA
                 // Modified By Yida (v3): 入队前识别 buffer 类型并解析 memory
                 // domain（每个 task 一次）。kError/kNotSupported 直接标记失败
@@ -530,6 +541,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
+                    if (nof_qos->poisoned) {
+                        task->failed = true;
+                        task->remaining_lba = 0;
+                    }
                     SpdkNofSubTask* sub_task;
                     while (task->remaining_lba > 0 && avail_blocks > 0) {
                         uint32_t submit_lba_count = std::min(
@@ -582,7 +597,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                        << task->seg_handle << " submit io fail";
                             task->failed = true;
                             task->remaining_lba = 0;
+                            sub_task_pool.push(sub_task);
                         } else {
+                            if (nof_qos->inflight_blocks[0] == 0 &&
+                                nof_qos->inflight_blocks[1] == 0) {
+                                nof_qos->last_progress =
+                                    std::chrono::steady_clock::now();
+                            }
                             task->idx++;
 #ifdef USE_NOF_URMA
                             // Modified By Yida (v3): 验收指标（host/cuda
@@ -590,7 +611,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             // 即计数，完成成功在 nvmf_io_complete 另计。
                             NofMemoryDomainManager::GetInstance().OnIoSubmitted(
                                 task->buffer_info,
-                                task->op == kSpdkNofOpWrite);
+                                task->op == kSpdkNofOpWrite,
+                                static_cast<uint64_t>(submit_lba_count) *
+                                    block_size);
 #endif
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
@@ -611,10 +634,46 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         if (total_outstanding_io > 0) {
             int64_t ret = 0;
             for (auto& it : seg_to_qos) {
+                if (it.second->poisoned) continue;
                 ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
                     it.first, 0);
-                if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
+                auto& qos = *it.second;
+                const auto now = std::chrono::steady_clock::now();
+                if (ret > 0) qos.last_progress = now;
+                const bool timed_out =
+                    (qos.inflight_blocks[0] > 0 || qos.inflight_blocks[1] > 0) &&
+                    now - qos.last_progress >= io_timeout;
+                if (ret < 0 || timed_out) {
+                    LOG(ERROR) << "NoF qpair failed ret=" << ret
+                               << " timeout=" << timed_out << " seg=" << it.first;
+                    qos.poisoned = true;
+                    // Keep queued tasks alive while SPDK invokes abort callbacks.
+                    for (auto* task : live_tasks) {
+                        if (task->seg_handle == it.first) {
+                            task->failed = true;
+                            task->remaining_lba = 0;
+                        }
+                    }
+                    SpdkWrapper::GetInstance().DrainFailedNofSegment(it.first);
+                    // DMA is quiesced and SPDK no longer owns callback contexts.
+                    // Complete any tasks the transport did not callback itself.
+                    for (auto pos = live_tasks.begin(); pos != live_tasks.end();) {
+                        auto* task = *pos++;
+                        if (task->seg_handle != it.first) continue;
+#ifdef USE_NOF_URMA
+                        NofMemoryDomainManager::GetInstance().OnIoAborted(
+                            task->buffer_info, task->op == kSpdkNofOpWrite,
+                            task->outstanding_sub_io);
+#endif
+                        total_outstanding_io -= task->outstanding_sub_io;
+                        task->outstanding_sub_io = 0;
+                        task->on_chain = false;
+                        SpdkNofTaskCompletion(task);
+                    }
+                    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+                        qos.head[op] = qos.tail[op] = nullptr;
+                        qos.inflight_blocks[op] = 0;
+                    }
                 }
             }
         }

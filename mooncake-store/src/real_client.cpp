@@ -3126,6 +3126,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         bool is_local_holder = (ld_desc.client_id == client_->getClientId());
         replica_type =
             is_local_holder ? "local_disk_local" : "local_disk_remote";
+    } else if (replica.is_nof_replica()) {
+        replica_type = "nof";
+        remote_endpoint =
+            replica.get_nof_descriptor().buffer_descriptor.transport_endpoint_;
     } else {
         replica_type = "disk";
     }
@@ -3589,6 +3593,8 @@ RealClient::batch_get_buffer_internal(
                 rtype = (ld.client_id == client_->getClientId())
                             ? "local_disk_local"
                             : "local_disk_remote";
+            } else if (replica.is_nof_replica()) {
+                rtype = "nof";
             } else {
                 rtype = "disk";
             }
@@ -3985,6 +3991,10 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         bool is_local_holder = (ld_desc.client_id == client_->getClientId());
         replica_type =
             is_local_holder ? "local_disk_local" : "local_disk_remote";
+    } else if (replica.is_nof_replica()) {
+        replica_type = "nof";
+        remote_endpoint =
+            replica.get_nof_descriptor().buffer_descriptor.transport_endpoint_;
     } else {
         replica_type = "disk";
     }
@@ -5656,6 +5666,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
+    size_t nof_count = 0;
 
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
@@ -5714,6 +5725,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 rtype = (ld.client_id == client_->getClientId())
                             ? "local_disk_local"
                             : "local_disk_remote";
+            } else if (replica.is_nof_replica()) {
+                rtype = "nof";
             } else {
                 rtype = "disk";
             }
@@ -5757,7 +5770,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY: RDMA directly to user buffer.
+        // MEMORY and NoF both use the batched transfer path.
+        if (replica.is_nof_replica()) ++nof_count;
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -5793,7 +5807,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                          << "] start_time[" << FormatWallClock(t0_wall)
                          << "] query_us[" << query_us << "] prep_us[" << prep_us
                          << "] read_us[0] total_us[" << total_us
-                         << "] mem_ops[0] disk_ops[0] ssd_offload_ops[0]"
+                         << "] mem_ops[0] nof_ops[0] disk_ops[0] ssd_offload_ops[0]"
                          << " success[0] replicas[" << replica_types_log << "]";
         }
         return results;
@@ -6005,7 +6019,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
-                     << "] mem_ops[" << valid_operations.size() << "] disk_ops["
+                     << "] mem_ops[" << (valid_operations.size() - nof_count)
+                     << "] nof_ops[" << nof_count << "] disk_ops["
                      << disk_operations.size() << "] ssd_offload_ops["
                      << offload_object_count << "] success[" << success_count
                      << "] replicas[" << replica_types_log << "]";

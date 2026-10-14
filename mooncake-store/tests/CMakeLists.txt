@@ -20,6 +20,15 @@ add_executable(stress_bench_validation_test stress_bench_validation_test.cpp)
 target_include_directories(stress_bench_validation_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME stress_bench_validation_test COMMAND stress_bench_validation_test)
+add_executable(ub_allocator_lifecycle_test
+               ub_allocator_lifecycle_test.cpp
+               ../../mooncake-transfer-engine/src/transport/kunpeng_transport/ub_allocator.cpp)
+target_include_directories(ub_allocator_lifecycle_test BEFORE PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/ub_allocator_stubs
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+target_compile_definitions(ub_allocator_lifecycle_test PRIVATE USE_CUDA)
+target_link_libraries(ub_allocator_lifecycle_test PRIVATE pthread)
+add_test(NAME ub_allocator_lifecycle_test COMMAND ub_allocator_lifecycle_test)
 add_test(NAME spdk_link_dependencies_test
          COMMAND ${CMAKE_COMMAND}
                  -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/spdk_link_test

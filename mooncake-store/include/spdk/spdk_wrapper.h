@@ -56,6 +56,10 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
+    // Called by the owning worker after polling has returned. SPDK aborts
+    // requests and tears down DMA resources before callers can reuse buffers.
+    void DrainFailedNofSegment(nof_seg_handle *seg);
+
     /** @brief Open a NoF segment. */
     nof_seg_handle *OpenNofSegment(const std::string &tr_str);
 

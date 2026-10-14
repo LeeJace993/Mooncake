@@ -25,6 +25,7 @@
 #include "memory_location.h"
 #include <cassert>
 #include "ub_allocator.h"
+#include "ub_gpu_direct_stats.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
@@ -663,10 +664,12 @@ Status UbTransport::submitTransferTask(
         std::shared_ptr<StagingState> staging_state;
         StagingLease staging_lease;
         bool staged_request = false;
+        bool direct_gpu_request = false;
 
         if (isDevicePointer(request.source)) {
             const auto mode = gpuMode();
             if (mode == UbGpuMode::kGdrPeermem) {
+                direct_gpu_request = true;
                 // Direct DMA: NIC reads/writes GPU HBM via peermem. The GPU VA
                 // (request.source) was registered with is_gpu_seg=1, so post it
                 // as-is -- no staging copy, effective_source unchanged.
@@ -700,6 +703,7 @@ Status UbTransport::submitTransferTask(
                     countUbSlices(request.length, kBlockSize, kFragmentSize);
                 effective_source = staging_state->staging_ptr;
                 staged_request = true;
+                GetUbGpuDirectCounters().Stage(request.length);
 
                 if (request.opcode == TransferRequest::WRITE &&
                     !copyDeviceToHost(staging_state->staging_ptr,
@@ -754,6 +758,16 @@ Status UbTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->ts = 0;
             slice->status = Slice::PENDING;
+            slice->completion_callback = nullptr;
+            if (direct_gpu_request) {
+                GetUbGpuDirectCounters().Submit(
+                    request.opcode == TransferRequest::WRITE, slice->length);
+                slice->completion_callback = [](Slice* completed, bool success) {
+                    GetUbGpuDirectCounters().Complete(
+                        completed->opcode == TransferRequest::WRITE,
+                        success, completed->length);
+                };
+            }
             slice->ub.src_chip_id = INVALID_CHIP_ID;
             slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <ostream>
 #include <queue>
+#include <set>
 #include <stack>
 #include <string>
 #include <thread>
@@ -384,6 +386,7 @@ struct SpdkNofTask {
     int64_t* io_count;
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
+    std::set<SpdkNofTask*>* live_registry = nullptr;
 // Modified By Yida (v3): buffer 类型识别结果（每个 task 解析一次，
 // 所有 sub_task 共用）；host 时 type=kHost、domain 可能为 system domain
 #ifdef USE_NOF_URMA
@@ -427,6 +430,9 @@ struct SpdkNofQos {
     int inflight_blocks_limit;
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
+    bool poisoned = false;
+    std::chrono::steady_clock::time_point last_progress =
+        std::chrono::steady_clock::now();
 
     explicit SpdkNofQos(uint32_t block_size);
 
