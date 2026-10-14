@@ -85,6 +85,13 @@ static std::string FormatBytes(size_t bytes) {
     return oss.str();
 }
 
+static size_t MaxEffectiveBatchSize(size_t total_keys, size_t num_threads,
+                                    size_t configured_batch_size) {
+    const size_t max_keys_per_thread =
+        (total_keys + num_threads - 1) / num_threads;
+    return std::min(configured_batch_size, max_keys_per_thread);
+}
+
 static std::optional<std::string> FetchMasterAdminBody(
     const std::string& master_host, int master_admin_port,
     const std::string& path) {
@@ -333,8 +340,8 @@ DEFINE_uint64(read_segment_nums, 0,
               "Number of memory and NoF segments to read/remove from "
               "(0 = all, memory segments first)");
 DEFINE_uint64(duration, 0,
-              "Duration in seconds for continuous reading in segment_read "
-              "scenario (0 = read num_keys once)");
+              "Duration in seconds for continuous reading in local_memory and "
+              "segment_read scenarios (0 = read num_keys once)");
 DEFINE_uint64(statis_interval, 5,
               "Statistics print interval in seconds for segment_read scenario");
 DEFINE_uint64(shuffle_seed, 0,
@@ -516,7 +523,9 @@ class BenchmarkStats {
         return (wall > 0) ? static_cast<double>(total_queries_) / wall : 0;
     }
 
-    void Print(const std::string& title) const {
+    void Print(const std::string& title,
+               std::optional<size_t> effective_batch_size = std::nullopt,
+               const char* transfer_path = nullptr) const {
         std::cout << "\n";
         std::cout << "========================================"
                   << "========================================\n";
@@ -532,10 +541,17 @@ class BenchmarkStats {
         std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
         std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
         std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
+        if (effective_batch_size) {
+            std::cout << "    Max batch used: " << *effective_batch_size
+                      << "\n";
+        }
         std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
         std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
         std::cout << "    Verify data:    " << (FLAGS_verify ? "yes" : "no")
                   << "\n";
+        if (transfer_path != nullptr) {
+            std::cout << "    Transfer path:  " << transfer_path << "\n";
+        }
 
         double wall = WallSeconds();
         std::cout << "\n  Total time:        " << wall << " s\n";
@@ -843,14 +859,18 @@ class StressBenchmark {
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
         if (!BeginMeasurement()) return 1;
-        stats.StartTimer();
 
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         auto threads = LaunchReadWorkers(
-            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
-            [](size_t idx) { return MakeKey(idx); });
+            FLAGS_num_threads, FLAGS_num_keys, stats, ready_latch, start_latch,
+            done_latch, [](size_t idx) { return MakeKey(idx); });
 
+        ready_latch.wait();
+        stats.StartTimer();
+        start_latch.arrive_and_wait();
         done_latch.wait();
         stats.StopTimer();
 
@@ -861,7 +881,12 @@ class StressBenchmark {
         stats.Finalize();
 
         std::string title = "READ BENCHMARK [" + FLAGS_scenario + "]";
-        stats.Print(title);
+        stats.Print(title,
+                    MaxEffectiveBatchSize(FLAGS_num_keys, FLAGS_num_threads,
+                                          FLAGS_batch_size),
+                    FLAGS_batch_size > 1
+                        ? "batch_get_into / strategy selected per batch"
+                        : "get_into / per-object strategy");
 
         FinishMeasurement("reader");
         const int verification = FLAGS_verify ? VerifyData() : 0;
@@ -913,7 +938,8 @@ class StressBenchmark {
         LOG(INFO) << "Write phase complete";
         FinishMeasurement("local_memory_write");
         put_stats.Finalize();
-        put_stats.Print("LOCAL MEMORY PUT BENCHMARK");
+        put_stats.Print("LOCAL MEMORY PUT BENCHMARK", 1,
+                        "put_from / automatic per-object strategy");
         if (put_stats.total_failed() != 0) return 1;
 
         int warmup_ret = DoWarmup();
@@ -922,20 +948,36 @@ class StressBenchmark {
         }
 
         LOG(INFO) << "Phase 2: Concurrent reads with " << FLAGS_num_threads
-                  << " threads";
+                  << " threads, "
+                  << (FLAGS_duration > 0
+                          ? std::to_string(FLAGS_duration) + "s duration"
+                          : "single pass");
 
         BenchmarkStats stats;
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
         if (!BeginMeasurement()) return 1;
-        stats.StartTimer();
 
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::atomic<bool> stop_flag{false};
+        const std::atomic<bool>* read_stop_flag =
+            FLAGS_duration > 0 ? &stop_flag : nullptr;
         auto threads = LaunchReadWorkers(
-            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
-            [](size_t idx) { return MakeKey(idx); });
+            FLAGS_num_threads, FLAGS_num_keys, stats, ready_latch, start_latch,
+            done_latch, [](size_t idx) { return MakeKey(idx); },
+            read_stop_flag);
 
+        ready_latch.wait();
+        stats.StartTimer();
+        start_latch.arrive_and_wait();
+        if (FLAGS_duration > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(FLAGS_duration));
+            stop_flag.store(true, std::memory_order_relaxed);
+        }
         done_latch.wait();
         stats.StopTimer();
 
@@ -944,7 +986,13 @@ class StressBenchmark {
         }
 
         stats.Finalize();
-        stats.Print("LOCAL MEMORY READ BENCHMARK");
+        stats.Print(
+            "LOCAL MEMORY READ BENCHMARK",
+            MaxEffectiveBatchSize(FLAGS_num_keys, FLAGS_num_threads,
+                                  FLAGS_batch_size),
+            FLAGS_batch_size > 1
+                ? "batch_get_into / automatic batch strategy"
+                : "get_into / per-object strategy");
 
         FinishMeasurement("local_memory_read");
         const int verification = FLAGS_verify ? VerifyData() : 0;
@@ -1010,14 +1058,18 @@ class StressBenchmark {
         stats.InitThreads(FLAGS_num_threads,
                           FLAGS_num_keys / FLAGS_num_threads);
         if (!BeginMeasurement()) return 1;
-        stats.StartTimer();
 
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         auto threads = LaunchReadWorkers(
-            FLAGS_num_threads, FLAGS_num_keys, stats, start_latch, done_latch,
-            [](size_t idx) { return MakeKey(idx); });
+            FLAGS_num_threads, FLAGS_num_keys, stats, ready_latch, start_latch,
+            done_latch, [](size_t idx) { return MakeKey(idx); });
 
+        ready_latch.wait();
+        stats.StartTimer();
+        start_latch.arrive_and_wait();
         done_latch.wait();
         stats.StopTimer();
 
@@ -1026,7 +1078,12 @@ class StressBenchmark {
         }
 
         stats.Finalize();
-        stats.Print("LOCAL DISK READ BENCHMARK");
+        stats.Print("LOCAL DISK READ BENCHMARK",
+                    MaxEffectiveBatchSize(FLAGS_num_keys, FLAGS_num_threads,
+                                          FLAGS_batch_size),
+                    FLAGS_batch_size > 1
+                        ? "batch_get_into / strategy selected per batch"
+                        : "get_into / per-object strategy");
 
         FinishMeasurement("local_disk_read");
         const int verification = FLAGS_verify ? VerifyData() : 0;
@@ -1265,16 +1322,20 @@ class StressBenchmark {
         stats.InitThreads(FLAGS_num_threads,
                           all_keys.size() / FLAGS_num_threads);
         if (!BeginMeasurement()) return 1;
-        stats.StartTimer();
 
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
-        auto threads =
-            LaunchReadWorkers(FLAGS_num_threads, all_keys.size(), stats,
-                              start_latch, done_latch, [&all_keys](size_t idx) {
-                                  return all_keys[idx % all_keys.size()];
-                              });
+        auto threads = LaunchReadWorkers(
+            FLAGS_num_threads, all_keys.size(), stats, ready_latch, start_latch,
+            done_latch, [&all_keys](size_t idx) {
+                return all_keys[idx % all_keys.size()];
+            });
 
+        ready_latch.wait();
+        stats.StartTimer();
+        start_latch.arrive_and_wait();
         done_latch.wait();
         stats.StopTimer();
 
@@ -1286,7 +1347,12 @@ class StressBenchmark {
 
         std::string title = "SEGMENT READ BENCHMARK [segments=" +
                             std::to_string(read_segments.size()) + "]";
-        stats.Print(title);
+        stats.Print(title,
+                    MaxEffectiveBatchSize(all_keys.size(), FLAGS_num_threads,
+                                          FLAGS_batch_size),
+                    FLAGS_batch_size > 1
+                        ? "batch_get_into / strategy selected per batch"
+                        : "get_into / per-object strategy");
         FinishMeasurement("segment_read");
         const int verification = FLAGS_verify ? VerifySegments(read_segments) : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
@@ -2198,9 +2264,10 @@ class StressBenchmark {
     }
 
     void BatchReadWorker(size_t tid, size_t my_keys, size_t key_offset,
-                         BenchmarkStats& stats, std::latch& start_latch,
-                         std::latch& done_latch,
-                         const std::function<std::string(size_t)>& key_func) {
+                         BenchmarkStats& stats, std::latch& ready_latch,
+                         std::latch& start_latch, std::latch& done_latch,
+                         const std::function<std::string(size_t)>& key_func,
+                         const std::atomic<bool>* stop_flag) {
         bindToSocket(tid % NR_SOCKETS);
 
         ThreadResult& result = stats.GetThreadResult(tid);
@@ -2208,6 +2275,7 @@ class StressBenchmark {
 
         char* my_buf = thread_buffers_[tid].ptr;
 
+        ready_latch.count_down();
         start_latch.arrive_and_wait();
 
         size_t keys = 0;
@@ -2215,69 +2283,88 @@ class StressBenchmark {
         size_t failed = 0;
         size_t bytes = 0;
 
-        if (FLAGS_batch_size <= 1) {
-            for (size_t i = 0; i < my_keys; ++i) {
-                size_t key_idx = key_offset + i;
-                std::string key = key_func(key_idx);
+        if (my_keys > 0) {
+            do {
+                if (FLAGS_batch_size <= 1) {
+                    for (size_t i = 0; i < my_keys; ++i) {
+                        if (stop_flag != nullptr &&
+                            stop_flag->load(std::memory_order_relaxed)) {
+                            break;
+                        }
+                        size_t key_idx = key_offset + i;
+                        std::string key = key_func(key_idx);
 
-                auto t0 = Clock::now();
-                int64_t ret = client_->get_into(key, my_buf, FLAGS_value_size);
-                auto t1 = Clock::now();
+                        auto t0 = Clock::now();
+                        int64_t ret =
+                            client_->get_into(key, my_buf, FLAGS_value_size);
+                        auto t1 = Clock::now();
 
-                int64_t lat_ns = ElapsedNanos(t0, t1);
+                        int64_t lat_ns = ElapsedNanos(t0, t1);
 
-                AccountMeasuredIo(key, ret, false);
-                if (!ValidateMeasuredRead(key, my_buf, ret)) {
-                    ++failed;
-                    LOG_EVERY_N(ERROR, 100)
-                        << "get_into failed key=" << key << " ret=" << ret;
-                } else {
-                    bytes += static_cast<size_t>(ret);
-                }
-                result.latencies_ns.push_back(lat_ns);
-                ++keys;
-                ++queries;
-            }
-        } else {
-            size_t per_key_buf = FLAGS_value_size;
-            size_t i = 0;
-            while (i < my_keys) {
-                std::vector<std::string> key_list;
-                std::vector<void*> bufs;
-                std::vector<size_t> sizes;
-                size_t batch_end = std::min(i + FLAGS_batch_size, my_keys);
-                key_list.reserve(batch_end - i);
-                bufs.reserve(batch_end - i);
-                sizes.reserve(batch_end - i);
-
-                for (size_t j = i; j < batch_end; ++j) {
-                    size_t key_idx = key_offset + j;
-                    key_list.push_back(key_func(key_idx));
-                    bufs.push_back(my_buf + (j - i) * per_key_buf);
-                    sizes.push_back(FLAGS_value_size);
-                }
-
-                auto t0 = Clock::now();
-                auto results = client_->batch_get_into(key_list, bufs, sizes);
-                auto t1 = Clock::now();
-
-                int64_t lat_ns = ElapsedNanos(t0, t1);
-                result.latencies_ns.push_back(lat_ns);
-
-                for (size_t k = 0; k < key_list.size(); ++k) {
-                    const int64_t ret = k < results.size() ? results[k] : -1;
-                    AccountMeasuredIo(key_list[k], ret, false);
-                    if (!ValidateMeasuredRead(key_list[k], bufs[k], ret)) {
-                        ++failed;
-                    } else {
-                        bytes += static_cast<size_t>(results[k]);
+                        AccountMeasuredIo(key, ret, false);
+                        if (!ValidateMeasuredRead(key, my_buf, ret)) {
+                            ++failed;
+                            LOG_EVERY_N(ERROR, 100)
+                                << "get_into failed key=" << key
+                                << " ret=" << ret;
+                        } else {
+                            bytes += static_cast<size_t>(ret);
+                        }
+                        result.latencies_ns.push_back(lat_ns);
+                        ++keys;
+                        ++queries;
                     }
-                    ++keys;
-                }
-                ++queries;
+                } else {
+                    size_t per_key_buf = FLAGS_value_size;
+                    size_t i = 0;
+                    while (i < my_keys) {
+                        if (stop_flag != nullptr &&
+                            stop_flag->load(std::memory_order_relaxed)) {
+                            break;
+                        }
+                        std::vector<std::string> key_list;
+                        std::vector<void*> bufs;
+                        std::vector<size_t> sizes;
+                        size_t batch_end =
+                            std::min(i + FLAGS_batch_size, my_keys);
+                        key_list.reserve(batch_end - i);
+                        bufs.reserve(batch_end - i);
+                        sizes.reserve(batch_end - i);
 
-                i = batch_end;
-            }
+                        for (size_t j = i; j < batch_end; ++j) {
+                            size_t key_idx = key_offset + j;
+                            key_list.push_back(key_func(key_idx));
+                            bufs.push_back(my_buf + (j - i) * per_key_buf);
+                            sizes.push_back(FLAGS_value_size);
+                        }
+
+                        auto t0 = Clock::now();
+                        auto results =
+                            client_->batch_get_into(key_list, bufs, sizes);
+                        auto t1 = Clock::now();
+
+                        int64_t lat_ns = ElapsedNanos(t0, t1);
+                        result.latencies_ns.push_back(lat_ns);
+
+                        for (size_t k = 0; k < key_list.size(); ++k) {
+                            const int64_t ret =
+                                k < results.size() ? results[k] : -1;
+                            AccountMeasuredIo(key_list[k], ret, false);
+                            if (!ValidateMeasuredRead(key_list[k], bufs[k],
+                                                      ret)) {
+                                ++failed;
+                            } else {
+                                bytes += static_cast<size_t>(results[k]);
+                            }
+                            ++keys;
+                        }
+                        ++queries;
+
+                        i = batch_end;
+                    }
+                }
+            } while (stop_flag != nullptr &&
+                     !stop_flag->load(std::memory_order_relaxed));
         }
 
         result.total_bytes = bytes;
@@ -2290,8 +2377,10 @@ class StressBenchmark {
 
     std::vector<std::thread> LaunchReadWorkers(
         size_t num_threads, size_t total_keys, BenchmarkStats& stats,
-        std::latch& start_latch, std::latch& done_latch,
-        const std::function<std::string(size_t)>& key_func) {
+        std::latch& ready_latch, std::latch& start_latch,
+        std::latch& done_latch,
+        const std::function<std::string(size_t)>& key_func,
+        const std::atomic<bool>* stop_flag = nullptr) {
         std::vector<std::thread> threads;
         size_t keys_per_thread = total_keys / num_threads;
         size_t remainder = total_keys % num_threads;
@@ -2300,10 +2389,12 @@ class StressBenchmark {
             size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
             size_t key_offset = t * keys_per_thread + std::min(t, remainder);
 
-            threads.emplace_back([&, t, my_keys, key_offset]() {
-                BatchReadWorker(t, my_keys, key_offset, stats, start_latch,
-                                done_latch, key_func);
-            });
+            threads.emplace_back(
+                [&, t, my_keys, key_offset, key_func, stop_flag]() {
+                    BatchReadWorker(t, my_keys, key_offset, stats, ready_latch,
+                                    start_latch, done_latch, key_func,
+                                    stop_flag);
+                });
         }
         return threads;
     }
@@ -2324,7 +2415,7 @@ class StressBenchmark {
             const size_t key_offset =
                 t * keys_per_thread + std::min(t, remainder);
 
-            threads.emplace_back([&, t, my_keys, key_offset]() {
+            threads.emplace_back([&, t, my_keys, key_offset, key_func]() {
                 bindToSocket(t % NR_SOCKETS);
                 ThreadResult& result = stats.GetThreadResult(t);
                 result.latencies_ns.reserve(my_keys);
@@ -2450,10 +2541,11 @@ class StressBenchmark {
             size_t my_keys = keys_per_thread + (t < remainder ? 1 : 0);
             size_t key_offset = t * keys_per_thread + std::min(t, remainder);
 
-            threads.emplace_back([&, t, my_keys, key_offset, use_batch]() {
-                RemoveWorker(t, my_keys, key_offset, stats, start_latch,
-                             done_latch, use_batch, key_func);
-            });
+            threads.emplace_back(
+                [&, t, my_keys, key_offset, use_batch, key_func]() {
+                    RemoveWorker(t, my_keys, key_offset, stats, start_latch,
+                                 done_latch, use_batch, key_func);
+                });
         }
         return threads;
     }
