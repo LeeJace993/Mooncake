@@ -534,6 +534,8 @@ class BenchmarkStats {
         std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
         std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
         std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
+        std::cout << "    Verify data:    " << (FLAGS_verify ? "yes" : "no")
+                  << "\n";
 
         double wall = WallSeconds();
         std::cout << "\n  Total time:        " << wall << " s\n";
@@ -882,18 +884,26 @@ class StressBenchmark {
 
         LOG(INFO) << "Phase 1: Concurrent writes with " << FLAGS_num_threads
                   << " threads for " << FLAGS_num_keys << " keys";
+        if (!FLAGS_verify) {
+            LOG(INFO) << "Write performance mode: prefill one buffer per "
+                         "thread before timing";
+        }
         if (!BeginMeasurement()) return 1;
-        put_stats.StartTimer();
 
-        std::latch put_start_latch(
+        std::latch put_ready_latch(
             static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch put_start_latch(
+            static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch put_done_latch(
             static_cast<ptrdiff_t>(FLAGS_num_threads));
         auto put_threads = LaunchPutWorkers(
             FLAGS_num_threads, FLAGS_num_keys, config, put_stats,
-            put_start_latch, put_done_latch,
+            put_ready_latch, put_start_latch, put_done_latch,
             [](size_t idx) { return MakeKey(idx); });
 
+        put_ready_latch.wait();
+        put_stats.StartTimer();
+        put_start_latch.arrive_and_wait();
         put_done_latch.wait();
         put_stats.StopTimer();
         for (auto& thread : put_threads) {
@@ -2301,7 +2311,8 @@ class StressBenchmark {
     std::vector<std::thread> LaunchPutWorkers(
         size_t num_threads, size_t total_keys,
         const mooncake::ReplicateConfig& config, BenchmarkStats& stats,
-        std::latch& start_latch, std::latch& done_latch,
+        std::latch& ready_latch, std::latch& start_latch,
+        std::latch& done_latch,
         const std::function<std::string(size_t)>& key_func) {
         std::vector<std::thread> threads;
         threads.reserve(num_threads);
@@ -2319,11 +2330,13 @@ class StressBenchmark {
                 result.latencies_ns.reserve(my_keys);
                 char* write_buffer = thread_buffers_[t].ptr;
 
+                if (!FLAGS_verify) FillBuffer(write_buffer, t);
+                ready_latch.count_down();
                 start_latch.arrive_and_wait();
                 for (size_t i = 0; i < my_keys; ++i) {
                     const size_t key_idx = key_offset + i;
                     const std::string key = key_func(key_idx);
-                    FillBuffer(write_buffer, key_idx);
+                    if (FLAGS_verify) FillBuffer(write_buffer, key_idx);
 
                     const auto t0 = Clock::now();
                     const int ret = client_->put_from(
