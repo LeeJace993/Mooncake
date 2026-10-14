@@ -302,40 +302,69 @@ bool NofGpuDirectAvailable() {
     return NofMemoryDomainManager::GetInstance().IsGpuDirectAvailable();
 }
 
-std::string NofGpuDirectAcceptanceReport() {
+NofGpuDirectStats GetNofGpuDirectStats() {
     const auto &mgr = NofMemoryDomainManager::GetInstance();
     struct spdk_nvme_urma_memory_stats stats {};
     NofMemoryDomainManager::GetUrmaMemoryStats(&stats);
-
-    std::ostringstream oss;
-    oss << "gpu_direct_available="
-        << (mgr.IsGpuDirectAvailable() ? "yes" : "no");
+    NofGpuDirectStats result;
+    result.available = mgr.IsGpuDirectAvailable();
 #if defined(USE_NOF_GPU_DIRECT)
-    oss << " reg_mode=" << GetRegModeFromEnv();
+    result.reg_mode = GetRegModeFromEnv();
 #endif
+    result.reads = mgr.CudaIoStats(false);
+    result.writes = mgr.CudaIoStats(true);
+    result.host_io = mgr.host_io_total();
+    result.classify_fail = mgr.classify_fail_total();
+    result.dmabuf_exports = mgr.dmabuf_export_total();
+    result.staging_fallbacks = mgr.gpu_staging_fallback_total();
+    result.staged_bytes = mgr.payload_staged_bytes();
+    result.host_registrations = stats.host_registrations;
+    result.accelerator_attempts = stats.accelerator_registrations;
+    result.dmabuf_registrations = stats.dmabuf_registrations;
+    result.peer_memory_registrations = stats.peer_memory_registrations;
+    result.registration_failures = stats.registration_failures;
+    return result;
+}
+
+std::string NofGpuDirectAcceptanceReport(const NofGpuDirectStats& stats) {
+    std::ostringstream oss;
+    oss << "gpu_direct_available=" << (stats.available ? "yes" : "no");
+    if (!stats.reg_mode.empty()) oss << " reg_mode=" << stats.reg_mode;
     // buffer-domain 识别结果（计数口径，外部审阅 #3 复审）：
     // cuda_io_submitted>0 仅说明 SPDK 接受过 CUDA memory-domain I/O 提交
     // （SubmitRequest 返回成功）；提交≠完成，最终成功以 cuda_io_success
     // （completion 无错误计数）为准。
-    oss << "\nbuffer_domain: host_io=" << mgr.host_io_total()
-        << " cuda_io_submitted=" << mgr.cuda_io_submitted_total()
-        << " cuda_io_success=" << mgr.cuda_io_success_total()
-        << " classify_fail=" << mgr.classify_fail_total();
+    oss << "\nbuffer_domain: host_io=" << stats.host_io
+        << " cuda_io_submitted="
+        << stats.reads.submitted + stats.writes.submitted
+        << " cuda_io_success=" << stats.reads.success + stats.writes.success
+        << " cuda_io_failed=" << stats.reads.failed + stats.writes.failed
+        << " classify_fail=" << stats.classify_fail;
+    oss << "\ncuda_read: submitted=" << stats.reads.submitted
+        << " success=" << stats.reads.success
+        << " failed=" << stats.reads.failed;
+    oss << "\ncuda_write: submitted=" << stats.writes.submitted
+        << " success=" << stats.writes.success
+        << " failed=" << stats.writes.failed;
     // GPU Direct 过程统计：staging 回退与 staged 字节应恒为 0（严格错误
     // 策略下出现即异常）。dmabuf_exports 是 CUDA DMA-BUF 导出成功次数，
     // 注册是否成功看 spdk_urma_regs.dmabuf。
-    oss << "\ngpu_direct_io: dmabuf_exports=" << mgr.dmabuf_export_total()
-        << " gpu_staging_fallbacks=" << mgr.gpu_staging_fallback_total()
-        << " staged_bytes=" << mgr.payload_staged_bytes();
+    oss << "\ngpu_direct_io: dmabuf_exports=" << stats.dmabuf_exports
+        << " gpu_staging_fallbacks=" << stats.staging_fallbacks
+        << " staged_bytes=" << stats.staged_bytes;
     // SPDK URMA 注册统计。注意 accelerator 是**尝试数**：SPDK 在 provider
     // 检查与 URMA 注册之前就递增（nvme_urma_common.c:368），注册成功 =
     // dmabuf + peer_memory（:408/:431），失败看 failures（:379/:386/:435）。
     oss << "\nspdk_urma_regs: host=" << stats.host_registrations
-        << " accelerator_attempts=" << stats.accelerator_registrations
+        << " accelerator_attempts=" << stats.accelerator_attempts
         << " dmabuf=" << stats.dmabuf_registrations
         << " peer_memory=" << stats.peer_memory_registrations
         << " failures=" << stats.registration_failures;
     return oss.str();
+}
+
+std::string NofGpuDirectAcceptanceReport() {
+    return NofGpuDirectAcceptanceReport(GetNofGpuDirectStats());
 }
 
 }  // namespace mooncake

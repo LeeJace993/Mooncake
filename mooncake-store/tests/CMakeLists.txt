@@ -15,6 +15,16 @@ function(add_store_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Acceptance policy checks do not need hardware, SPDK, or the Store runtime.
+add_executable(stress_bench_validation_test stress_bench_validation_test.cpp)
+target_include_directories(stress_bench_validation_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME stress_bench_validation_test COMMAND stress_bench_validation_test)
+add_test(NAME spdk_link_dependencies_test
+         COMMAND ${CMAKE_COMMAND}
+                 -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/spdk_link_test
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/spdk_link_dependencies_test.cmake)
+
 function(add_ha_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -893,6 +893,16 @@ int ReportUrmaMemoryStats(bool require_dmabuf) {
               << "\n";
     std::cout << "nof_cuda_io_success=" << manager.cuda_io_success_total()
               << "\n";
+    std::cout << "nof_cuda_io_failed=" << manager.cuda_io_failed_total()
+              << "\n";
+    const auto reads = manager.CudaIoStats(false);
+    const auto writes = manager.CudaIoStats(true);
+    std::cout << "nof_cuda_read_submitted=" << reads.submitted << "\n"
+              << "nof_cuda_read_success=" << reads.success << "\n"
+              << "nof_cuda_read_failed=" << reads.failed << "\n"
+              << "nof_cuda_write_submitted=" << writes.submitted << "\n"
+              << "nof_cuda_write_success=" << writes.success << "\n"
+              << "nof_cuda_write_failed=" << writes.failed << "\n";
     std::cout << "nof_classify_fail_total=" << manager.classify_fail_total()
               << "\n";
     std::cout << "nof_dmabuf_export_total=" << manager.dmabuf_export_total()

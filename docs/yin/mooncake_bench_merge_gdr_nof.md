@@ -27,13 +27,12 @@
   = NIC 经 vendor P2P 直连 DMA GPU HBM）
 
 > ⚠️ **两条 GDR 路径要分清**。本仓库（Mooncake）里有两套独立的 GPU Direct 实现：
-> - **Store NoF → SSD**（`nof_worker_pool_bench --memory=cuda`，SPDK memory domain，
->   见 `mooncake_nof_architecture.md` §3.2）：数据从 SSD 直达 GPU 显存，走 SPDK 侧。
-> - **Transfer Engine UB transport → GPU HBM**（本文的 `stress_cluster_bench
->   --gpu_mode=gdr-peermem`）：数据从远端内存经 UB transport 直达 GPU HBM，走
->   Mooncake Transfer Engine 的 kunpeng UB transport 侧。
+> - **Store NoF/SPDK**（CUDA memory domain）：writer 为 GPU→NoF SSD，reader 为
+>   NoF SSD→GPU；依赖 `USE_NOF_GPU_DIRECT` 及实际 URMA GPU 注册成功。
+> - **Transfer Engine UB transport**（`--protocol=ub --gpu_mode=gdr-peermem`）：
+>   writer 为 GPU→远端 memory segment，reader 为远端 memory→GPU。
 >
-> 本文全程讲的是**第二条**。两条互不影响，可共存于同一构建。
+> 两条可共存于同一构建；UB 的 GPU mode 不决定 SPDK 的注册策略，分别验收。
 
 ---
 
@@ -260,11 +259,19 @@ udma.ko 的导出）。`ummu.ko` 提供 VA→PA 翻译平面。
 ./stress_cluster_bench --protocol=ub \
     --nof_segments=<seg1,seg2> --nof_replica_num=N ...
 
-# GDR 路径（GPU 显存写入）—— reader 角色（writer 不支持 gpu_mode）
-MC_UB_GPU_MODE=gdr-peermem ./stress_cluster_bench \
-    --gpu_mode=gdr-peermem --gpu_device=0 ...
-MC_UB_GPU_MODE=staging ./stress_cluster_bench \
-    --gpu_mode=staging --gpu_device=0 ...
+# GPU → 远端 UB memory segment；替换段名，并补 master/metadata 地址
+./stress_cluster_bench --scenario=segment_write --protocol=ub \
+    --gpu_mode=gdr-peermem --gpu_device=0 --require_gpu_direct=true \
+    --segments=<memory_segment> --replica_num=1 --nof_replica_num=0 \
+    --master_admin_port=<master_metrics_port> ...
+# GPU → NoF SSD；Store 的 tcp 协议不影响 SPDK URMA 数据面
+SPDK_URMA_DEV_NAME=<device> SPDK_URMA_CAPSULE_TRANSPORT=urma \
+./stress_cluster_bench --scenario=segment_write --protocol=tcp \
+    --gpu_mode=gdr-peermem --gpu_device=0 --require_gpu_direct=true \
+    --nof_segments=<nof_segment> --replica_num=0 --nof_replica_num=1 ...
+# 读方向分别为远端 memory/NoF SSD → GPU HBM
+# 改用 --scenario=segment_read；单条和批量均可用 --batch_size 控制。
+# memory staging 对照：--protocol=ub --gpu_mode=staging，不设 require_gpu_direct。
 # 分级日志：MC_VERBOSE=2 开 VLOG(2)
 ```
 
@@ -273,7 +280,10 @@ MC_UB_GPU_MODE=staging ./stress_cluster_bench \
 | flag | 默认 | 说明 |
 |---|---|---|
 | `--protocol` | tcp | tcp/rdma/ub；UB+GPU 路径需 ub |
-| `--gpu_mode` | (空/host) | gdr-peermem \| staging；writer 忽略（host only） |
+| `--gpu_mode` | (空/host) | reader 读入 GPU；writer/segment_write 从 GPU 写出；memory gdr-peermem 必须配 protocol=ub |
+| `--require_gpu_direct` | false | 强制校验直接 GPU 通路；要求 verify=true；NoF 校验实际 GPU 注册与读写 completion |
+| `--strict_segment_placement` | true | segment 场景每类型限 1 副本；PUT 后查询实际 endpoint 与地址区间，回退到其他段即失败；false 恢复 preferred 放置 |
+| `--verify` | true | 读写后按 key seed 校验完整 value，短读/不匹配返回非零；remove 在预填后校验 |
 | `--gpu_device` | 0 | GPU 设备索引；gpu_mode 空/host 时忽略 |
 | `--nof_segments` | (空) | NoF 段名逗号分隔；空=--nof_replica_num 非零时从 master 自动发现 |
 | `--nof_replica_num` | 0 | 每个 object 的 NoF SSD 副本数 |
@@ -285,14 +295,44 @@ MC_UB_GPU_MODE=staging ./stress_cluster_bench \
 
 ### 3.5 验证阶梯（部署节点）
 
-1. 编译：`-DUSE_NOF_URMA=ON -DUSE_CUDA=ON -DUSE_UB=ON` + UMDK(含 `is_gpu_seg`)
+1. 编译：`-DUSE_NOF=ON -DUSE_NOF_URMA=ON -DUSE_NOF_GPU_DIRECT=ON
+   -DUSE_CUDA=ON -DUSE_UB=ON` + UMDK(含 `is_gpu_seg`)
    + 上述模块序列。cmake 日志应见 `HAVE_URMA_SEG_CFG_IS_GPU_SEG=1`（否则
-   gdr-peermem 降级为 host/staging only）。
-2. `--gpu_mode=gdr-peermem`：验证 GPU→Mooncake 直连写（reader 角色）。
+   GPU 段注册会明确拒绝 gdr-peermem，需更换 SDK 或使用 staging）。
+2. `--scenario=segment_write --gpu_mode=gdr-peermem`：验证 GPU-source 写入；
+   `segment_read` 验证反向读取。两者都需检查退出码和数据校验结果。
 3. `--gpu_mode=staging`：验证映射到现有 staging 机制。
 4. `--nof_segments=... --nof_replica_num=N` + `list_segments`：验证 NoF 路径。
 5. ⚠️ **gdr-peermem × NoF segment 交互**：gdr-peermem 清零 `global_segment_size`，
    若 `replica_num>0` 且无远端内存段，`DiscoverBenchmarkSegments()` 可能报「no
-   memory segments found」——显式传 `--segments` 规避。
+   memory segments found」——纯 NoF 测试设 `--replica_num=0`；memory 测试指定远端段。
+
+### 3.6 NoF GPU Direct 验收
+
+`--require_gpu_direct=true` 在 I/O 和数据校验结束后检查结构化统计。
+`cuda_read` / `cuda_write` 分别打印 `submitted`、`success`、`failed`，总计保留
+`cuda_io_submitted` / `cuda_io_success`，新增 `cuda_io_failed`。粒度是 SPDK
+子任务 chunk，不是 object 数。提交不代表完成；成功应追平提交，失败应为零。
+
+GPU 注册成功以 `spdk_urma_regs.dmabuf + peer_memory > 0` 为证；
+`accelerator_attempts` 是尝试数，`dmabuf_exports` 是导出数。缓存可复用注册，
+注册数无需等于 I/O 数。分类错误、注册失败、host staging 回退都会导致强制验收失败。
+写场景还要求存在成功的 CUDA write；读场景要求 CUDA read，避免方向混淆。
+
+memory 强制验收会查询 Master `/get_segments_detail`，确认实际副本位于 UB 段；
+请把 `--master_admin_port` 设置为 Master 的 metrics/admin 端口（例如 9004）。
+`--strict_segment_placement=false` 允许副本回退，但不会跳过直接 GPU 通路检查。
+memory 强制验收会关闭本进程的 local hot cache，防止 host cache 命中替代网络 DMA。
+
+这些检查是验收条件，不是硬件测试结果。部署节点仍需从当前代码重新构建，分别验证
+CPU NoF、GPU→memory、GPU→NoF SSD；本地无硬件回归可运行：
+
+```bash
+g++ -std=c++20 -Wall -Wextra -Werror -I mooncake-store/include \
+  mooncake-store/tests/stress_bench_validation_test.cpp -o /tmp/stress_bench_validation
+/tmp/stress_bench_validation
+cmake -DTEST_DIRECTORY=/tmp/spdk_link_validation \
+  -P mooncake-store/tests/spdk_link_dependencies_test.cmake
+```
 
 完整编译部署步骤见 [`Deployment/mooncake_deployment_gdr.md`](./Deployment/mooncake_deployment_gdr.md)。

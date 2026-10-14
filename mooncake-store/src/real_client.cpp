@@ -29,6 +29,7 @@
 
 #include "real_client.h"
 #include "registered_pinned_memory.h"
+#include "gpu_direct_read.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "common.h"
@@ -3897,6 +3898,30 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_read_ub_device_memory_direct(
+    const Replica::Descriptor &replica, void *dst, size_t size) const {
+#ifdef USE_UB
+    // AllocatedBuffer::Descriptor::protocol_ is an allocation tag (normally
+    // "tcp"), not the segment transport. Use the configured client transport.
+    if (!client_) return false;
+    const char *mode = std::getenv("MC_UB_GPU_MODE");
+    const auto region = resolve_writable_buffer_region(dst);
+    if (!CanReadUbGpuDirect(replica.is_memory_replica(), client_->GetProtocol(),
+                            mode ? mode : "", region.has_value(),
+                            region ? region->size : 0,
+                            region ? region->offset : 0, size)) {
+        return false;
+    }
+    return client_->IsUbTransportSegment(
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+#else
+    (void)replica;
+    (void)dst;
+    (void)size;
+    return false;
+#endif
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {
@@ -4131,6 +4156,17 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 }
             }
 #endif
+            if (can_read_ub_device_memory_direct(replica, dst, total_size)) {
+                std::vector<mooncake::Slice> slices;
+                allocateSlices(slices, replica, dst);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, verify_checksum);
+                auto result = client_->Get(key, filtered_qr, slices);
+                if (!result) return tl::unexpected(result.error());
+                VLOG(1) << "UB GPU Direct read key=" << key
+                        << " size=" << total_size;
+                return static_cast<int64_t>(total_size);
+            }
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -4270,6 +4306,12 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
     if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (can_read_ub_device_memory_direct(replica, dst, size)) {
+            std::vector<Slice> slices{{dst, size}};
+            auto result = client_->Get(key, query_result, slices, src_offset);
+            if (!result) return tl::unexpected(result.error());
+            return static_cast<int64_t>(size);
+        }
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);

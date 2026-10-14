@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_set>
 #include <utility>
+#include <optional>
 #include <vector>
 #include <cstdlib>
 
@@ -28,6 +29,9 @@
 #include "nof_gpu_direct_report.h"
 #include "real_client.h"
 #include "ub_allocator.h"
+#include "stress_bench_validation.h"
+
+#include <ylt/struct_json/json_reader.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -79,14 +83,13 @@ static std::string FormatBytes(size_t bytes) {
     return oss.str();
 }
 
-static std::vector<std::string> DiscoverSegmentsFromMaster(
-    const std::string& master_host, int master_admin_port) {
-    std::vector<std::string> segments;
-
+static std::optional<std::string> FetchMasterAdminBody(
+    const std::string& master_host, int master_admin_port,
+    const std::string& path) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         LOG(ERROR) << "Failed to create socket for discovering segments";
-        return segments;
+        return std::nullopt;
     }
 
     struct timeval timeout;
@@ -109,22 +112,22 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
         LOG(ERROR) << "Invalid master host: " << host;
         close(sockfd);
-        return segments;
+        return std::nullopt;
     }
 
     if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         LOG(ERROR) << "Failed to connect to master admin at " << host << ":"
                    << master_admin_port;
         close(sockfd);
-        return segments;
+        return std::nullopt;
     }
 
-    std::string request = "GET /get_all_segments HTTP/1.0\r\nHost: " + host +
+    std::string request = "GET " + path + " HTTP/1.0\r\nHost: " + host +
                           "\r\nConnection: close\r\n\r\n";
     if (send(sockfd, request.c_str(), request.size(), 0) < 0) {
         LOG(ERROR) << "Failed to send HTTP request to master";
         close(sockfd);
-        return segments;
+        return std::nullopt;
     }
 
     std::string response;
@@ -134,24 +137,28 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
         response.append(buf, n);
     }
     close(sockfd);
+    if (n < 0) {
+        LOG(ERROR) << "Incomplete master admin HTTP response";
+        return std::nullopt;
+    }
 
     size_t header_end = response.find("\r\n\r\n");
     if (header_end == std::string::npos) {
         LOG(ERROR) << "Invalid HTTP response from master";
-        return segments;
+        return std::nullopt;
     }
 
     std::string header = response.substr(0, header_end);
     size_t status_pos = header.find(' ');
     if (status_pos == std::string::npos) {
         LOG(ERROR) << "Invalid HTTP response header from master";
-        return segments;
+        return std::nullopt;
     }
     size_t status_code_start = status_pos + 1;
     size_t status_code_end = header.find(' ', status_code_start);
     if (status_code_end == std::string::npos) {
         LOG(ERROR) << "Invalid HTTP status line from master";
-        return segments;
+        return std::nullopt;
     }
     std::string status_code =
         header.substr(status_code_start, status_code_end - status_code_start);
@@ -159,11 +166,19 @@ static std::vector<std::string> DiscoverSegmentsFromMaster(
         LOG(ERROR) << "HTTP request failed with status " << status_code
                    << " from master at " << master_host << ":"
                    << master_admin_port;
-        return segments;
+        return std::nullopt;
     }
 
-    std::string body = response.substr(header_end + 4);
-    std::istringstream iss(body);
+    return response.substr(header_end + 4);
+}
+
+static std::vector<std::string> DiscoverSegmentsFromMaster(
+    const std::string& master_host, int master_admin_port) {
+    std::vector<std::string> segments;
+    auto body = FetchMasterAdminBody(master_host, master_admin_port,
+                                    "/get_all_segments");
+    if (!body) return segments;
+    std::istringstream iss(*body);
     std::string line;
     // Use an unordered_set to track already-seen segments and avoid duplicates
     std::unordered_set<std::string> seen;
@@ -215,7 +230,22 @@ enum class SegmentKind { MEMORY, NOF };
 struct BenchmarkSegment {
     std::string name;
     SegmentKind kind;
+    std::vector<mooncake::bench::PlacementRegion> regions;
 };
+
+struct MemorySegmentDetail {
+    std::string segment_name;
+    std::string base_address;
+    uint64_t size_bytes = 0;
+    std::string te_endpoint;
+    std::string protocol;
+};
+YLT_REFL(MemorySegmentDetail, segment_name, base_address, size_bytes, te_endpoint,
+         protocol);
+struct MemorySegmentsDetail {
+    std::vector<MemorySegmentDetail> segments;
+};
+YLT_REFL(MemorySegmentsDetail, segments);
 
 static const char* SegmentKindName(SegmentKind kind) {
     return kind == SegmentKind::MEMORY ? "memory" : "NoF";
@@ -251,7 +281,13 @@ DEFINE_uint64(client_init_wait_seconds, 0,
               "Seconds to wait after RealClient setup succeeds and before "
               "benchmark run starts. This can give asynchronous RPC/transfer "
               "warmup and background initialization time to settle.");
-DEFINE_bool(verify, true, "Verify data integrity after read");
+DEFINE_bool(verify, true, "Verify full values after read/write (before remove)");
+DEFINE_bool(strict_segment_placement, true,
+            "Check actual placement after segment PUTs; require one replica "
+            "per selected type. False permits preferred-placement fallback.");
+DEFINE_bool(require_gpu_direct, false,
+            "Fail unless the requested direct GPU path is supported and "
+            "NoF GPU I/O completes with successful GPU registrations.");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_uint64(nof_replica_num, 0,
               "Number of NoF SSD replicas for each object");
@@ -266,8 +302,8 @@ DEFINE_string(nof_segments, "",
               "Leave empty to auto-discover from master when "
               "--nof_replica_num is nonzero.");
 DEFINE_uint64(master_admin_port, 9003,
-              "Master admin HTTP port for auto-discovering memory segments; "
-              "NoF discovery uses --master_server RPC");
+              "Master admin HTTP port for memory segment discovery and "
+              "placement checks; NoF uses --master_server RPC");
 DEFINE_uint64(read_segment_nums, 0,
               "Number of memory and NoF segments to read/remove from "
               "(0 = all, memory segments first)");
@@ -616,6 +652,33 @@ class StressBenchmark {
         LOG(INFO) << "RealClient setup succeeded"
                   << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
+        if (gpu_config_.use_gpu_buffer && FLAGS_nof_replica_num > 0) {
+            if (!EnsurePlacementClient()) return -1;
+            auto snapshots = placement_client_->GetAllNoFSegments();
+            if (!snapshots || snapshots->empty()) {
+                LOG(ERROR) << "Cannot inspect NoF endpoints for GPU I/O";
+                return -1;
+            }
+            const auto requested = ParseSegments(FLAGS_nof_segments);
+            const bool segment_scenario = FLAGS_scenario == "segment_write" ||
+                                          FLAGS_scenario == "segment_read" ||
+                                          FLAGS_scenario == "remove" ||
+                                          FLAGS_scenario == "batch_remove";
+            for (const auto& segment : *snapshots) {
+                if (segment_scenario && FLAGS_strict_segment_placement &&
+                    !requested.empty() &&
+                    std::find(requested.begin(), requested.end(), segment.name) ==
+                        requested.end()) {
+                    continue;
+                }
+                if (!IsUrmaEndpoint(segment.te_endpoint)) {
+                    LOG(ERROR) << "NoF GPU I/O requires URMA endpoints: "
+                               << segment.name << " " << segment.te_endpoint;
+                    return -1;
+                }
+            }
+        }
+
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
         if (gpu_config_.use_gpu_buffer) {
 #if defined(USE_CUDA) && defined(USE_UB)
@@ -709,11 +772,12 @@ class StressBenchmark {
                   << " failed";
         put_stats.FinalizeSequential();
         put_stats.Print("PUT BENCHMARK [" + FLAGS_scenario + "]");
+        const int verification = FLAGS_verify ? VerifyData() : 0;
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for reader to connect...";
         std::this_thread::sleep_for(std::chrono::seconds(FLAGS_wait_seconds));
 
-        return (failed > 0) ? -1 : 0;
+        return mooncake::bench::ExitCode(failed, verification);
     }
 
     int RunReader() {
@@ -763,16 +827,8 @@ class StressBenchmark {
         std::string title = "READ BENCHMARK [" + FLAGS_scenario + "]";
         stats.Print(title);
 
-        if (FLAGS_verify) {
-            int v = VerifyData();
-            if (v != 0) {
-                LOG(ERROR) << "Data verification FAILED";
-            } else {
-                LOG(INFO) << "Data verification PASSED";
-            }
-        }
-
-        return 0;
+        const int verification = FLAGS_verify ? VerifyData() : 0;
+        return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
 
     int RunLocalMemory() {
@@ -840,13 +896,8 @@ class StressBenchmark {
         stats.Finalize();
         stats.Print("LOCAL MEMORY READ BENCHMARK");
 
-        if (FLAGS_verify) {
-            int v = VerifyData();
-            LOG_IF(INFO, v == 0) << "Data verification PASSED";
-            LOG_IF(ERROR, v != 0) << "Data verification FAILED";
-        }
-
-        return 0;
+        const int verification = FLAGS_verify ? VerifyData() : 0;
+        return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
 
     int RunLocalDisk() {
@@ -921,13 +972,8 @@ class StressBenchmark {
         stats.Finalize();
         stats.Print("LOCAL DISK READ BENCHMARK");
 
-        if (FLAGS_verify) {
-            int v = VerifyData();
-            LOG_IF(INFO, v == 0) << "Data verification PASSED";
-            LOG_IF(ERROR, v != 0) << "Data verification FAILED";
-        }
-
-        return 0;
+        const int verification = FLAGS_verify ? VerifyData() : 0;
+        return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
 
     static std::vector<std::string> ParseSegments(const std::string& value) {
@@ -1032,6 +1078,10 @@ class StressBenchmark {
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
                 auto t1 = Clock::now();
+                if (ret == 0 && FLAGS_strict_segment_placement &&
+                    !VerifyPlacement(key, segment)) {
+                    ret = -1;
+                }
                 RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
 
                 if (ret != 0) {
@@ -1054,7 +1104,7 @@ class StressBenchmark {
         for (size_t s = 0; s < segments.size(); ++s) {
             total_written += seg_written[s];
             total_failed += seg_failed[s];
-            LOG(INFO) << "Segment [" << s << "] " << segments[s].name
+            LOG(INFO) << "Requested segment [" << s << "] " << segments[s].name
                       << " type=" << SegmentKindName(segments[s].kind)
                       << " complete: " << seg_written[s] << " succeeded, "
                       << seg_failed[s] << " failed";
@@ -1064,12 +1114,13 @@ class StressBenchmark {
                   << " succeeded, " << total_failed << " failed";
         put_stats.FinalizeSequential();
         put_stats.Print("SEGMENT PUT BENCHMARK");
+        const int verification = FLAGS_verify ? VerifySegments(segments) : 0;
 
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for reader to connect...";
         std::this_thread::sleep_for(std::chrono::seconds(FLAGS_wait_seconds));
 
-        return (total_failed > 0) ? -1 : 0;
+        return mooncake::bench::ExitCode(total_failed, verification);
     }
 
     int RunSegmentRead() {
@@ -1171,7 +1222,8 @@ class StressBenchmark {
         std::string title = "SEGMENT READ BENCHMARK [segments=" +
                             std::to_string(read_segments.size()) + "]";
         stats.Print(title);
-        return 0;
+        const int verification = FLAGS_verify ? VerifySegments(read_segments) : 0;
+        return mooncake::bench::ExitCode(stats.total_failed(), verification);
     }
 
     struct IntervalLatencyStats {
@@ -1291,7 +1343,7 @@ class StressBenchmark {
                             thread_latencies[t].push_back(latency_ns);
                         }
 
-                        if (ret < 0) {
+                        if (ret != static_cast<int64_t>(FLAGS_value_size)) {
                             global_failed.fetch_add(1,
                                                     std::memory_order_relaxed);
                         } else {
@@ -1333,8 +1385,10 @@ class StressBenchmark {
                             thread_latencies[t].push_back(latency_ns);
                         }
 
-                        for (size_t k = 0; k < results.size(); ++k) {
-                            if (results[k] < 0) {
+                        for (size_t k = 0; k < keys.size(); ++k) {
+                            if (k >= results.size() ||
+                                results[k] !=
+                                    static_cast<int64_t>(FLAGS_value_size)) {
                                 global_failed.fetch_add(
                                     1, std::memory_order_relaxed);
                             } else {
@@ -1555,7 +1609,8 @@ class StressBenchmark {
         std::cout << "========================================"
                   << "========================================\n\n";
 
-        return 0;
+        const int verification = FLAGS_verify ? VerifySegments(read_segments) : 0;
+        return mooncake::bench::ExitCode(final_failed, verification);
     }
 
     int RunSegmentRemove(bool use_batch) {
@@ -1618,6 +1673,10 @@ class StressBenchmark {
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
                 auto t1 = Clock::now();
+                if (ret == 0 && FLAGS_strict_segment_placement &&
+                    !VerifyPlacement(key, segment)) {
+                    ret = -1;
+                }
                 RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
                 if (ret != 0) {
                     LOG(ERROR) << "put_from failed for key=" << key
@@ -1638,6 +1697,9 @@ class StressBenchmark {
         LOG(INFO) << "Prefill phase complete";
         put_stats.FinalizeSequential();
         put_stats.Print("REMOVE PREFILL PUT BENCHMARK");
+        if (FLAGS_verify && VerifySegments(remove_segments, true) != 0) {
+            return 1;
+        }
 
         // Phase 2: assemble the full key list in the same order as
         // RunSegmentRead (outer key index, inner segment).
@@ -1677,7 +1739,7 @@ class StressBenchmark {
         stats.Print(use_batch ? "SEGMENT BATCH REMOVE BENCHMARK"
                               : "SEGMENT REMOVE BENCHMARK");
 
-        return 0;
+        return mooncake::bench::ExitCode(stats.total_failed());
     }
 
     int RunListSegments() {
@@ -1815,14 +1877,7 @@ class StressBenchmark {
             if (shadow.size() != buffer_size_) shadow.assign(buffer_size_, 0);
             target = shadow.data();
         }
-        uint64_t* ptr = reinterpret_cast<uint64_t*>(target);
-        size_t num_words = FLAGS_value_size / sizeof(uint64_t);
-        uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
-        for (size_t w = 0; w < num_words; ++w) {
-            pattern = (pattern ^ (pattern >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            pattern = (pattern ^ (pattern >> 27)) * 0x94D049BB133111EBULL;
-            ptr[w] = pattern ^ (pattern >> 31);
-        }
+        mooncake::bench::FillPattern(target, FLAGS_value_size, seed);
 #if defined(USE_CUDA)
         if (buffer_is_gpu_) {
             checkCudaError(cudaMemcpy(buffer_, shadow.data(), FLAGS_value_size,
@@ -1840,6 +1895,7 @@ class StressBenchmark {
     }
 
     bool CheckBuffer(size_t seed, const void* data, size_t size) const {
+        if (size != FLAGS_value_size) return false;
         const void* compare_data = data;
         static thread_local std::vector<uint8_t> shadow;
 #if defined(USE_CUDA)
@@ -1857,22 +1913,8 @@ class StressBenchmark {
             compare_data = shadow.data();
         }
 #endif
-        const uint64_t* ptr =
-            reinterpret_cast<const uint64_t*>(compare_data);
-        size_t num_words = size / sizeof(uint64_t);
-        uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
-        for (size_t w = 0; w < num_words; ++w) {
-            pattern = (pattern ^ (pattern >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            pattern = (pattern ^ (pattern >> 27)) * 0x94D049BB133111EBULL;
-            uint64_t expected = pattern ^ (pattern >> 31);
-            if (ptr[w] != expected) {
-                LOG(ERROR) << "Checksum mismatch at word " << w
-                           << " for seed=" << seed << " expected=" << std::hex
-                           << expected << " got=" << ptr[w] << std::dec;
-                return false;
-            }
-        }
-        return true;
+        return mooncake::bench::CheckPattern(compare_data, size, FLAGS_value_size,
+                                             seed);
     }
 
     int DoWarmup() {
@@ -1922,7 +1964,7 @@ class StressBenchmark {
 
                 int64_t lat_ns = ElapsedNanos(t0, t1);
 
-                if (ret < 0) {
+                if (ret != static_cast<int64_t>(FLAGS_value_size)) {
                     ++failed;
                     LOG_EVERY_N(ERROR, 100)
                         << "get_into failed key=" << key << " ret=" << ret;
@@ -1959,8 +2001,9 @@ class StressBenchmark {
                 int64_t lat_ns = ElapsedNanos(t0, t1);
                 result.latencies_ns.push_back(lat_ns);
 
-                for (size_t k = 0; k < results.size(); ++k) {
-                    if (results[k] < 0) {
+                for (size_t k = 0; k < key_list.size(); ++k) {
+                    if (k >= results.size() ||
+                        results[k] != static_cast<int64_t>(FLAGS_value_size)) {
                         ++failed;
                     } else {
                         bytes += static_cast<size_t>(results[k]);
@@ -2061,8 +2104,8 @@ class StressBenchmark {
                 int64_t lat_ns = ElapsedNanos(t0, t1);
                 result.latencies_ns.push_back(lat_ns);
 
-                for (size_t k = 0; k < results.size(); ++k) {
-                    if (results[k] != 0) {
+                for (size_t k = 0; k < key_list.size(); ++k) {
+                    if (k >= results.size() || results[k] != 0) {
                         ++failed;
                     } else {
                         bytes += per_key_buf;
@@ -2110,7 +2153,7 @@ class StressBenchmark {
             std::sort(names.begin(), names.end());
             names.erase(std::unique(names.begin(), names.end()), names.end());
             for (auto& name : names) {
-                segments.push_back({std::move(name), kind});
+                segments.push_back({std::move(name), kind, {}});
             }
         };
 
@@ -2141,7 +2184,214 @@ class StressBenchmark {
             }
             append(std::move(nof_segments), SegmentKind::NOF);
         }
+        if (FLAGS_strict_segment_placement || FLAGS_require_gpu_direct) {
+            if (!LoadSegmentRegions(segments)) return {};
+        }
         return segments;
+    }
+
+    static bool IsUrmaEndpoint(const std::string& endpoint) {
+        std::istringstream tokens(endpoint);
+        std::string token;
+        while (tokens >> token) {
+            if (token == "trtype:URMA") return true;
+        }
+        return false;
+    }
+
+    bool EnsurePlacementClient() {
+        if (placement_client_) return true;
+        auto master = std::make_unique<mooncake::MasterClient>(
+            mooncake::generate_uuid());
+        if (master->Connect(FLAGS_master_server) != mooncake::ErrorCode::OK) {
+            LOG(ERROR) << "Cannot connect to master for placement checks";
+            return false;
+        }
+        placement_client_ = std::move(master);
+        return true;
+    }
+
+    bool EnsureMemorySegmentDetails() {
+        if (memory_segment_details_) return true;
+        auto body = FetchMasterAdminBody(
+            FLAGS_master_server, static_cast<int>(FLAGS_master_admin_port),
+            "/get_segments_detail");
+        if (!body) return false;
+        try {
+            MemorySegmentsDetail details;
+            struct_json::from_json(details, *body);
+            memory_segment_details_ = std::move(details);
+            return true;
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Cannot inspect memory segment details: "
+                       << error.what();
+            return false;
+        }
+    }
+
+    static std::optional<mooncake::bench::PlacementRegion> MemoryRegion(
+        const MemorySegmentDetail& item) {
+        try {
+            size_t consumed = 0;
+            const auto base = std::stoull(item.base_address, &consumed, 0);
+            if (consumed == item.base_address.size() && item.size_bytes > 0 &&
+                !item.te_endpoint.empty()) {
+                return mooncake::bench::PlacementRegion{
+                    base, item.size_bytes, item.te_endpoint, item.protocol};
+            }
+        } catch (const std::exception&) {
+        }
+        LOG(ERROR) << "Invalid memory segment region: " << item.segment_name;
+        return std::nullopt;
+    }
+
+    bool LoadSegmentRegions(std::vector<BenchmarkSegment>& segments) {
+        if (FLAGS_replica_num > 0 && !EnsureMemorySegmentDetails()) return false;
+        std::vector<mooncake::NoFSegment> nof;
+        if (FLAGS_nof_replica_num > 0) {
+            if (!EnsurePlacementClient()) return false;
+            auto result = placement_client_->GetAllNoFSegments();
+            if (!result) return false;
+            nof = std::move(*result);
+        }
+        for (auto& segment : segments) {
+            if (segment.kind == SegmentKind::NOF) {
+                for (const auto& region : nof) {
+                    if (region.name == segment.name) {
+                        segment.regions.push_back(
+                            {region.base, region.size, region.te_endpoint,
+                             "nof"});
+                    }
+                }
+            } else {
+                for (const auto& item : memory_segment_details_->segments) {
+                    if (item.segment_name != segment.name) continue;
+                    auto region = MemoryRegion(item);
+                    if (!region) return false;
+                    segment.regions.push_back(std::move(*region));
+                }
+            }
+            if (segment.regions.empty()) {
+                LOG(ERROR) << "Requested segment is not mounted: "
+                           << segment.name;
+                return false;
+            }
+            for (const auto& region : segment.regions) {
+                if (FLAGS_require_gpu_direct &&
+                    segment.kind == SegmentKind::MEMORY &&
+                    region.protocol != "ub") {
+                    LOG(ERROR) << "Direct GPU memory segment must use UB: "
+                               << segment.name;
+                    return false;
+                }
+                LOG(INFO) << "Requested segment=" << segment.name
+                          << " endpoint=" << region.endpoint
+                          << " effective_path="
+                          << (segment.kind == SegmentKind::NOF
+                                  ? (gpu_config_.use_gpu_buffer
+                                         ? "nof/urma/cuda-domain" : "nof/host")
+                                  : region.protocol + "/" + gpu_config_.mode);
+            }
+        }
+        return true;
+    }
+
+    bool VerifyDirectMemoryPlacement(const std::string& key) {
+        if (!FLAGS_require_gpu_direct || FLAGS_replica_num == 0) return true;
+        if (!EnsurePlacementClient()) return false;
+        auto result = placement_client_->GetReplicaList(key);
+        if (!result || result->replicas.empty()) return false;
+        if (!EnsureMemorySegmentDetails()) return false;
+        for (const auto& replica : result->replicas) {
+            if (replica.is_nof_replica()) continue;
+            if (!replica.is_memory_replica()) return false;
+            const auto& descriptor =
+                replica.get_memory_descriptor().buffer_descriptor;
+            bool direct = false;
+            for (const auto& item : memory_segment_details_->segments) {
+                if (item.protocol != "ub") continue;
+                auto region = MemoryRegion(item);
+                if (region && region->Contains(descriptor.buffer_address_,
+                                               descriptor.size_,
+                                               descriptor.transport_endpoint_)) {
+                    direct = true;
+                    break;
+                }
+            }
+            if (!direct) {
+                LOG(ERROR) << "Memory GPU Direct placement rejected key=" << key
+                           << " actual_endpoint="
+                           << descriptor.transport_endpoint_;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool VerifyPlacement(const std::string& key,
+                         const BenchmarkSegment& segment) {
+        if (!EnsurePlacementClient()) return false;
+        auto result = placement_client_->GetReplicaList(key);
+        if (!result || result->replicas.size() != 1) {
+            LOG(ERROR) << "Expected one replica for key=" << key
+                       << " requested_segment=" << segment.name;
+            return false;
+        }
+        const auto& replica = result->replicas.front();
+        const mooncake::AllocatedBuffer::Descriptor* descriptor = nullptr;
+        if (segment.kind == SegmentKind::NOF && replica.is_nof_replica()) {
+            descriptor = &replica.get_nof_descriptor().buffer_descriptor;
+        } else if (segment.kind == SegmentKind::MEMORY &&
+                   replica.is_memory_replica()) {
+            descriptor = &replica.get_memory_descriptor().buffer_descriptor;
+        }
+        if (descriptor) {
+            for (const auto& region : segment.regions) {
+                if (region.Contains(descriptor->buffer_address_,
+                                    descriptor->size_,
+                                    descriptor->transport_endpoint_)) {
+                    VLOG(1) << "Placement verified key=" << key
+                            << " requested_segment=" << segment.name
+                            << " actual_endpoint=" << region.endpoint;
+                    return true;
+                }
+            }
+        }
+        LOG(ERROR) << "Placement mismatch key=" << key
+                   << " requested_segment=" << segment.name
+                   << " actual_endpoint="
+                   << (descriptor ? descriptor->transport_endpoint_
+                                  : "wrong-type");
+        return false;
+    }
+
+    int VerifySegments(const std::vector<BenchmarkSegment>& segments,
+                       bool remove_keys = false) {
+        size_t errors = 0;
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (const auto& segment : segments) {
+                const auto key = remove_keys ? MakeRemoveKey(segment, i)
+                                             : MakeSegmentKey(segment, i);
+                if (!VerifyDirectMemoryPlacement(key)) {
+                    ++errors;
+                    continue;
+                }
+                if (FLAGS_strict_segment_placement &&
+                    !VerifyPlacement(key, segment)) {
+                    ++errors;
+                    continue;
+                }
+                const auto ret =
+                    client_->get_into(key, buffer_, FLAGS_value_size);
+                if (ret != static_cast<int64_t>(FLAGS_value_size) ||
+                    !CheckBuffer(i, buffer_, FLAGS_value_size)) {
+                    LOG(ERROR) << "Segment verification failed key=" << key;
+                    ++errors;
+                }
+            }
+        }
+        LOG(INFO) << "Segment verification: errors=" << errors;
+        return mooncake::bench::ExitCode(errors);
     }
 
     int VerifyData() {
@@ -2151,8 +2401,12 @@ class StressBenchmark {
 
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
+            if (!VerifyDirectMemoryPlacement(key)) {
+                ++errors;
+                continue;
+            }
             int64_t ret = client_->get_into(key, buffer_, FLAGS_value_size);
-            if (ret < 0) {
+            if (ret != static_cast<int64_t>(FLAGS_value_size)) {
                 LOG(ERROR) << "Verify: get_into failed for key=" << key;
                 ++errors;
                 continue;
@@ -2169,6 +2423,8 @@ class StressBenchmark {
     }
 
     std::shared_ptr<mooncake::RealClient> client_;
+    std::unique_ptr<mooncake::MasterClient> placement_client_;
+    std::optional<MemorySegmentsDetail> memory_segment_details_;
     char* buffer_;
     size_t buffer_size_;
     bool buffer_is_gpu_ = false;
@@ -2245,8 +2501,6 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
-    ValidateGpuDevice(gpu_config);
-    ApplyGpuEnv(gpu_config);
 
     // External review #2: GPU 写入是显式路径，不靠 role 绕行。writer（含
     // segment_write/remove 预填等直接写场景）带 --gpu_mode 时即从 GPU buffer
@@ -2339,8 +2593,84 @@ int main(int argc, char* argv[]) {
     // Listing is read-only. Do not mount the benchmark's own memory segment
     // before taking a snapshot of the segments already registered with Master.
     if (FLAGS_scenario == "list_segments") {
+        if (FLAGS_require_gpu_direct) {
+            LOG(ERROR) << "list_segments does not perform GPU I/O";
+            return 1;
+        }
         StressBenchmark bench;
         return bench.Run();
+    }
+
+    if (FLAGS_num_keys == 0 || FLAGS_num_threads == 0 ||
+        FLAGS_batch_size == 0 || FLAGS_value_size == 0 ||
+        (FLAGS_duration > 0 && FLAGS_statis_interval == 0)) {
+        LOG(ERROR) << "num_keys, num_threads, batch_size, value_size and "
+                      "duration statistics interval must be positive";
+        return 1;
+    }
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    const auto max_read_size =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (FLAGS_value_size > max_read_size ||
+        FLAGS_batch_size > max_size / FLAGS_value_size ||
+        FLAGS_num_keys > max_size / FLAGS_value_size ||
+        FLAGS_num_threads == max_size ||
+        (gpu_config.mode == "gdr-peermem" &&
+         FLAGS_num_threads + 1 >
+             max_size / (FLAGS_batch_size * FLAGS_value_size))) {
+        LOG(ERROR) << "Requested benchmark sizes overflow buffer or byte counts";
+        return 1;
+    }
+    const bool segment_scenario = FLAGS_scenario == "segment_write" ||
+                                  FLAGS_scenario == "segment_read" ||
+                                  FLAGS_scenario == "remove" ||
+                                  FLAGS_scenario == "batch_remove";
+    if (segment_scenario && FLAGS_strict_segment_placement &&
+        (FLAGS_replica_num > 1 || FLAGS_nof_replica_num > 1)) {
+        LOG(ERROR) << "Strict segment placement requires one replica per type; "
+                      "use --strict_segment_placement=false for replica tests";
+        return 1;
+    }
+    mooncake::bench::GpuPathOptions path;
+    path.mode = gpu_config.mode;
+    path.protocol = FLAGS_protocol;
+    path.memory_replicas = FLAGS_replica_num > 0;
+    path.nof_replicas = FLAGS_nof_replica_num > 0;
+    path.require_direct = FLAGS_require_gpu_direct;
+#if defined(USE_CUDA)
+    path.cuda_build = true;
+#endif
+#if defined(USE_UB)
+    path.ub_build = true;
+#endif
+#if defined(USE_NOF_URMA) && defined(USE_NOF_GPU_DIRECT)
+    path.nof_gpu_build = true;
+    path.nof_gpu_available = mooncake::NofGpuDirectAvailable();
+#endif
+    const auto path_error = mooncake::bench::ValidateGpuPath(path);
+    if (!path_error.empty()) {
+        LOG(ERROR) << path_error;
+        return 1;
+    }
+    if (FLAGS_require_gpu_direct &&
+        (!FLAGS_verify || FLAGS_enable_ssd_offload ||
+         FLAGS_scenario == "local_disk" || FLAGS_scenario == "remote_disk")) {
+        LOG(ERROR) << "--require_gpu_direct requires --verify=true and "
+                      "memory/NoF replicas without local SSD offload";
+        return 1;
+    }
+    ValidateGpuDevice(gpu_config);
+    ApplyGpuEnv(gpu_config);
+    if (FLAGS_require_gpu_direct && FLAGS_replica_num > 0) {
+        // A host hot-cache hit would measure a local copy instead of URMA DMA.
+        ::setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0", 1);
+        LOG(INFO) << "Local hot cache disabled for direct GPU acceptance";
+    }
+    LOG(INFO) << "Requested memory path: " << FLAGS_protocol << "/"
+              << gpu_config.mode;
+    if (FLAGS_nof_replica_num > 0) {
+        LOG(INFO) << "Requested NoF path: "
+                  << (gpu_config.use_gpu_buffer ? "urma/cuda-domain" : "host");
     }
 
     if (FLAGS_replica_num == 0 && FLAGS_nof_replica_num == 0) {
@@ -2386,8 +2716,24 @@ int main(int argc, char* argv[]) {
     // 提交（提交口径）；最终成功以 cuda_io_success 为准（完成口径，按
     // SPDK 子任务 chunk 计，结合本 bench 的操作成功/失败统计解读）；
     // accelerator_attempts 是注册尝试数，注册成功看 dmabuf+peer_memory。
+    const auto gpu_stats = mooncake::GetNofGpuDirectStats();
     LOG(INFO) << "NoF GPU Direct acceptance report:\n"
-              << mooncake::NofGpuDirectAcceptanceReport();
+              << mooncake::NofGpuDirectAcceptanceReport(gpu_stats);
+    if (FLAGS_require_gpu_direct && FLAGS_nof_replica_num > 0) {
+        const bool local = FLAGS_scenario == "local_memory";
+        const bool remote = FLAGS_scenario == "remote_memory";
+        const bool require_write = local || FLAGS_scenario == "segment_write" ||
+                                   FLAGS_scenario == "remove" ||
+                                   FLAGS_scenario == "batch_remove" ||
+                                   (remote && FLAGS_role == "writer");
+        const bool require_read = local || FLAGS_scenario == "segment_read" ||
+                                  (remote && FLAGS_role == "reader");
+        if (!mooncake::NofGpuDirectPassed(gpu_stats, require_read,
+                                         require_write)) {
+            LOG(ERROR) << "NoF GPU Direct acceptance FAILED";
+            ret = 1;
+        }
+    }
 #endif
     return ret;
 }

@@ -154,7 +154,8 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     // OnIoSubmitted 只证明 GPU I/O 提交成功；CUDA I/O 的最终成功在此
     // completion 无错误处另计（cuda_io_success），两者不可混用。
     mooncake::NofMemoryDomainManager::GetInstance().OnIoCompleted(
-        task->buffer_info, !spdk_nvme_cpl_is_error(cpl));
+        task->buffer_info, !spdk_nvme_cpl_is_error(cpl),
+        op == mooncake::kSpdkNofOpWrite);
 #endif
 
     SpdkNofTaskCompletion(task);
@@ -588,7 +589,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             // 分开计数）。提交口径：SubmitRequest 返回成功
                             // 即计数，完成成功在 nvmf_io_complete 另计。
                             NofMemoryDomainManager::GetInstance().OnIoSubmitted(
-                                task->buffer_info);
+                                task->buffer_info,
+                                task->op == kSpdkNofOpWrite);
 #endif
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;

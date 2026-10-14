@@ -563,6 +563,9 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
 
+    bool can_read_ub_device_memory_direct(const Replica::Descriptor &replica,
+                                         void *dst, size_t size) const;
+
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,

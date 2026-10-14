@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace mooncake {
@@ -21,13 +22,58 @@ namespace mooncake {
 /// 仅在 USE_NOF_URMA 构建中有定义。
 bool NofGpuDirectAvailable();
 
+struct NofGpuIoStats {
+    uint64_t submitted = 0;
+    uint64_t success = 0;
+    uint64_t failed = 0;
+};
+
+// Read after draining I/O for a consistent acceptance result. Registrations
+// can be reused across many requests, so their count need not match I/O count.
+struct NofGpuDirectStats {
+    bool available = false;
+    std::string reg_mode;
+    NofGpuIoStats reads;
+    NofGpuIoStats writes;
+    uint64_t host_io = 0;
+    uint64_t classify_fail = 0;
+    uint64_t dmabuf_exports = 0;
+    uint64_t staging_fallbacks = 0;
+    uint64_t staged_bytes = 0;
+    uint64_t host_registrations = 0;
+    uint64_t accelerator_attempts = 0;
+    uint64_t dmabuf_registrations = 0;
+    uint64_t peer_memory_registrations = 0;
+    uint64_t registration_failures = 0;
+};
+
+NofGpuDirectStats GetNofGpuDirectStats();
+std::string NofGpuDirectAcceptanceReport(const NofGpuDirectStats& stats);
+
+// Pure predicate, also usable without SPDK by acceptance tools and tests.
+inline bool NofGpuDirectPassed(const NofGpuDirectStats& stats,
+                               bool require_read, bool require_write) {
+    const auto& reads = stats.reads;
+    const auto& writes = stats.writes;
+    return stats.available &&
+           reads.submitted + writes.submitted > 0 &&
+           (!require_read || reads.submitted > 0) &&
+           (!require_write || writes.submitted > 0) &&
+           reads.success == reads.submitted &&
+           writes.success == writes.submitted && reads.failed == 0 &&
+           writes.failed == 0 && stats.classify_fail == 0 &&
+           stats.staging_fallbacks == 0 && stats.staged_bytes == 0 &&
+           stats.dmabuf_registrations + stats.peer_memory_registrations > 0 &&
+           stats.registration_failures == 0;
+}
+
 /**
  * @brief 一次性验收输出（多行，无尾随换行）。
  *
  * 内容（对应审阅意见 #3 及其复审）：
  *   - gpu_direct_available / reg_mode（MC_NOF_GPU_REG_MODE）
  *   - buffer-domain 识别统计：host_io / cuda_io_submitted /
- *     cuda_io_success / classify_fail。
+ *     cuda_io_success / cuda_io_failed / classify_fail；CUDA I/O 另按读写拆分。
  *     计数口径：cuda_io_submitted 是**提交口径**（SubmitRequest 返回成功
  *     即计数），>0 仅说明 SPDK 接受过 CUDA memory-domain I/O 提交，不证明
  *     请求最终完成成功；cuda_io_success 是**完成口径**（SPDK completion

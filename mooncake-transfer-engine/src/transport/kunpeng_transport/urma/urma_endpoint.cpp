@@ -328,6 +328,13 @@ void* UrmaContext::localSegWithIndex(unsigned value) {
 
 int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
                                       UbMemoryRegionType type) {
+#if !defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    if (type == UbMemoryRegionType::kGpu) {
+        LOG(ERROR) << "gdr-peermem requires URMA headers with is_gpu_seg; "
+                      "use staging or rebuild with a GPU-capable URMA SDK";
+        return ERR_INVALID_ARGUMENT;
+    }
+#endif
 #if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
     // The NVIDIA P2P bridge (udma_nv_p2p_bridge.c) requires the registration
     // length to be 64KB-aligned; nvidia_p2p_get_pages returns -EINVAL

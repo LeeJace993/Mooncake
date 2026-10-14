@@ -50,6 +50,14 @@
 
 namespace mooncake {
 
+bool Client::IsUbTransportSegment(const std::string& endpoint) {
+    if (!transfer_engine_) return false;
+    const auto metadata = transfer_engine_->getMetadata();
+    if (!metadata) return false;
+    const auto segment = metadata->getSegmentDescByName(endpoint);
+    return segment && segment->protocol == "ub";
+}
+
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;

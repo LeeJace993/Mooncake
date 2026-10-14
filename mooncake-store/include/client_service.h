@@ -614,6 +614,10 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    // Inspect the actual remote transport; allocation descriptors carry a
+    // storage tag rather than the Transfer Engine segment's protocol.
+    [[nodiscard]] bool IsUbTransportSegment(const std::string& endpoint);
+
     /**
      * @brief Warmup transport-level connections to all segments
      * currently registered with the master.

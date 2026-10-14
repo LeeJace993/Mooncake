@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,8 @@
 #include <spdk/dma.h>
 #include <spdk/env.h>
 #include <spdk/nvme_urma.h>
+
+#include "nof_gpu_direct_report.h"
 
 namespace mooncake {
 
@@ -71,10 +74,19 @@ class NofMemoryDomainManager {
     ///     时计数（nvmf_io_complete），是 GPU I/O 真正成功的证据。
     uint64_t host_io_total() const { return host_io_total_.load(std::memory_order_relaxed); }
     uint64_t cuda_io_submitted_total() const {
-        return cuda_io_submitted_total_.load(std::memory_order_relaxed);
+        return CudaIoStats(false).submitted + CudaIoStats(true).submitted;
     }
     uint64_t cuda_io_success_total() const {
-        return cuda_io_success_total_.load(std::memory_order_relaxed);
+        return CudaIoStats(false).success + CudaIoStats(true).success;
+    }
+    uint64_t cuda_io_failed_total() const {
+        return CudaIoStats(false).failed + CudaIoStats(true).failed;
+    }
+    NofGpuIoStats CudaIoStats(bool write) const {
+        const size_t index = write ? 1 : 0;
+        return {cuda_io_submitted_[index].load(std::memory_order_relaxed),
+                cuda_io_success_[index].load(std::memory_order_relaxed),
+                cuda_io_failed_[index].load(std::memory_order_relaxed)};
     }
     uint64_t classify_fail_total() const { return classify_fail_total_.load(std::memory_order_relaxed); }
     /// CUDA DMA-BUF 导出成功次数（导出后 SPDK 注册仍可能失败或回退
@@ -89,20 +101,23 @@ class NofMemoryDomainManager {
         return payload_staged_bytes_.load(std::memory_order_relaxed);
     }
 
-    void OnIoSubmitted(const NofBufferInfo &info) {
+    void OnIoSubmitted(const NofBufferInfo &info, bool write) {
         if (info.type == NofMemoryType::kCuda) {
-            cuda_io_submitted_total_.fetch_add(1, std::memory_order_relaxed);
+            cuda_io_submitted_[write ? 1 : 0].fetch_add(
+                1, std::memory_order_relaxed);
         } else if (info.type == NofMemoryType::kHost) {
             host_io_total_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    /// SPDK completion 处调用；仅统计 CUDA I/O 的无错误完成。
+    /// SPDK completion 处调用；仅统计 CUDA I/O，区分成功与失败。
     /// 注意粒度：按 SPDK 子任务 chunk 计（每次 chunk completion 一次，
     /// 与 OnIoSubmitted 的粒度对称），不是完整 value/object 数——验收时
     /// 需结合 bench 的操作成功/失败统计解读。
-    void OnIoCompleted(const NofBufferInfo &info, bool success) {
-        if (success && info.type == NofMemoryType::kCuda) {
-            cuda_io_success_total_.fetch_add(1, std::memory_order_relaxed);
+    void OnIoCompleted(const NofBufferInfo &info, bool success, bool write) {
+        if (info.type == NofMemoryType::kCuda) {
+            auto& counter = success ? cuda_io_success_[write ? 1 : 0]
+                                    : cuda_io_failed_[write ? 1 : 0];
+            counter.fetch_add(1, std::memory_order_relaxed);
         }
     }
     void OnClassifyFail() { classify_fail_total_.fetch_add(1, std::memory_order_relaxed); }
@@ -130,8 +145,9 @@ class NofMemoryDomainManager {
     bool provider_registered_ = false;
 
     std::atomic<uint64_t> host_io_total_{0};
-    std::atomic<uint64_t> cuda_io_submitted_total_{0};
-    std::atomic<uint64_t> cuda_io_success_total_{0};
+    std::array<std::atomic<uint64_t>, 2> cuda_io_submitted_{};
+    std::array<std::atomic<uint64_t>, 2> cuda_io_success_{};
+    std::array<std::atomic<uint64_t>, 2> cuda_io_failed_{};
     std::atomic<uint64_t> classify_fail_total_{0};
     std::atomic<uint64_t> dmabuf_export_total_{0};
     std::atomic<uint64_t> gpu_staging_fallback_total_{0};

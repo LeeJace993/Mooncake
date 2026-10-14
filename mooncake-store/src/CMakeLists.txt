@@ -245,6 +245,11 @@ if(USE_NOF)
     endif()
   endforeach()
 
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SpdkLinkDependencies.cmake)
+  mooncake_spdk_check_core_dpdk("${DPDK_LIB_DIR}")
+  mooncake_spdk_split_dpdk_libs(SPDK_SPLIT_DPDK_LIBS "${DPDK_LIB_DIR}")
+  mooncake_spdk_fuse_lib(SPDK_FUSE_LIB "${SPDK_LIB_DIR}")
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
       ${SPDK_CORE_LIBS}
@@ -269,13 +274,7 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
-      ${DPDK_LIB_DIR}/librte_log.a
-      ${DPDK_LIB_DIR}/librte_argparse.a
-      ${DPDK_LIB_DIR}/librte_bus_vdev.a
-      ${DPDK_LIB_DIR}/librte_cmdline.a
-      ${DPDK_LIB_DIR}/librte_dmadev.a
-      ${DPDK_LIB_DIR}/librte_meter.a
-      ${DPDK_LIB_DIR}/librte_stack.a
+      ${SPDK_SPLIT_DPDK_LIBS}
       pthread
       dl
       numa
@@ -291,7 +290,7 @@ if(USE_NOF)
       rdmacm
       ssl
       bsd
-      fuse3)
+      ${SPDK_FUSE_LIB})
 
   # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
   # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
