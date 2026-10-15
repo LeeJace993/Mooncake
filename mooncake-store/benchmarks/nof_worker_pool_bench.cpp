@@ -48,6 +48,24 @@ constexpr uint64_t kDefaultRangeBytes = 1 * GiB;
 constexpr uint64_t kDefaultWarmupSec = 3;
 constexpr char kDefaultOp[] = "read";
 
+bool WholePoolRegistrationDefault() {
+#if defined(USE_NOF_URMA)
+    const char *raw = std::getenv("MC_NOF_WHOLE_POOL_REGISTER");
+    if (!raw) {
+        return true;
+    }
+
+    std::string value(raw);
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+#else
+    return false;
+#endif
+}
+
 DEFINE_string(
     endpoints, "",
     "Comma-separated NoF transport endpoints. To use multiple "
@@ -100,6 +118,10 @@ DEFINE_uint64(
     "Optional override for MC_NOF_INFLIGHT_BYTES_LIMIT. Equivalent to "
     "exporting MC_NOF_INFLIGHT_BYTES_LIMIT before launch. 0 means keep "
     "environment/default.");
+DEFINE_bool(nof_whole_pool_register, WholePoolRegistrationDefault(),
+            "Register each endpoint's complete benchmark buffer pool once. "
+            "This bypasses the fixed per-I/O URMA registration cache. Set "
+            "false for compatibility or registration-cache testing.");
 DEFINE_int32(socket_id, -1,
              "NUMA socket for benchmark buffers. -1 lets SPDK choose.");
 DEFINE_bool(fill_on_write, true,
@@ -333,6 +355,10 @@ struct Slot {
 struct ThreadEndpointState {
     size_t endpoint_index{0};
     std::vector<Slot> slots;
+    void *buffer_pool{nullptr};
+    size_t buffer_pool_size{0};
+    bool cuda_buffer_pool{false};
+    std::shared_ptr<void> nof_pool_token;
 };
 
 struct BenchThreadContext {
@@ -679,24 +705,30 @@ void FreeThreadSlots(mooncake::SpdkWrapper &wrapper,
                      std::vector<BenchThreadContext> &thread_contexts) {
     for (auto &thread_context : thread_contexts) {
         for (auto &thread_endpoint : thread_context.endpoints) {
+            // Release the registration after all I/O drains and before the
+            // backing allocation is freed.
+            thread_endpoint.nof_pool_token.reset();
             for (auto &slot : thread_endpoint.slots) {
-                if (slot.buffer) {
 #if defined(USE_NOF_GPU_DIRECT)
-                    // Modified By Yida (v3): cuda 缓冲走 cudaFree/cudaFreeHost
-                    if (slot.cuda_buffer) {
-                        cudaFree(slot.buffer);
-                        if (slot.cuda_host) {
-                            cudaFreeHost(slot.cuda_host);
-                        }
-                    } else {
-                        wrapper.Free(slot.buffer);
-                    }
-#else
-                    wrapper.Free(slot.buffer);
-#endif
-                    slot.buffer = nullptr;
-                    slot.cuda_host = nullptr;
+                if (slot.cuda_host) {
+                    cudaFreeHost(slot.cuda_host);
                 }
+#endif
+                slot.buffer = nullptr;
+                slot.cuda_host = nullptr;
+            }
+            if (thread_endpoint.buffer_pool) {
+#if defined(USE_NOF_GPU_DIRECT)
+                if (thread_endpoint.cuda_buffer_pool) {
+                    cudaFree(thread_endpoint.buffer_pool);
+                } else {
+                    wrapper.Free(thread_endpoint.buffer_pool);
+                }
+#else
+                wrapper.Free(thread_endpoint.buffer_pool);
+#endif
+                thread_endpoint.buffer_pool = nullptr;
+                thread_endpoint.buffer_pool_size = 0;
             }
         }
     }
@@ -1117,21 +1149,52 @@ int main(int argc, char **argv) {
                 std::move(thread_endpoint));
         }
 
+        uint64_t whole_pool_regions = 0;
+        uint64_t whole_pool_bytes = 0;
         for (auto &thread_context : thread_contexts) {
             for (auto &thread_endpoint : thread_context.endpoints) {
-                for (auto &slot : thread_endpoint.slots) {
+                if (FLAGS_iodepth >
+                    std::numeric_limits<size_t>::max() / FLAGS_io_size) {
+                    LOG(ERROR) << "Benchmark buffer pool size overflow";
+                    FreeThreadSlots(wrapper, thread_contexts);
+                    return 1;
+                }
+                thread_endpoint.buffer_pool_size =
+                    static_cast<size_t>(FLAGS_iodepth * FLAGS_io_size);
+                if (use_cuda_memory) {
+#if defined(USE_NOF_GPU_DIRECT)
+                    if (cudaMalloc(&thread_endpoint.buffer_pool,
+                                   thread_endpoint.buffer_pool_size) !=
+                        cudaSuccess) {
+                        LOG(ERROR) << "Failed to allocate CUDA buffer pool of "
+                                   << thread_endpoint.buffer_pool_size
+                                   << " bytes";
+                        FreeThreadSlots(wrapper, thread_contexts);
+                        return 1;
+                    }
+                    thread_endpoint.cuda_buffer_pool = true;
+#endif
+                } else {
+                    thread_endpoint.buffer_pool = wrapper.Alloc(
+                        thread_endpoint.buffer_pool_size, 0x1000,
+                        FLAGS_socket_id);
+                }
+                if (!thread_endpoint.buffer_pool) {
+                    LOG(ERROR) << "Failed to allocate DMA buffer pool of "
+                               << thread_endpoint.buffer_pool_size << " bytes";
+                    FreeThreadSlots(wrapper, thread_contexts);
+                    return 1;
+                }
+
+                for (size_t slot_index = 0;
+                     slot_index < thread_endpoint.slots.size(); ++slot_index) {
+                    auto &slot = thread_endpoint.slots[slot_index];
                     slot.buffer_size = FLAGS_io_size;
+                    slot.buffer = static_cast<char *>(
+                                      thread_endpoint.buffer_pool) +
+                                  slot_index * slot.buffer_size;
                     if (use_cuda_memory) {
 #if defined(USE_NOF_GPU_DIRECT)
-                        // Modified By Yida (v3): 用户显存 + host staging
-                        if (cudaMalloc(&slot.buffer, slot.buffer_size) !=
-                            cudaSuccess) {
-                            LOG(ERROR) << "Failed to allocate CUDA buffer of "
-                                          "size "
-                                       << slot.buffer_size;
-                            FreeThreadSlots(wrapper, thread_contexts);
-                            return 1;
-                        }
                         slot.cuda_buffer = true;
                         if (cudaMallocHost(&slot.cuda_host,
                                            slot.buffer_size) != cudaSuccess) {
@@ -1142,16 +1205,40 @@ int main(int argc, char **argv) {
                             return 1;
                         }
 #endif
-                    } else {
-                        slot.buffer = wrapper.Alloc(slot.buffer_size, 0x1000,
-                                                    FLAGS_socket_id);
                     }
-                    if (!slot.buffer) {
-                        LOG(ERROR) << "Failed to allocate DMA buffer of size "
-                                   << slot.buffer_size;
+                }
+
+                if (FLAGS_nof_whole_pool_register) {
+#if defined(USE_NOF_URMA)
+                    if (!mooncake::NofWholePoolRegistrationAvailable()) {
+                        LOG(ERROR) << "--nof_whole_pool_register was requested "
+                                      "but this SPDK build does not expose URMA "
+                                      "whole-pool registration";
                         FreeThreadSlots(wrapper, thread_contexts);
                         return 1;
                     }
+                    const auto &endpoint =
+                        endpoints[thread_endpoint.endpoint_index].endpoint;
+                    thread_endpoint.nof_pool_token =
+                        mooncake::RegisterNofMemoryPool(
+                            endpoint, thread_endpoint.buffer_pool,
+                            thread_endpoint.buffer_pool_size);
+                    if (!thread_endpoint.nof_pool_token) {
+                        LOG(ERROR) << "Failed to register complete benchmark "
+                                      "buffer pool for endpoint="
+                                   << endpoint << " size="
+                                   << thread_endpoint.buffer_pool_size;
+                        FreeThreadSlots(wrapper, thread_contexts);
+                        return 1;
+                    }
+                    ++whole_pool_regions;
+                    whole_pool_bytes += thread_endpoint.buffer_pool_size;
+#else
+                    LOG(ERROR) << "--nof_whole_pool_register requires a "
+                                  "USE_NOF_URMA build";
+                    FreeThreadSlots(wrapper, thread_contexts);
+                    return 1;
+#endif
                 }
             }
         }
@@ -1280,6 +1367,10 @@ int main(int argc, char **argv) {
         std::cout << "bs=" << FLAGS_io_size << "\n";
         std::cout << "iodepth=" << FLAGS_iodepth << "\n";
         std::cout << "total_iodepth=" << total_iodepth << "\n";
+        std::cout << "whole_pool_requested="
+                  << (FLAGS_nof_whole_pool_register ? 1 : 0) << "\n";
+        std::cout << "whole_pool_regions=" << whole_pool_regions << "\n";
+        std::cout << "whole_pool_bytes=" << whole_pool_bytes << "\n";
         std::cout << "runtime=" << FLAGS_duration_sec << "\n";
         std::cout << "completed_ops=" << total_measured.completed_ops << "\n";
         std::cout << "failed_ops=" << total_measured.failed_ops << "\n";

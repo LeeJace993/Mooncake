@@ -1521,6 +1521,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto batch_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto elapsed_us = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+            .count();
+    };
+
     // Collect all transfer operations for parallel execution
     // Tuple: (index, key, future, replica, cache_used)
     std::vector<std::tuple<size_t, std::string, TransferFuture,
@@ -1532,8 +1543,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
+    size_t submitted_bytes = 0;
+    int64_t wait_blocked_us = 0;
+    int64_t checksum_us = 0;
 
     // Submit all transfers in parallel
+    const auto submit_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
@@ -1597,12 +1614,27 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+        if (breakdown_log) {
+            for (const auto& slice : slices_it->second) {
+                submitted_bytes += slice.size;
+            }
+        }
     }
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        const auto wait_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
         ErrorCode result = future.get();
+        if (breakdown_log) {
+            wait_blocked_us +=
+                elapsed_us(wait_start, std::chrono::steady_clock::now());
+        }
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -1620,9 +1652,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            const auto checksum_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
+            if (breakdown_log) {
+                checksum_us += elapsed_us(checksum_start,
+                                          std::chrono::steady_clock::now());
+            }
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
@@ -1640,9 +1679,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
     }
+    const auto wait_loop_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
+    const auto lease_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -1652,12 +1697,44 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
+    const auto batch_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - t0_batch_get)
                             .count();
     if (metrics_) {
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
+    }
+
+    if (breakdown_log) {
+        const int64_t setup_us = elapsed_us(batch_start, submit_start);
+        const int64_t submit_us = elapsed_us(submit_start, submit_end);
+        const int64_t wait_loop_us = elapsed_us(submit_end, wait_loop_end);
+        const int64_t result_us =
+            std::max<int64_t>(0, wait_loop_us - wait_blocked_us - checksum_us);
+        const int64_t lease_us = elapsed_us(lease_start, batch_end);
+        const int64_t total_us = elapsed_us(batch_start, batch_end);
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        MC_LOG(INFO) << "batch_get_data_breakdown trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " bytes=" << submitted_bytes
+                     << " setup_us=" << setup_us
+                     << " submit_us=" << submit_us
+                     << " wait_blocked_us=" << wait_blocked_us
+                     << " checksum_us=" << checksum_us
+                     << " result_us=" << result_us
+                     << " lease_us=" << lease_us
+                     << " total_us=" << total_us
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
     }
 
     // Log overall cache hit statistics for the entire batch

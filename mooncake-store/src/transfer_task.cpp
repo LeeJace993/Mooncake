@@ -142,6 +142,7 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     }
 
     if (spdk_nvme_cpl_is_error(cpl)) {
+        ++nof_qos->completion_errors;
         LOG(ERROR) << "task_complete: I/O failed "
                    << mooncake::NofCplStatusString(
                           cpl, op == mooncake::kSpdkNofOpRead
@@ -149,6 +150,8 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
                                    : SPDK_NVME_OPC_WRITE);
         task->remaining_lba = 0;
         task->failed = true;
+    } else {
+        ++nof_qos->completion_successes;
     }
 
 #ifdef USE_NOF_URMA
@@ -390,6 +393,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        task.queued_at = std::chrono::steady_clock::now();
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
@@ -592,13 +596,39 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
 #endif
+                        ++nof_qos->submit_attempts;
                         if (ret != 0) {
+                            if (ret == -EAGAIN) {
+                                ++nof_qos->submit_eagain;
+                            } else if (ret == -ENOMEM) {
+                                ++nof_qos->submit_enomem;
+                            } else {
+                                ++nof_qos->submit_other_errors;
+                            }
                             LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
+                                       << task->seg_handle
+                                       << " submit io fail ret=" << ret
+                                       << " chunk_blocks=" << submit_lba_count
+                                       << " inflight_blocks="
+                                       << nof_qos->inflight_blocks[i]
+                                       << " inflight_limit="
+                                       << nof_qos->inflight_blocks_limit;
                             task->failed = true;
                             task->remaining_lba = 0;
                             sub_task_pool.push(sub_task);
                         } else {
+                            ++nof_qos->submit_successes;
+                            if (!task->first_sub_io_submitted) {
+                                task->first_sub_io_submitted = true;
+                                ++nof_qos->first_submit_count;
+                                nof_qos->first_submit_wait_us +=
+                                    static_cast<uint64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            task->queued_at)
+                                            .count());
+                            }
                             if (nof_qos->inflight_blocks[0] == 0 &&
                                 nof_qos->inflight_blocks[1] == 0) {
                                 nof_qos->last_progress =
@@ -617,6 +647,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 #endif
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
+                            nof_qos->max_inflight_blocks = std::max(
+                                nof_qos->max_inflight_blocks,
+                                nof_qos->inflight_blocks[0] +
+                                    nof_qos->inflight_blocks[1]);
                             avail_blocks -= submit_lba_count;
                             task->outstanding_sub_io++;
                             total_outstanding_io++;
@@ -638,6 +672,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
                     it.first, 0);
                 auto& qos = *it.second;
+                ++qos.poll_calls;
+                if (ret == 0) {
+                    ++qos.empty_polls;
+                } else if (ret > 0) {
+                    qos.polled_completions += static_cast<uint64_t>(ret);
+                }
                 const auto now = std::chrono::steady_clock::now();
                 if (ret > 0) qos.last_progress = now;
                 const bool timed_out =
@@ -695,7 +735,27 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " total_outstanding_io=" << total_outstanding_io;
+                        << " total_outstanding_io=" << total_outstanding_io
+                        << " max_inflight_blocks="
+                        << nof_qos->max_inflight_blocks
+                        << " submit_attempts=" << nof_qos->submit_attempts
+                        << " submit_successes=" << nof_qos->submit_successes
+                        << " submit_eagain=" << nof_qos->submit_eagain
+                        << " submit_enomem=" << nof_qos->submit_enomem
+                        << " submit_other_errors="
+                        << nof_qos->submit_other_errors
+                        << " completion_successes="
+                        << nof_qos->completion_successes
+                        << " completion_errors="
+                        << nof_qos->completion_errors
+                        << " poll_calls=" << nof_qos->poll_calls
+                        << " empty_polls=" << nof_qos->empty_polls
+                        << " polled_completions="
+                        << nof_qos->polled_completions
+                        << " first_submit_count="
+                        << nof_qos->first_submit_count
+                        << " first_submit_wait_us="
+                        << nof_qos->first_submit_wait_us;
                 }
                 last_debug_snapshot = now;
             }

@@ -388,6 +388,8 @@ struct SpdkNofTask {
     int idx;  // subop idx
     bool failed;
     bool on_chain;
+    bool first_sub_io_submitted;
+    std::chrono::steady_clock::time_point queued_at;
     std::shared_ptr<SpdkNofOperationState> state;
     int64_t* io_count;
     SpdkNofQos* nof_qos;
@@ -411,6 +413,8 @@ struct SpdkNofTask {
           idx(0),
           failed(false),
           on_chain(false),
+          first_sub_io_submitted(false),
+          queued_at(std::chrono::steady_clock::now()),
           state(std::move(s)),
           io_count(nullptr),
           nof_qos(nullptr),
@@ -437,6 +441,19 @@ struct SpdkNofQos {
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
     bool poisoned = false;
+    uint64_t submit_attempts = 0;
+    uint64_t submit_successes = 0;
+    uint64_t submit_eagain = 0;
+    uint64_t submit_enomem = 0;
+    uint64_t submit_other_errors = 0;
+    uint64_t completion_successes = 0;
+    uint64_t completion_errors = 0;
+    uint64_t poll_calls = 0;
+    uint64_t empty_polls = 0;
+    uint64_t polled_completions = 0;
+    uint64_t first_submit_count = 0;
+    uint64_t first_submit_wait_us = 0;
+    int max_inflight_blocks = 0;
     std::chrono::steady_clock::time_point last_progress =
         std::chrono::steady_clock::now();
 
