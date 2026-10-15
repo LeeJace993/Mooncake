@@ -35,6 +35,7 @@ inline const char *NofCplStatusString(const struct spdk_nvme_cpl *cpl,
 }
 
 struct nof_seg_handle;
+struct nof_io_lane;
 struct tr_info;
 struct ctrlr_info;
 
@@ -56,19 +57,37 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
+    size_t GetIoLaneCount(const nof_seg_handle *seg_handle) const;
+
+    nof_io_lane *GetIoLane(nof_seg_handle *seg_handle,
+                           size_t lane_index) const;
+
+    uint32_t GetIoLaneIndex(const nof_io_lane *lane) const;
+
+    int64_t PollIoLane(nof_io_lane *lane, uint32_t max_completions);
+
     // Called by the owning worker after polling has returned. SPDK aborts
     // requests and tears down DMA resources before callers can reuse buffers.
     void DrainFailedNofSegment(nof_seg_handle *seg);
+
+    void DrainFailedIoLane(nof_io_lane *lane);
 
     /** @brief Open a NoF segment. */
     nof_seg_handle *OpenNofSegment(const std::string &tr_str);
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
+    uint32_t GetBlockSize(const nof_io_lane *lane);
+
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
                       uint32_t lba_count, int op, spdk_nvme_cmd_cb cb_fn,
                       void *cb_ctx,
                       spdk_nvme_ns_cmd_ext_io_opts *io_opts = nullptr);
+
+    int SubmitRequestOnLane(
+        const nof_io_lane *lane, void *ptr, uint64_t lba, uint32_t lba_count,
+        int op, spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+        spdk_nvme_ns_cmd_ext_io_opts *io_opts = nullptr);
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);

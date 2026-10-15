@@ -379,6 +379,8 @@ struct SpdkNofQos;
  */
 struct SpdkNofTask {
     nof_seg_handle* seg_handle;
+    nof_io_lane* io_lane;
+    uint32_t io_lane_index;
     void* ptr;
     uint64_t lba;
     uint32_t lba_count;
@@ -404,6 +406,8 @@ struct SpdkNofTask {
     SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
                 int op_code, std::shared_ptr<SpdkNofOperationState> s)
         : seg_handle(handle),
+          io_lane(nullptr),
+          io_lane_index(0),
           ptr(buf),
           lba(off),
           lba_count(len),
@@ -519,6 +523,11 @@ class SpdkNofWorkerPool {
     void submitTask(SpdkNofTask task);
 
    private:
+    struct SegmentLaneBinding {
+        std::vector<int> worker_indices;
+        uint64_t next_lane = 0;
+    };
+
     void workerThread(int work_idx);
 
     int worker_count_;
@@ -530,7 +539,7 @@ class SpdkNofWorkerPool {
     std::atomic<bool> shutdown_;
     std::mutex seg_mutex_;
     int seg_num = 0;
-    std::map<nof_seg_handle*, int> seg_to_worker_;
+    std::map<nof_seg_handle*, SegmentLaneBinding> seg_to_workers_;
 };
 #endif
 

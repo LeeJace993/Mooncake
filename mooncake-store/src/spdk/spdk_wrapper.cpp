@@ -42,6 +42,21 @@ bool ParseEnvBool(const char *name, bool *out) {
     return true;
 }
 
+uint32_t GetNofQpairsPerSegment() {
+    constexpr uint32_t kDefaultQpairs = 1;
+    constexpr uint32_t kMaxQpairs = 64;
+    uint64_t value = 0;
+    if (!ParseEnvU64("MC_NOF_QPAIRS_PER_SEGMENT", &value)) {
+        return kDefaultQpairs;
+    }
+    if (value == 0 || value > kMaxQpairs) {
+        LOG(WARNING) << "Invalid MC_NOF_QPAIRS_PER_SEGMENT=" << value
+                     << ", using default " << kDefaultQpairs;
+        return kDefaultQpairs;
+    }
+    return static_cast<uint32_t>(value);
+}
+
 void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
     uint64_t v = 0;
     bool bv = false;
@@ -86,13 +101,19 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 
 }  // namespace
 
+struct nof_io_lane {
+    struct spdk_nvme_qpair *qpair = nullptr;
+    struct nof_seg_handle *segment = nullptr;
+    uint32_t index = 0;
+};
+
 struct nof_seg_handle {
     struct spdk_nvme_ns *ns;
     /* Modified By Yida (v3): 业务 worker 与 heartbeat 分离 qpair。SPDK URMA
      * qpair 内部有 outstanding list 和同一条 TCP control socket，heartbeat
-     * 线程与 worker 同时 submit/poll 同一 qpair 会产生竞争。worker 只用
-     * io_qpair，heartbeat 只用 probe_qpair，probe_mutex 串行化并发 probe。 */
-    struct spdk_nvme_qpair *io_qpair;
+     * 线程与 worker 同时 submit/poll 同一 qpair 会产生竞争。每个业务 lane
+     * 由一个 worker 独占，heartbeat 只用 probe_qpair。 */
+    std::vector<std::unique_ptr<nof_io_lane>> io_lanes;
     struct spdk_nvme_qpair *probe_qpair;
     std::mutex probe_mutex;
 };
@@ -152,9 +173,13 @@ void SpdkWrapper::Cleanup() {
                     // Free all qpairs and segment handles
                     for (auto &[_, seg] : info->ns_seg) {
                         if (seg) {
-                            // Modified By Yida (v3): 分别释放业务与 probe qpair
-                            if (seg->io_qpair) {
-                                spdk_nvme_ctrlr_free_io_qpair(seg->io_qpair);
+                            // Each I/O lane is owned by one NoF worker. Free
+                            // every business qpair before the probe qpair.
+                            for (auto &lane : seg->io_lanes) {
+                                if (lane && lane->qpair) {
+                                    spdk_nvme_ctrlr_free_io_qpair(lane->qpair);
+                                    lane->qpair = nullptr;
+                                }
                             }
                             if (seg->probe_qpair) {
                                 spdk_nvme_ctrlr_free_io_qpair(seg->probe_qpair);
@@ -249,17 +274,44 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
-    if (!seg || !seg->io_qpair) {
+    return PollIoLane(GetIoLane(seg, 0), complete_per_seg);
+}
+
+size_t SpdkWrapper::GetIoLaneCount(const nof_seg_handle *seg_handle) const {
+    return seg_handle == nullptr ? 0 : seg_handle->io_lanes.size();
+}
+
+nof_io_lane *SpdkWrapper::GetIoLane(nof_seg_handle *seg_handle,
+                                    size_t lane_index) const {
+    if (seg_handle == nullptr || lane_index >= seg_handle->io_lanes.size()) {
+        return nullptr;
+    }
+    return seg_handle->io_lanes[lane_index].get();
+}
+
+uint32_t SpdkWrapper::GetIoLaneIndex(const nof_io_lane *lane) const {
+    return lane == nullptr ? 0 : lane->index;
+}
+
+int64_t SpdkWrapper::PollIoLane(nof_io_lane *lane,
+                                uint32_t max_completions) {
+    if (!lane || !lane->qpair) {
         return -1;
     }
-    return spdk_nvme_qpair_process_completions(seg->io_qpair,
-                                               complete_per_seg);
+    return spdk_nvme_qpair_process_completions(lane->qpair, max_completions);
 }
 
 void SpdkWrapper::DrainFailedNofSegment(nof_seg_handle *seg) {
-    if (!seg || !seg->io_qpair) return;
-    auto* qpair = seg->io_qpair;
-    seg->io_qpair = nullptr;
+    if (!seg) return;
+    for (auto& lane : seg->io_lanes) {
+        DrainFailedIoLane(lane.get());
+    }
+}
+
+void SpdkWrapper::DrainFailedIoLane(nof_io_lane *lane) {
+    if (!lane || !lane->qpair) return;
+    auto* qpair = lane->qpair;
+    lane->qpair = nullptr;
     spdk_nvme_ctrlr_free_io_qpair(qpair);
 }
 
@@ -287,22 +339,36 @@ std::shared_ptr<void> RegisterNofMemoryPool(const std::string& endpoint,
         return {};
     }
     auto* segment = SpdkWrapper::GetInstance().OpenNofSegment(endpoint);
-    if (!segment || !segment->io_qpair) return {};
+    if (!segment || segment->io_lanes.empty()) return {};
     const auto info =
         NofMemoryDomainManager::GetInstance().ResolveBuffer(buffer, size);
     if (info.type != NofMemoryType::kHost && info.type != NofMemoryType::kCuda) {
         return {};
     }
-    spdk_nvme_urma_memory_region* region = nullptr;
     const auto type = info.type == NofMemoryType::kCuda
                           ? SPDK_NVME_URMA_MEM_CUDA : SPDK_NVME_URMA_MEM_HOST;
-    const int rc = spdk_nvme_urma_register_memory_for_qpair(
-        segment->io_qpair, buffer, size, type, &region);
-    if (rc != 0 || !region) {
-        LOG(ERROR) << "NoF whole-pool registration failed endpoint=" << endpoint
-                   << " buffer=" << buffer << " size=" << size << " rc=" << rc;
+    const auto& registration_lane = segment->io_lanes.front();
+    if (!registration_lane || !registration_lane->qpair) {
+        LOG(ERROR) << "NoF whole-pool registration found no available lane "
+                   << "endpoint=" << endpoint;
         return {};
     }
+    spdk_nvme_urma_memory_region* region = nullptr;
+    const int rc = spdk_nvme_urma_register_memory_for_qpair(
+        registration_lane->qpair, buffer, size, type, &region);
+    if (rc != 0 || !region) {
+        LOG(ERROR) << "NoF whole-pool registration failed endpoint="
+                   << endpoint << " buffer=" << buffer << " size=" << size
+                   << " rc=" << rc;
+        return {};
+    }
+    // SPDK's URMA region registry is keyed by the shared urma_context, so all
+    // qpairs on the same NIC reuse this region. Registering the same buffer
+    // once per lane would add duplicate registry entries without improving
+    // coverage.
+    LOG(INFO) << "NoF whole-pool registered endpoint=" << endpoint
+              << " shared_by_lanes=" << segment->io_lanes.size()
+              << " buffer=" << buffer << " size=" << size;
     return {region, [](void* value) {
         spdk_nvme_urma_unregister_memory(
             static_cast<spdk_nvme_urma_memory_region*>(value));
@@ -410,7 +476,6 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     }
 
     nof_seg_handle *seg_handle = nullptr;
-    struct spdk_nvme_qpair *qpair = nullptr;
     struct spdk_nvme_qpair *probe_qpair = nullptr;
     struct spdk_nvme_ns *ns = nullptr;
     {
@@ -428,10 +493,29 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             return nullptr;
         }
 
-        qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
-        if (!qpair) {
-            LOG(ERROR) << "alloc spdk_nvme_qpair failed";
-            return nullptr;
+        const uint32_t lane_count = GetNofQpairsPerSegment();
+        if (lane_count > 1) {
+            LOG(INFO) << "Experimental NoF multi-qpair mode enabled: lanes="
+                      << lane_count
+                      << "; completion order is independent across lanes";
+        }
+        std::vector<std::unique_ptr<nof_io_lane>> io_lanes;
+        io_lanes.reserve(lane_count);
+        for (uint32_t lane_index = 0; lane_index < lane_count; ++lane_index) {
+            auto lane = std::make_unique<nof_io_lane>();
+            lane->qpair =
+                spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+            if (!lane->qpair) {
+                LOG(ERROR) << "alloc SPDK NoF I/O qpair failed lane="
+                           << lane_index << " requested_lanes=" << lane_count;
+                for (auto& allocated_lane : io_lanes) {
+                    spdk_nvme_ctrlr_free_io_qpair(allocated_lane->qpair);
+                    allocated_lane->qpair = nullptr;
+                }
+                return nullptr;
+            }
+            lane->index = lane_index;
+            io_lanes.push_back(std::move(lane));
         }
 
         // Modified By Yida (v3): 每个 segment 额外分配一个 heartbeat 专用
@@ -439,16 +523,24 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         probe_qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
         if (!probe_qpair) {
             LOG(ERROR) << "alloc probe spdk_nvme_qpair failed";
-            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            for (auto& lane : io_lanes) {
+                spdk_nvme_ctrlr_free_io_qpair(lane->qpair);
+                lane->qpair = nullptr;
+            }
             return nullptr;
         }
 
         auto new_seg = std::make_unique<nof_seg_handle>();
         new_seg->ns = ns;
-        new_seg->io_qpair = qpair;
+        new_seg->io_lanes = std::move(io_lanes);
         new_seg->probe_qpair = probe_qpair;
+        for (auto& lane : new_seg->io_lanes) {
+            lane->segment = new_seg.get();
+        }
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
+        LOG(INFO) << "Opened NoF segment ns=" << tr.ns
+                  << " io_qpairs=" << lane_count;
     }
 
     return seg_handle;
@@ -460,6 +552,10 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     }
 
     return spdk_nvme_ns_get_sector_size(seg_handle->ns);
+}
+
+uint32_t SpdkWrapper::GetBlockSize(const nof_io_lane *lane) {
+    return lane == nullptr ? INVALID_BLOCK_SIZE : GetBlockSize(lane->segment);
 }
 
 int SpdkWrapper::SubmitRequestOnQpair(struct spdk_nvme_qpair *qpair,
@@ -495,13 +591,24 @@ int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
                                spdk_nvme_ns_cmd_ext_io_opts *io_opts) {
-    if (!seg_handle) {
+    if (!seg_handle || seg_handle->io_lanes.empty()) {
         return -1;
     }
 
-    // Modified By Yida (v3): 业务提交固定走 io_qpair；io_opts 由调用方
-    // (SpdkNofSubTask) 持有，生命周期覆盖整个异步 I/O。
-    return SubmitRequestOnQpair(seg_handle->io_qpair, seg_handle->ns, ptr, lba,
+    // Compatibility entry point: direct callers use lane 0. The worker pool
+    // uses SubmitRequestOnLane() after assigning each task to a lane.
+    return SubmitRequestOnLane(seg_handle->io_lanes[0].get(), ptr, lba,
+                               lba_count, op, cb_fn, cb_ctx, io_opts);
+}
+
+int SpdkWrapper::SubmitRequestOnLane(
+    const nof_io_lane *lane, void *ptr, uint64_t lba, uint32_t lba_count,
+    int op, spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+    spdk_nvme_ns_cmd_ext_io_opts *io_opts) {
+    if (!lane || !lane->segment || !lane->qpair) {
+        return -1;
+    }
+    return SubmitRequestOnQpair(lane->qpair, lane->segment->ns, ptr, lba,
                                 lba_count, op, cb_fn, cb_ctx, io_opts);
 }
 

@@ -334,6 +334,10 @@ DEFINE_bool(nof_whole_pool_register,
             "URMA NoF endpoints when SPDK supports whole-pool registration. "
             "Set false (or MC_NOF_WHOLE_POOL_REGISTER=0) for compatibility "
             "testing with per-I/O registration.");
+DEFINE_uint64(nof_qpairs_per_segment, 0,
+              "Optional override for MC_NOF_QPAIRS_PER_SEGMENT. Each qpair "
+              "is assigned to one NoF worker. 0 keeps environment/default "
+              "(one qpair).");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_uint64(nof_replica_num, 0,
               "Number of NoF SSD replicas for each object");
@@ -2988,6 +2992,11 @@ int main(int argc, char* argv[]) {
     }
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+    if (FLAGS_nof_qpairs_per_segment > 0) {
+        ::setenv("MC_NOF_QPAIRS_PER_SEGMENT",
+                 std::to_string(FLAGS_nof_qpairs_per_segment).c_str(), 1);
+    }
+
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
 #if defined(USE_NOF_URMA)
     const bool nof_whole_pool_available =
@@ -3044,6 +3053,10 @@ int main(int argc, char* argv[]) {
                       ? "disabled"
                       : (nof_whole_pool_available ? "auto/available"
                                                   : "auto/unavailable"));
+    LOG(INFO) << "  NoF qpairs/segment: "
+              << (FLAGS_nof_qpairs_per_segment == 0
+                      ? "environment/default"
+                      : std::to_string(FLAGS_nof_qpairs_per_segment));
     LOG(INFO) << "  Hard pin:       " << (FLAGS_hard_pin ? "yes" : "no");
     LOG(INFO) << "  SSD offload:    "
               << (FLAGS_enable_ssd_offload ? "yes" : "no");

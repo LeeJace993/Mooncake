@@ -383,17 +383,45 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
         nof_seg_handle* seg = task.seg_handle;
+        auto& wrapper = SpdkWrapper::GetInstance();
+        const size_t lane_count = wrapper.GetIoLaneCount(seg);
+        if (lane_count == 0) {
+            LOG(ERROR) << "No NoF I/O lanes available for seg=" << seg;
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
         bool new_binding = false;
-        if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
-            worker_idx = seg_to_worker_[seg];
-        } else {
-            worker_idx = (seg_num++ % worker_count_);
-            seg_to_worker_[seg] = worker_idx;
+        auto binding_it = seg_to_workers_.find(seg);
+        if (binding_it == seg_to_workers_.end()) {
+            SegmentLaneBinding binding;
+            binding.worker_indices.reserve(lane_count);
+            for (size_t lane_index = 0; lane_index < lane_count;
+                 ++lane_index) {
+                binding.worker_indices.push_back(seg_num++ % worker_count_);
+            }
+            binding_it =
+                seg_to_workers_.emplace(seg, std::move(binding)).first;
             new_binding = true;
         }
+        auto& binding = binding_it->second;
+        const size_t lane_index = binding.next_lane++ % lane_count;
+        task.io_lane = wrapper.GetIoLane(seg, lane_index);
+        task.io_lane_index = static_cast<uint32_t>(lane_index);
+        worker_idx = binding.worker_indices[lane_index];
         if (new_binding && IsSpdkNofDebugEnabled()) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
-                      << " worker_idx=" << worker_idx;
+                      << " lanes=" << lane_count;
+            for (size_t lane_index = 0; lane_index < lane_count;
+                 ++lane_index) {
+                LOG(INFO) << "nof_lane_bind seg_handle=" << seg
+                          << " lane=" << lane_index << " worker_idx="
+                          << binding.worker_indices[lane_index];
+            }
+        }
+        if (new_binding && lane_count > static_cast<size_t>(worker_count_)) {
+            LOG(WARNING) << "NoF segment has " << lane_count
+                         << " I/O lanes but only " << worker_count_
+                         << " workers; some qpairs share a polling worker";
         }
     }
     if (worker_idx < 0 || worker_idx >= worker_count_) {
@@ -411,8 +439,8 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
 }
 
 static bool HasBufferedTask(
-    const std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>>& seg_to_qos) {
-    for (const auto& [_, nof_qos] : seg_to_qos) {
+    const std::map<nof_io_lane*, std::unique_ptr<SpdkNofQos>>& lane_to_qos) {
+    for (const auto& [_, nof_qos] : lane_to_qos) {
         if (!nof_qos->Empty()) {
             return true;
         }
@@ -450,7 +478,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 
     int64_t total_outstanding_io = 0;
     // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::map<nof_io_lane*, std::unique_ptr<SpdkNofQos>> lane_to_qos;
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
     std::set<SpdkNofTask*> live_tasks;
@@ -471,13 +499,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
+                lock, [this, &task_queue, &total_outstanding_io, &lane_to_qos] {
                     return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
+                           total_outstanding_io || HasBufferedTask(lane_to_qos);
                 });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                (total_outstanding_io == 0) && !HasBufferedTask(lane_to_qos)) {
                 break;
             }
 
@@ -491,8 +519,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 }
 
                 SpdkNofQos* nof_qos = nullptr;
-                auto it = seg_to_qos.find(task->seg_handle);
-                if (it == seg_to_qos.end()) {
+                auto it = lane_to_qos.find(task->io_lane);
+                if (it == lane_to_qos.end()) {
                     auto qos = std::make_unique<SpdkNofQos>(
                         SpdkWrapper::GetInstance().GetBlockSize(
                             task->seg_handle));
@@ -503,15 +531,16 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         continue;
                     }
                     nof_qos = qos.get();
-                    seg_to_qos[task->seg_handle] = std::move(qos);
+                    lane_to_qos[task->io_lane] = std::move(qos);
                     if (debug_enabled) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
                             << " seg_handle=" << task->seg_handle
+                            << " lane=" << task->io_lane_index
                             << " blocks_per_chunk="
-                            << seg_to_qos[task->seg_handle]->blocks_per_chunk
+                            << lane_to_qos[task->io_lane]->blocks_per_chunk
                             << " inflight_blocks_limit="
-                            << seg_to_qos[task->seg_handle]
+                            << lane_to_qos[task->io_lane]
                                    ->inflight_blocks_limit;
                     }
                 } else {
@@ -549,9 +578,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
 
-        for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+        for (auto& [io_lane, nof_qos] : lane_to_qos) {
             uint32_t block_size =
-                SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
+                SpdkWrapper::GetInstance().GetBlockSize(io_lane);
             bool qpair_backpressured = false;
             for (int i = 0;
                  i < kSpdkNofOpNum && !qpair_backpressured; ++i) {
@@ -600,13 +629,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             sub_task->io_opts.memory_domain =
                                 task->buffer_info.domain;
                         }
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
+                        int ret = SpdkWrapper::GetInstance().SubmitRequestOnLane(
+                            task->io_lane, submit_ptr, submit_lba,
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task, is_cuda_io ? &sub_task->io_opts : nullptr);
 #else
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
+                        int ret = SpdkWrapper::GetInstance().SubmitRequestOnLane(
+                            task->io_lane, submit_ptr, submit_lba,
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
 #endif
@@ -643,6 +672,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             ++nof_qos->submit_fatal_errors;
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle
+                                       << " lane=" << task->io_lane_index
                                        << " submit io fail ret=" << ret
                                        << " chunk_blocks=" << submit_lba_count
                                        << " inflight_blocks="
@@ -722,9 +752,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 
         if (total_outstanding_io > 0) {
             int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
+            for (auto& it : lane_to_qos) {
                 if (it.second->poisoned) continue;
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
+                ret = SpdkWrapper::GetInstance().PollIoLane(
                     it.first, 0);
                 auto& qos = *it.second;
                 ++qos.poll_calls;
@@ -740,21 +770,24 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     now - qos.last_progress >= io_timeout;
                 if (ret < 0 || timed_out) {
                     LOG(ERROR) << "NoF qpair failed ret=" << ret
-                               << " timeout=" << timed_out << " seg=" << it.first;
+                               << " timeout=" << timed_out
+                               << " lane="
+                               << SpdkWrapper::GetInstance().GetIoLaneIndex(
+                                      it.first);
                     qos.poisoned = true;
                     // Keep queued tasks alive while SPDK invokes abort callbacks.
                     for (auto* task : live_tasks) {
-                        if (task->seg_handle == it.first) {
+                        if (task->io_lane == it.first) {
                             task->failed = true;
                             task->remaining_lba = 0;
                         }
                     }
-                    SpdkWrapper::GetInstance().DrainFailedNofSegment(it.first);
+                    SpdkWrapper::GetInstance().DrainFailedIoLane(it.first);
                     // DMA is quiesced and SPDK no longer owns callback contexts.
                     // Complete any tasks the transport did not callback itself.
                     for (auto pos = live_tasks.begin(); pos != live_tasks.end();) {
                         auto* task = *pos++;
-                        if (task->seg_handle != it.first) continue;
+                        if (task->io_lane != it.first) continue;
 #ifdef USE_NOF_URMA
                         NofMemoryDomainManager::GetInstance().OnIoAborted(
                             task->buffer_info, task->op == kSpdkNofOpWrite,
@@ -779,7 +812,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
             if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
-                for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+                for (const auto& [io_lane, nof_qos] : lane_to_qos) {
                     const double empty_poll_ratio =
                         nof_qos->poll_calls == 0
                             ? 0.0
@@ -810,7 +843,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                   nof_qos->submit_backpressure_recoveries;
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
-                        << " seg_handle=" << seg_handle
+                        << " io_lane=" << io_lane
+                        << " lane="
+                        << SpdkWrapper::GetInstance().GetIoLaneIndex(io_lane)
                         << " inflight_read=" << nof_qos->inflight_blocks[0]
                         << " inflight_write=" << nof_qos->inflight_blocks[1]
                         << " inflight_limit=" << nof_qos->inflight_blocks_limit
@@ -875,7 +910,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     for (auto* sub_tasks : sub_task_chunks) {
         delete[] sub_tasks;
     }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
+    // lane_to_qos will automatically clean up SpdkNofQos objects using
     // unique_ptr
 
     VLOG(2) << "SpdkNofWorkerPool worker thread exiting";

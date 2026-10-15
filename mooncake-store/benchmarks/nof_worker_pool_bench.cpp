@@ -109,6 +109,10 @@ DEFINE_uint64(
     nof_workers, 0,
     "Optional override for MC_NOF_WORKERS. Equivalent to exporting "
     "MC_NOF_WORKERS before launch. 0 means keep environment/default.");
+DEFINE_uint64(
+    nof_qpairs_per_segment, 0,
+    "Optional override for MC_NOF_QPAIRS_PER_SEGMENT. Each qpair is assigned "
+    "to one NoF worker. 0 means keep environment/default (one qpair).");
 DEFINE_uint64(nof_submit_chunk_bytes, 0,
               "Optional override for MC_NOF_SUBMIT_CHUNK_BYTES. Equivalent to "
               "exporting MC_NOF_SUBMIT_CHUNK_BYTES before launch. 0 means keep "
@@ -1033,6 +1037,8 @@ int main(int argc, char **argv) {
         }
 
         SetEnvU64IfRequested("MC_NOF_WORKERS", FLAGS_nof_workers);
+        SetEnvU64IfRequested("MC_NOF_QPAIRS_PER_SEGMENT",
+                             FLAGS_nof_qpairs_per_segment);
         SetEnvU64IfRequested("MC_NOF_SUBMIT_CHUNK_BYTES",
                              FLAGS_nof_submit_chunk_bytes);
         SetEnvU64IfRequested("MC_NOF_INFLIGHT_BYTES_LIMIT",
@@ -1103,11 +1109,16 @@ int main(int argc, char **argv) {
                   << ", configured_nof_workers="
                   << (FLAGS_nof_workers == 0 ? mooncake::kDefaultSpdkNofWorkers
                                              : FLAGS_nof_workers)
+                  << ", io_lanes_per_segment="
+                  << wrapper.GetIoLaneCount(endpoints.front().seg_handle)
                   << ", effective_worker_bindings<="
-                  << std::min<uint64_t>(unique_handles.size(),
-                                        FLAGS_nof_workers == 0
-                                            ? mooncake::kDefaultSpdkNofWorkers
-                                            : FLAGS_nof_workers)
+                  << std::min<uint64_t>(
+                         unique_handles.size() *
+                             wrapper.GetIoLaneCount(
+                                 endpoints.front().seg_handle),
+                         FLAGS_nof_workers == 0
+                             ? mooncake::kDefaultSpdkNofWorkers
+                             : FLAGS_nof_workers)
                   << ", io_size=" << FLAGS_io_size
                   << ", iodepth_per_endpoint=" << FLAGS_iodepth
                   << ", total_iodepth=" << total_iodepth
@@ -1116,11 +1127,9 @@ int main(int argc, char **argv) {
                   << ", duration_sec=" << FLAGS_duration_sec;
         if (unique_handles.size() < endpoints.size()) {
             LOG(WARNING)
-                << "Some endpoints resolved to the same nof_seg_handle. In the "
-                   "current SpdkNofWorkerPool implementation, the same handle "
-                   "binds to a single worker thread, so duplicate endpoints "
-                   "will "
-                   "not increase worker parallelism.";
+                << "Some endpoints resolved to the same nof_seg_handle. "
+                   "Duplicate endpoints share that handle's configured I/O "
+                   "lanes and do not create additional qpairs.";
         }
 
         // Modified By Yida (v3): verify 模式走独立的同步 写→读→比对 流程，
