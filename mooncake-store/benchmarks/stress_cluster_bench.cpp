@@ -560,7 +560,8 @@ class BenchmarkStats {
         std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
         std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
         std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
-        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB
+                  << " MiB\n";
         std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
         if (effective_batch_size) {
             std::cout << "    Max batch used: " << *effective_batch_size
@@ -581,9 +582,9 @@ class BenchmarkStats {
         std::cout << "  Total keys:       " << total_keys_ << "\n";
         std::cout << "  Total data:       " << FormatBytes(total_bytes_)
                   << "\n";
-        std::cout << "  Throughput (avg): " << ThroughputMBps() << " MB/s";
+        std::cout << "  Throughput (avg): " << ThroughputMBps() << " MiB/s";
         if (ThroughputMBps() > 1024) {
-            std::cout << " (" << ThroughputMBps() / 1024 << " GB/s)";
+            std::cout << " (" << ThroughputMBps() / 1024 << " GiB/s)";
         }
         std::cout << "\n";
         std::cout << "  Keys/sec:         " << KeysPerSec() << "\n";
@@ -793,14 +794,14 @@ class StressBenchmark {
             LOG(ERROR) << "register_buffer failed, ret=" << ret;
             return ret;
         }
-        LOG(INFO) << "Registered buffer of " << buffer_size_ / MB << " MB";
+        LOG(INFO) << "Registered buffer of " << buffer_size_ / MB << " MiB";
         return 0;
     }
 
     int RunWriter() {
         LOG(INFO) << "=== WRITER MODE ===";
         LOG(INFO) << "Writing " << FLAGS_num_keys << " keys, each "
-                  << FLAGS_value_size / MB << " MB";
+                  << FLAGS_value_size / MB << " MiB";
 
         mooncake::ReplicateConfig config = MakeReplicateConfig();
 
@@ -1175,7 +1176,7 @@ class StressBenchmark {
                      "controls concurrent reads/removes, not PUT concurrency";
         LOG(INFO) << "Writing to " << segments.size() << " segments, "
                   << FLAGS_num_keys << " keys per segment (interleaved), each "
-                  << FLAGS_value_size / MB << " MB";
+                  << FLAGS_value_size / MB << " MiB";
 
         std::vector<size_t> seg_written(segments.size(), 0);
         std::vector<size_t> seg_failed(segments.size(), 0);
@@ -1645,7 +1646,7 @@ class StressBenchmark {
 
                 std::cout << "  [t=" << std::setw(6) << total_sec << "s]"
                           << "  interval: " << interval_throughput_mbps
-                          << " MB/s, " << interval_keys_per_sec << " keys/s, "
+                          << " MiB/s, " << interval_keys_per_sec << " keys/s, "
                           << interval_queries_per_sec << " qps"
                           << " (failed=" << interval_failed << ")"
                           << "  lat[us]: avg="
@@ -1658,7 +1659,7 @@ class StressBenchmark {
                           << NanosToUs(interval_stats.p99_latency_ns)
                           << "  total: " << cur_queries << " queries, "
                           << cur_keys << " keys, " << total_throughput_mbps
-                          << " MB/s, " << total_keys_per_sec << " keys/s, "
+                          << " MiB/s, " << total_keys_per_sec << " keys/s, "
                           << total_queries_per_sec << " qps"
                           << " (failed=" << cur_failed << ")\n";
 
@@ -1719,7 +1720,8 @@ class StressBenchmark {
         std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
         std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
         std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
-        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB
+                  << " MiB\n";
         std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
         std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
         std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
@@ -1729,13 +1731,16 @@ class StressBenchmark {
                   << " (failed: " << final_failed << ")\n";
         std::cout << "  Total keys:       " << final_keys << "\n";
         std::cout << "  Total data:       " << FormatBytes(final_bytes) << "\n";
-        std::cout << "  Throughput (peak): " << peak_throughput_mbps << " MB/s\n";
-        std::cout << "  Throughput (avg):  " << final_throughput_mbps << " MB/s";
+        std::cout << "  Throughput (peak): " << peak_throughput_mbps
+                  << " MiB/s\n";
+        std::cout << "  Throughput (avg):  " << final_throughput_mbps
+                  << " MiB/s";
         if (final_throughput_mbps > 1024) {
-            std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
+            std::cout << " (" << final_throughput_mbps / 1024 << " GiB/s)";
         }
         std::cout << "\n";
-        std::cout << "  Throughput (cur):  " << cur_throughput_mbps << " MB/s\n";
+        std::cout << "  Throughput (cur):  " << cur_throughput_mbps
+                  << " MiB/s\n";
         std::cout << "  Keys/sec:         " << final_keys_per_sec << "\n";
         std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
 
@@ -1824,7 +1829,7 @@ class StressBenchmark {
         LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
                   << " keys to " << remove_segment_nums
                   << " segments (interleaved), each "
-                  << FLAGS_value_size / MB << " MB";
+                  << FLAGS_value_size / MB << " MiB";
         if (!BeginMeasurement()) return 1;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (size_t s = 0; s < remove_segments.size(); ++s) {
@@ -2980,7 +2985,7 @@ class StressBenchmark {
             }
         }
         LOG(INFO) << "Allocated " << num_threads << " thread buffers, each "
-                  << per_buf_size / MB << " MB (NUMA-aware, " << NR_SOCKETS
+                  << per_buf_size / MB << " MiB (NUMA-aware, " << NR_SOCKETS
                   << " sockets)";
         return 0;
     }
@@ -3042,7 +3047,7 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Protocol:       " << FLAGS_protocol;
     LOG(INFO) << "  GPU mode:       " << gpu_config.mode;
     LOG(INFO) << "  GPU device:     " << FLAGS_gpu_device;
-    LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MB";
+    LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MiB";
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
@@ -3245,9 +3250,10 @@ int main(int argc, char* argv[]) {
     size_t total_data = FLAGS_num_keys * FLAGS_value_size;
     if (FLAGS_replica_num > 0 &&
         total_data > FLAGS_global_segment_size * 9.5 / 10) {
-        LOG(WARNING) << "Total data (" << total_data / MB << " MB) may exceed "
+        LOG(WARNING) << "Total data (" << total_data / MB
+                     << " MiB) may exceed "
                      << "95% of segment (" << FLAGS_global_segment_size / MB
-                     << " MB). Master eviction may delete objects. "
+                     << " MiB). Master eviction may delete objects. "
                      << "Consider increasing --global_segment_size or "
                      << "decreasing --num_keys, or use --hard_pin=true.";
     }
