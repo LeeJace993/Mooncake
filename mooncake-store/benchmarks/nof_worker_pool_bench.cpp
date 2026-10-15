@@ -112,16 +112,17 @@ DEFINE_uint64(
 DEFINE_uint64(
     nof_qpairs_per_segment, 0,
     "Optional override for MC_NOF_QPAIRS_PER_SEGMENT. Each qpair is assigned "
-    "to one NoF worker. 0 means keep environment/default (one qpair).");
+    "to one NoF worker. 0 means keep environment/default (four qpairs).");
 DEFINE_uint64(nof_submit_chunk_bytes, 0,
               "Optional override for MC_NOF_SUBMIT_CHUNK_BYTES. Equivalent to "
               "exporting MC_NOF_SUBMIT_CHUNK_BYTES before launch. 0 means keep "
               "environment/default.");
 DEFINE_uint64(
     nof_inflight_bytes_limit, 0,
-    "Optional override for MC_NOF_INFLIGHT_BYTES_LIMIT. Equivalent to "
-    "exporting MC_NOF_INFLIGHT_BYTES_LIMIT before launch. 0 means keep "
-    "environment/default.");
+    "Optional aggregate per-segment inflight byte budget. Equivalent to "
+    "exporting MC_NOF_INFLIGHT_BYTES_LIMIT before launch; the worker pool "
+    "divides it across the segment's I/O lanes. 0 means keep "
+    "environment/default (32 MiB total).");
 DEFINE_bool(nof_whole_pool_register, WholePoolRegistrationDefault(),
             "Register each endpoint's complete benchmark buffer pool once. "
             "This bypasses the fixed per-I/O URMA registration cache. Set "

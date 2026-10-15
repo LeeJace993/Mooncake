@@ -337,7 +337,7 @@ DEFINE_bool(nof_whole_pool_register,
 DEFINE_uint64(nof_qpairs_per_segment, 0,
               "Optional override for MC_NOF_QPAIRS_PER_SEGMENT. Each qpair "
               "is assigned to one NoF worker. 0 keeps environment/default "
-              "(one qpair).");
+              "(four qpairs).");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_uint64(nof_replica_num, 0,
               "Number of NoF SSD replicas for each object");

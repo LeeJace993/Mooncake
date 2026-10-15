@@ -444,6 +444,7 @@ struct SpdkNofQos {
     int inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
     int inflight_blocks_limit;
+    int next_op = 0;
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
     bool poisoned = false;
@@ -473,7 +474,7 @@ struct SpdkNofQos {
     std::chrono::steady_clock::time_point last_progress =
         std::chrono::steady_clock::now();
 
-    explicit SpdkNofQos(uint32_t block_size);
+    explicit SpdkNofQos(uint32_t block_size, size_t lane_count);
 
     bool Empty() const {
         return (head[kSpdkNofOpRead] == nullptr &&

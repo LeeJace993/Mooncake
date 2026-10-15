@@ -43,7 +43,9 @@ bool ParseEnvBool(const char *name, bool *out) {
 }
 
 uint32_t GetNofQpairsPerSegment() {
-    constexpr uint32_t kDefaultQpairs = 1;
+    // R4 measured 31.16/39.83/43.17 GB/s with 1/2/4 qpairs at the same
+    // aggregate QD=256. Four lanes also match the default NoF worker count.
+    constexpr uint32_t kDefaultQpairs = 4;
     constexpr uint32_t kMaxQpairs = 64;
     uint64_t value = 0;
     if (!ParseEnvU64("MC_NOF_QPAIRS_PER_SEGMENT", &value)) {
@@ -493,41 +495,47 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             return nullptr;
         }
 
-        const uint32_t lane_count = GetNofQpairsPerSegment();
-        if (lane_count > 1) {
-            LOG(INFO) << "Experimental NoF multi-qpair mode enabled: lanes="
-                      << lane_count
+        const uint32_t requested_lane_count = GetNofQpairsPerSegment();
+        if (requested_lane_count > 1) {
+            LOG(INFO) << "NoF multi-qpair mode enabled: requested_lanes="
+                      << requested_lane_count
                       << "; completion order is independent across lanes";
         }
+
+        // Reserve the heartbeat qpair first. Business I/O must never share a
+        // qpair with the heartbeat thread because submit/poll are not safe
+        // across those threads.
+        probe_qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+        if (!probe_qpair) {
+            LOG(ERROR) << "alloc probe spdk_nvme_qpair failed";
+            return nullptr;
+        }
+
         std::vector<std::unique_ptr<nof_io_lane>> io_lanes;
-        io_lanes.reserve(lane_count);
-        for (uint32_t lane_index = 0; lane_index < lane_count; ++lane_index) {
+        io_lanes.reserve(requested_lane_count);
+        for (uint32_t lane_index = 0; lane_index < requested_lane_count;
+             ++lane_index) {
             auto lane = std::make_unique<nof_io_lane>();
             lane->qpair =
                 spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
             if (!lane->qpair) {
-                LOG(ERROR) << "alloc SPDK NoF I/O qpair failed lane="
-                           << lane_index << " requested_lanes=" << lane_count;
-                for (auto& allocated_lane : io_lanes) {
-                    spdk_nvme_ctrlr_free_io_qpair(allocated_lane->qpair);
-                    allocated_lane->qpair = nullptr;
+                if (io_lanes.empty()) {
+                    LOG(ERROR) << "alloc SPDK NoF I/O qpair failed lane="
+                               << lane_index << " requested_lanes="
+                               << requested_lane_count;
+                    spdk_nvme_ctrlr_free_io_qpair(probe_qpair);
+                    probe_qpair = nullptr;
+                    return nullptr;
                 }
-                return nullptr;
+                LOG(WARNING)
+                    << "SPDK controller could not allocate all requested NoF "
+                       "I/O qpairs; continuing with lanes="
+                    << io_lanes.size()
+                    << " requested_lanes=" << requested_lane_count;
+                break;
             }
             lane->index = lane_index;
             io_lanes.push_back(std::move(lane));
-        }
-
-        // Modified By Yida (v3): 每个 segment 额外分配一个 heartbeat 专用
-        // qpair，避免 heartbeat 复用业务 qpair 造成跨线程竞争
-        probe_qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
-        if (!probe_qpair) {
-            LOG(ERROR) << "alloc probe spdk_nvme_qpair failed";
-            for (auto& lane : io_lanes) {
-                spdk_nvme_ctrlr_free_io_qpair(lane->qpair);
-                lane->qpair = nullptr;
-            }
-            return nullptr;
         }
 
         auto new_seg = std::make_unique<nof_seg_handle>();
@@ -540,7 +548,8 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
         LOG(INFO) << "Opened NoF segment ns=" << tr.ns
-                  << " io_qpairs=" << lane_count;
+                  << " io_qpairs=" << seg_handle->io_lanes.size()
+                  << " requested_io_qpairs=" << requested_lane_count;
     }
 
     return seg_handle;

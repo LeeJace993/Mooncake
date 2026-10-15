@@ -186,7 +186,7 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 namespace mooncake {
 
 #ifdef USE_NOF
-SpdkNofQos::SpdkNofQos(uint32_t block_size) {
+SpdkNofQos::SpdkNofQos(uint32_t block_size, size_t lane_count) {
     int block_size_int = static_cast<int>(block_size);
     if (block_size_int <= 0) {
         block_size_int = 1;
@@ -194,8 +194,14 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 
     blocks_per_chunk =
         std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
+    // MC_NOF_INFLIGHT_BYTES_LIMIT is the aggregate budget for one segment.
+    // R4 showed that aggregate QD above 256 only increases completion latency,
+    // so divide the existing 32 MiB default across the I/O lanes.
+    const auto effective_lane_count = std::max<size_t>(1, lane_count);
+    const int segment_inflight_blocks =
         std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
+    inflight_blocks_limit = std::max(
+        1, static_cast<int>(segment_inflight_blocks / effective_lane_count));
     for (int i = 0; i < kSpdkNofOpNum; ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
@@ -521,9 +527,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 SpdkNofQos* nof_qos = nullptr;
                 auto it = lane_to_qos.find(task->io_lane);
                 if (it == lane_to_qos.end()) {
+                    const size_t lane_count =
+                        SpdkWrapper::GetInstance().GetIoLaneCount(
+                            task->seg_handle);
                     auto qos = std::make_unique<SpdkNofQos>(
                         SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
+                            task->seg_handle),
+                        lane_count);
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc SpdkNofQos failed, worker " << work_idx;
@@ -539,9 +549,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             << " lane=" << task->io_lane_index
                             << " blocks_per_chunk="
                             << lane_to_qos[task->io_lane]->blocks_per_chunk
-                            << " inflight_blocks_limit="
+                            << " lane_inflight_blocks_limit="
                             << lane_to_qos[task->io_lane]
-                                   ->inflight_blocks_limit;
+                                   ->inflight_blocks_limit
+                            << " segment_inflight_blocks_limit="
+                            << lane_to_qos[task->io_lane]
+                                   ->inflight_blocks_limit *
+                                   static_cast<int>(lane_count);
                     }
                 } else {
                     nof_qos = it->second.get();
@@ -582,10 +596,15 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(io_lane);
             bool qpair_backpressured = false;
-            for (int i = 0;
-                 i < kSpdkNofOpNum && !qpair_backpressured; ++i) {
+            const int first_op = nof_qos->next_op;
+            for (int op_offset = 0;
+                 op_offset < kSpdkNofOpNum && !qpair_backpressured;
+                 ++op_offset) {
+                const int i = (first_op + op_offset) % kSpdkNofOpNum;
                 int avail_blocks = nof_qos->inflight_blocks_limit -
-                                   nof_qos->inflight_blocks[i];
+                                   nof_qos->inflight_blocks[0] -
+                                   nof_qos->inflight_blocks[1];
+                bool submitted_for_op = false;
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
                     if (nof_qos->poisoned) {
@@ -729,6 +748,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 #endif
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
+                            submitted_for_op = true;
                             nof_qos->max_inflight_blocks = std::max(
                                 nof_qos->max_inflight_blocks,
                                 nof_qos->inflight_blocks[0] +
@@ -746,6 +766,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         task->on_chain = false;
                         SpdkNofTaskCompletion(task);
                     }
+                }
+                if (submitted_for_op) {
+                    // Alternate the first direction considered after progress
+                    // so a sustained read stream cannot starve queued writes,
+                    // or vice versa, under the shared lane budget.
+                    nof_qos->next_op = (i + 1) % kSpdkNofOpNum;
                 }
             }
         }
@@ -848,7 +874,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << SpdkWrapper::GetInstance().GetIoLaneIndex(io_lane)
                         << " inflight_read=" << nof_qos->inflight_blocks[0]
                         << " inflight_write=" << nof_qos->inflight_blocks[1]
-                        << " inflight_limit=" << nof_qos->inflight_blocks_limit
+                        << " lane_inflight_limit="
+                        << nof_qos->inflight_blocks_limit
                         << " queued_read="
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
