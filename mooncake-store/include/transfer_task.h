@@ -425,6 +425,8 @@ struct SpdkNofSubTask {
     SpdkNofTask* task;
     int submit_lba_count;
     std::stack<SpdkNofSubTask*>* sub_task_pool;
+    bool track_latency = false;
+    std::chrono::steady_clock::time_point submitted_at;
 // Modified By Yida (v3): ext I/O 选项。必须是成员而非栈变量——SPDK 要求
 // 在 I/O 完成前保持有效；host 路径不使用（io_opts 以 nullptr 提交）。
 #ifdef USE_NOF_URMA
@@ -445,9 +447,19 @@ struct SpdkNofQos {
     uint64_t submit_successes = 0;
     uint64_t submit_eagain = 0;
     uint64_t submit_enomem = 0;
+    uint64_t submit_backpressure_retries = 0;
+    uint64_t submit_backpressure_events = 0;
+    uint64_t submit_backpressure_recoveries = 0;
+    uint64_t submit_backpressure_wait_us = 0;
+    bool submit_backpressured = false;
+    std::chrono::steady_clock::time_point submit_backpressure_started;
+    uint64_t submit_fatal_errors = 0;
     uint64_t submit_other_errors = 0;
     uint64_t completion_successes = 0;
     uint64_t completion_errors = 0;
+    uint64_t completion_latency_samples = 0;
+    uint64_t completion_latency_us = 0;
+    uint64_t max_completion_latency_us = 0;
     uint64_t poll_calls = 0;
     uint64_t empty_polls = 0;
     uint64_t polled_completions = 0;

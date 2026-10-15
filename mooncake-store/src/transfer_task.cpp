@@ -128,6 +128,17 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofTask* task = sub_task->task;
     mooncake::SpdkNofQos* nof_qos = task->nof_qos;
     int op = task->op;
+    if (sub_task->track_latency) {
+        const auto latency_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - sub_task->submitted_at)
+                .count());
+        ++nof_qos->completion_latency_samples;
+        nof_qos->completion_latency_us += latency_us;
+        nof_qos->max_completion_latency_us =
+            std::max(nof_qos->max_completion_latency_us, latency_us);
+        sub_task->track_latency = false;
+    }
     if (--(*task->io_count) < 0) {
         LOG(ERROR) << "total outstanding io < 0";
     }
@@ -445,6 +456,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     std::set<SpdkNofTask*> live_tasks;
     const auto io_timeout = std::chrono::milliseconds(
         GetPositiveEnvOrDefault("MC_NOF_IO_TIMEOUT_MS", 60000));
+    const bool debug_enabled = IsSpdkNofDebugEnabled();
     auto& task_queue = task_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
@@ -492,7 +504,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     }
                     nof_qos = qos.get();
                     seg_to_qos[task->seg_handle] = std::move(qos);
-                    if (IsSpdkNofDebugEnabled()) {
+                    if (debug_enabled) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
                             << " seg_handle=" << task->seg_handle
@@ -540,7 +552,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-            for (int i = 0; i < kSpdkNofOpNum; ++i) {
+            bool qpair_backpressured = false;
+            for (int i = 0;
+                 i < kSpdkNofOpNum && !qpair_backpressured; ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
@@ -598,6 +612,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 #endif
                         ++nof_qos->submit_attempts;
                         if (ret != 0) {
+                            const bool retryable =
+                                ret == -EAGAIN || ret == -ENOMEM;
+                            const bool has_inflight =
+                                nof_qos->inflight_blocks[0] > 0 ||
+                                nof_qos->inflight_blocks[1] > 0;
                             if (ret == -EAGAIN) {
                                 ++nof_qos->submit_eagain;
                             } else if (ret == -ENOMEM) {
@@ -605,6 +624,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             } else {
                                 ++nof_qos->submit_other_errors;
                             }
+                            sub_task_pool.push(sub_task);
+                            if (retryable && has_inflight) {
+                                // SPDK uses EAGAIN/ENOMEM as queue-pressure
+                                // signals. Keep the task at the head, poll
+                                // completions to return credits, then retry it
+                                // on the next worker iteration.
+                                ++nof_qos->submit_backpressure_retries;
+                                if (!nof_qos->submit_backpressured) {
+                                    nof_qos->submit_backpressured = true;
+                                    ++nof_qos->submit_backpressure_events;
+                                    nof_qos->submit_backpressure_started =
+                                        std::chrono::steady_clock::now();
+                                }
+                                qpair_backpressured = true;
+                                break;
+                            }
+                            ++nof_qos->submit_fatal_errors;
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle
                                        << " submit io fail ret=" << ret
@@ -615,9 +651,25 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                        << nof_qos->inflight_blocks_limit;
                             task->failed = true;
                             task->remaining_lba = 0;
-                            sub_task_pool.push(sub_task);
                         } else {
                             ++nof_qos->submit_successes;
+                            if (nof_qos->submit_backpressured) {
+                                nof_qos->submit_backpressured = false;
+                                ++nof_qos->submit_backpressure_recoveries;
+                                nof_qos->submit_backpressure_wait_us +=
+                                    static_cast<uint64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            nof_qos
+                                                ->submit_backpressure_started)
+                                            .count());
+                            }
+                            if (debug_enabled) {
+                                sub_task->submitted_at =
+                                    std::chrono::steady_clock::now();
+                                sub_task->track_latency = true;
+                            }
                             if (!task->first_sub_io_submitted) {
                                 task->first_sub_io_submitted = true;
                                 ++nof_qos->first_submit_count;
@@ -655,6 +707,9 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             task->outstanding_sub_io++;
                             total_outstanding_io++;
                         }
+                    }
+                    if (qpair_backpressured) {
+                        break;
                     }
                     if (task->remaining_lba == 0) {
                         nof_qos->PopTask(i);
@@ -718,13 +773,41 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
 
-        if (IsSpdkNofDebugEnabled()) {
+        if (debug_enabled) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
             if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+                    const double empty_poll_ratio =
+                        nof_qos->poll_calls == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->empty_polls) /
+                                  static_cast<double>(nof_qos->poll_calls);
+                    const uint64_t nonempty_polls =
+                        nof_qos->poll_calls - nof_qos->empty_polls;
+                    const double completions_per_nonempty_poll =
+                        nonempty_polls == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->polled_completions) /
+                                  static_cast<double>(nonempty_polls);
+                    const uint64_t first_submit_wait_avg_us =
+                        nof_qos->first_submit_count == 0
+                            ? 0
+                            : nof_qos->first_submit_wait_us /
+                                  nof_qos->first_submit_count;
+                    const uint64_t completion_latency_avg_us =
+                        nof_qos->completion_latency_samples == 0
+                            ? 0
+                            : nof_qos->completion_latency_us /
+                                  nof_qos->completion_latency_samples;
+                    const uint64_t backpressure_wait_avg_us =
+                        nof_qos->submit_backpressure_recoveries == 0
+                            ? 0
+                            : nof_qos->submit_backpressure_wait_us /
+                                  nof_qos->submit_backpressure_recoveries;
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
                         << " seg_handle=" << seg_handle
@@ -742,6 +825,20 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " submit_successes=" << nof_qos->submit_successes
                         << " submit_eagain=" << nof_qos->submit_eagain
                         << " submit_enomem=" << nof_qos->submit_enomem
+                        << " submit_backpressure_retries="
+                        << nof_qos->submit_backpressure_retries
+                        << " submit_backpressure_events="
+                        << nof_qos->submit_backpressure_events
+                        << " submit_backpressure_recoveries="
+                        << nof_qos->submit_backpressure_recoveries
+                        << " submit_backpressure_active="
+                        << nof_qos->submit_backpressured
+                        << " submit_backpressure_wait_us="
+                        << nof_qos->submit_backpressure_wait_us
+                        << " submit_backpressure_wait_avg_us="
+                        << backpressure_wait_avg_us
+                        << " submit_fatal_errors="
+                        << nof_qos->submit_fatal_errors
                         << " submit_other_errors="
                         << nof_qos->submit_other_errors
                         << " completion_successes="
@@ -750,12 +847,25 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << nof_qos->completion_errors
                         << " poll_calls=" << nof_qos->poll_calls
                         << " empty_polls=" << nof_qos->empty_polls
+                        << " empty_poll_ratio=" << empty_poll_ratio
                         << " polled_completions="
                         << nof_qos->polled_completions
+                        << " completions_per_nonempty_poll="
+                        << completions_per_nonempty_poll
                         << " first_submit_count="
                         << nof_qos->first_submit_count
                         << " first_submit_wait_us="
-                        << nof_qos->first_submit_wait_us;
+                        << nof_qos->first_submit_wait_us
+                        << " first_submit_wait_avg_us="
+                        << first_submit_wait_avg_us
+                        << " completion_latency_samples="
+                        << nof_qos->completion_latency_samples
+                        << " completion_latency_us="
+                        << nof_qos->completion_latency_us
+                        << " completion_latency_avg_us="
+                        << completion_latency_avg_us
+                        << " max_completion_latency_us="
+                        << nof_qos->max_completion_latency_us;
                 }
                 last_debug_snapshot = now;
             }
