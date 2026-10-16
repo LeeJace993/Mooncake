@@ -155,6 +155,18 @@ class RealClient : public PyClient {
                                         const std::vector<size_t> &sizes);
 
     /**
+     * @brief Batch read while reusing unexpired placement query results
+     *
+     * The caller owns the cache and must serialize access to it. Successful
+     * entries are refreshed from Master when absent, expired, or within the
+     * refresh margin. Failed queries are never cached.
+     */
+    std::vector<int64_t> batch_get_into(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        QueryResultCache *query_result_cache);
+
+    /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
      * @param keys Vector of keys of the objects to get
@@ -592,7 +604,8 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
