@@ -1546,6 +1546,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     size_t submitted_bytes = 0;
     int64_t wait_blocked_us = 0;
     int64_t checksum_us = 0;
+    size_t ready_before_wait = 0;
+    size_t blocked_futures = 0;
+    int64_t max_future_wait_us = 0;
+    size_t nof_timing_count = 0;
+    uint64_t nof_sub_io_count = 0;
+    uint32_t slowest_lane = 0;
+    int64_t slowest_task_us = 0;
+    int64_t nof_dispatch_queue_sum_us = 0;
+    int64_t nof_dispatch_queue_max_us = 0;
+    int64_t nof_qos_queue_sum_us = 0;
+    int64_t nof_qos_queue_max_us = 0;
+    int64_t nof_queue_to_submit_sum_us = 0;
+    int64_t nof_queue_to_submit_max_us = 0;
+    int64_t nof_submit_span_sum_us = 0;
+    int64_t nof_submit_span_max_us = 0;
+    int64_t nof_drain_sum_us = 0;
+    int64_t nof_drain_max_us = 0;
+    int64_t nof_first_completion_sum_us = 0;
+    int64_t nof_first_completion_max_us = 0;
+    int64_t nof_completion_span_sum_us = 0;
+    int64_t nof_completion_span_max_us = 0;
+    int64_t nof_task_total_sum_us = 0;
+    int64_t nof_task_total_max_us = 0;
+    int64_t nof_observe_delay_sum_us = 0;
+    int64_t nof_observe_delay_max_us = 0;
 
     // Submit all transfers in parallel
     const auto submit_start =
@@ -1627,13 +1652,64 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        const bool was_ready = breakdown_log && future.isReady();
+        if (was_ready) {
+            ++ready_before_wait;
+        } else if (breakdown_log) {
+            ++blocked_futures;
+        }
         const auto wait_start =
             breakdown_log ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
         ErrorCode result = future.get();
         if (breakdown_log) {
-            wait_blocked_us +=
+            const int64_t future_wait_us =
                 elapsed_us(wait_start, std::chrono::steady_clock::now());
+            wait_blocked_us += future_wait_us;
+            max_future_wait_us =
+                std::max(max_future_wait_us, future_wait_us);
+            if (auto timing = future.nofTiming(); timing.has_value()) {
+                ++nof_timing_count;
+                nof_sub_io_count += timing->sub_io_count;
+                nof_dispatch_queue_sum_us += timing->dispatch_queue_us;
+                nof_dispatch_queue_max_us = std::max(
+                    nof_dispatch_queue_max_us, timing->dispatch_queue_us);
+                nof_qos_queue_sum_us += timing->qos_queue_us;
+                nof_qos_queue_max_us =
+                    std::max(nof_qos_queue_max_us, timing->qos_queue_us);
+                nof_queue_to_submit_sum_us +=
+                    timing->queue_to_first_submit_us;
+                nof_queue_to_submit_max_us = std::max(
+                    nof_queue_to_submit_max_us,
+                    timing->queue_to_first_submit_us);
+                nof_submit_span_sum_us += timing->first_to_last_submit_us;
+                nof_submit_span_max_us = std::max(
+                    nof_submit_span_max_us, timing->first_to_last_submit_us);
+                nof_drain_sum_us += timing->last_submit_to_complete_us;
+                nof_drain_max_us = std::max(
+                    nof_drain_max_us, timing->last_submit_to_complete_us);
+                nof_first_completion_sum_us +=
+                    timing->first_submit_to_first_completion_us;
+                nof_first_completion_max_us = std::max(
+                    nof_first_completion_max_us,
+                    timing->first_submit_to_first_completion_us);
+                nof_completion_span_sum_us +=
+                    timing->first_completion_to_complete_us;
+                nof_completion_span_max_us = std::max(
+                    nof_completion_span_max_us,
+                    timing->first_completion_to_complete_us);
+                nof_task_total_sum_us += timing->total_us;
+                nof_task_total_max_us =
+                    std::max(nof_task_total_max_us, timing->total_us);
+                nof_observe_delay_sum_us += timing->complete_to_observe_us;
+                nof_observe_delay_max_us = std::max(
+                    nof_observe_delay_max_us,
+                    timing->complete_to_observe_us);
+                if (timing->total_us > slowest_task_us) {
+                    slowest_task_us = timing->total_us;
+                    slowest_lane = timing->lane;
+                }
+            }
         }
 
         // Release the cache block after transfer completes (memcpy is done)
@@ -1735,6 +1811,48 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                      << " total_us=" << total_us
                      << " success=" << success_count
                      << " failed=" << (results.size() - success_count);
+        if (nof_timing_count > 0) {
+            auto average = [nof_timing_count](int64_t sum) {
+                return sum / static_cast<int64_t>(nof_timing_count);
+            };
+            MC_LOG(INFO)
+                << "batch_get_nof_wait_breakdown trace_id=" << trace_id
+                << " nof_tasks=" << nof_timing_count
+                << " sub_ios=" << nof_sub_io_count
+                << " ready_before_wait=" << ready_before_wait
+                << " blocked_futures=" << blocked_futures
+                << " future_wait_sum_us=" << wait_blocked_us
+                << " future_wait_max_us=" << max_future_wait_us
+                << " dispatch_queue_avg_us="
+                << average(nof_dispatch_queue_sum_us)
+                << " dispatch_queue_max_us=" << nof_dispatch_queue_max_us
+                << " qos_queue_avg_us=" << average(nof_qos_queue_sum_us)
+                << " qos_queue_max_us=" << nof_qos_queue_max_us
+                << " queue_to_submit_avg_us="
+                << average(nof_queue_to_submit_sum_us)
+                << " queue_to_submit_max_us="
+                << nof_queue_to_submit_max_us
+                << " submit_span_avg_us="
+                << average(nof_submit_span_sum_us)
+                << " submit_span_max_us=" << nof_submit_span_max_us
+                << " drain_avg_us=" << average(nof_drain_sum_us)
+                << " drain_max_us=" << nof_drain_max_us
+                << " first_completion_avg_us="
+                << average(nof_first_completion_sum_us)
+                << " first_completion_max_us="
+                << nof_first_completion_max_us
+                << " completion_span_avg_us="
+                << average(nof_completion_span_sum_us)
+                << " completion_span_max_us="
+                << nof_completion_span_max_us
+                << " task_total_avg_us=" << average(nof_task_total_sum_us)
+                << " task_total_max_us=" << nof_task_total_max_us
+                << " observe_delay_avg_us="
+                << average(nof_observe_delay_sum_us)
+                << " observe_delay_max_us=" << nof_observe_delay_max_us
+                << " slowest_lane=" << slowest_lane
+                << " slowest_task_us=" << slowest_task_us;
+        }
     }
 
     // Log overall cache hit statistics for the entire batch

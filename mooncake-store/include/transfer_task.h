@@ -44,6 +44,26 @@ enum class TransferStrategy {
     SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
+// Per-object NoF timing, captured only for sampled high-frequency traces.
+// The first three phases form a non-overlapping decomposition of total_us:
+// queue_to_first_submit_us + first_to_last_submit_us +
+// last_submit_to_complete_us ~= total_us.  Completion timings overlap the
+// submit span because completions may arrive while later sub-I/Os are still
+// being admitted to the qpair.
+struct NofTransferTiming {
+    uint32_t lane = 0;
+    uint32_t sub_io_count = 0;
+    int64_t dispatch_queue_us = 0;
+    int64_t qos_queue_us = 0;
+    int64_t queue_to_first_submit_us = 0;
+    int64_t first_to_last_submit_us = 0;
+    int64_t last_submit_to_complete_us = 0;
+    int64_t first_submit_to_first_completion_us = 0;
+    int64_t first_completion_to_complete_us = 0;
+    int64_t total_us = 0;
+    int64_t complete_to_observe_us = 0;
+};
+
 /**
  * @brief Stream operator for TransferStrategy
  */
@@ -109,6 +129,11 @@ class OperationState {
      */
     virtual void wait_for_completion() = 0;
 
+    // Available only for sampled SPDK NoF operations after completion.
+    virtual std::optional<NofTransferTiming> nof_timing() const {
+        return std::nullopt;
+    }
+
     uint64_t trace_id() const { return trace_id_; }
 
    protected:
@@ -169,15 +194,26 @@ class MemcpyOperationState : public OperationState {
  */
 class SpdkNofOperationState : public OperationState {
    public:
+    explicit SpdkNofOperationState(uint64_t trace_id = 0,
+                                   bool track_timing = false)
+        : OperationState(trace_id), track_timing_(track_timing) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
     }
 
-    void set_completed(ErrorCode error_code) {
+    void set_completed(
+        ErrorCode error_code,
+        std::optional<NofTransferTiming> timing = std::nullopt) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
+            if (track_timing_ && timing.has_value()) {
+                timing_ = std::make_unique<NofTransferTiming>(
+                    std::move(timing.value()));
+                completed_at_ = std::chrono::steady_clock::now();
+            }
             result_.emplace(error_code);
         }
         cv_.notify_all();
@@ -191,6 +227,26 @@ class SpdkNofOperationState : public OperationState {
     TransferStrategy get_strategy() const override {
         return TransferStrategy::SPDK_NVMF;
     }
+
+    bool track_timing() const { return track_timing_; }
+
+    std::optional<NofTransferTiming> nof_timing() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value() || !timing_) {
+            return std::nullopt;
+        }
+        auto timing = *timing_;
+        timing.complete_to_observe_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - completed_at_)
+                .count();
+        return timing;
+    }
+
+   private:
+    bool track_timing_ = false;
+    std::unique_ptr<NofTransferTiming> timing_;
+    std::chrono::steady_clock::time_point completed_at_{};
 };
 
 class FilereadOperationState : public OperationState {
@@ -296,6 +352,9 @@ class TransferFuture {
      */
     ErrorCode get();
 
+    // Returns per-object NoF phase timings after get()/wait() completes.
+    std::optional<NofTransferTiming> nofTiming() const;
+
     /**
      * @brief Get the transfer strategy used by this operation
      * @return TransferStrategy enum value
@@ -374,6 +433,15 @@ class MemcpyWorkerPool {
 // struct SpdkNofSubTask;
 struct SpdkNofQos;
 
+struct SpdkNofTaskTiming {
+    std::chrono::steady_clock::time_point worker_dequeued_at;
+    std::chrono::steady_clock::time_point first_submit_at;
+    std::chrono::steady_clock::time_point last_submit_at;
+    std::chrono::steady_clock::time_point first_completion_at;
+    uint32_t submitted_sub_io_count = 0;
+    uint32_t completed_sub_io_count = 0;
+};
+
 /**
  * @brief Spdk nvmf operation descriptor
  */
@@ -393,6 +461,7 @@ struct SpdkNofTask {
     bool first_sub_io_submitted;
     std::chrono::steady_clock::time_point queued_at;
     std::shared_ptr<SpdkNofOperationState> state;
+    std::unique_ptr<SpdkNofTaskTiming> timing;
     int64_t* io_count;
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
@@ -420,6 +489,9 @@ struct SpdkNofTask {
           first_sub_io_submitted(false),
           queued_at(std::chrono::steady_clock::now()),
           state(std::move(s)),
+          timing(state && state->track_timing()
+                     ? std::make_unique<SpdkNofTaskTiming>()
+                     : nullptr),
           io_count(nullptr),
           nof_qos(nullptr),
           nxt(nullptr) {}

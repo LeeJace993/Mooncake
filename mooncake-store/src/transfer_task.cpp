@@ -109,9 +109,48 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
     // after it is popped, so the queue and callback cannot complete it twice.
     if (task->remaining_lba == 0 && task->outstanding_sub_io == 0 &&
         !task->on_chain) {
-        task->state->set_completed(task->failed
-                                       ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
+        std::optional<mooncake::NofTransferTiming> timing;
+        if (task->timing && task->first_sub_io_submitted &&
+            task->timing->submitted_sub_io_count > 0 &&
+            task->timing->completed_sub_io_count > 0 &&
+            task->timing->worker_dequeued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->last_submit_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->first_completion_at !=
+                std::chrono::steady_clock::time_point{}) {
+            const auto completed_at = std::chrono::steady_clock::now();
+            auto elapsed_us = [](auto begin, auto end) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(
+                           end - begin)
+                    .count();
+            };
+            timing.emplace();
+            timing->lane = task->io_lane_index;
+            timing->sub_io_count = task->timing->submitted_sub_io_count;
+            timing->dispatch_queue_us =
+                elapsed_us(task->queued_at, task->timing->worker_dequeued_at);
+            timing->qos_queue_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->first_submit_at);
+            timing->queue_to_first_submit_us =
+                elapsed_us(task->queued_at, task->timing->first_submit_at);
+            timing->first_to_last_submit_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->last_submit_at);
+            timing->last_submit_to_complete_us =
+                elapsed_us(task->timing->last_submit_at, completed_at);
+            timing->first_submit_to_first_completion_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_to_complete_us =
+                elapsed_us(task->timing->first_completion_at, completed_at);
+            timing->total_us = elapsed_us(task->queued_at, completed_at);
+        }
+        task->state->set_completed(
+            task->failed ? mooncake::ErrorCode::TRANSFER_FAIL
+                         : mooncake::ErrorCode::OK,
+            std::move(timing));
         if (task->live_registry) task->live_registry->erase(task);
         delete task;
     }
@@ -128,6 +167,13 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofTask* task = sub_task->task;
     mooncake::SpdkNofQos* nof_qos = task->nof_qos;
     int op = task->op;
+    if (task->timing) {
+        if (task->timing->completed_sub_io_count == 0) {
+            task->timing->first_completion_at =
+                std::chrono::steady_clock::now();
+        }
+        ++task->timing->completed_sub_io_count;
+    }
     if (sub_task->track_latency) {
         const auto latency_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -575,6 +621,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     task_queue.pop();
                     continue;
                 }
+                if (task->timing) {
+                    task->timing->worker_dequeued_at =
+                        std::chrono::steady_clock::now();
+                }
 
                 SpdkNofQos* nof_qos = nullptr;
                 auto it = lane_to_qos.find(task->io_lane);
@@ -781,6 +831,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             }
                             if (!task->first_sub_io_submitted) {
                                 task->first_sub_io_submitted = true;
+                                if (task->timing) {
+                                    task->timing->first_submit_at =
+                                        std::chrono::steady_clock::now();
+                                }
                                 ++nof_qos->first_submit_count;
                                 nof_qos->first_submit_wait_us +=
                                     static_cast<uint64_t>(
@@ -807,6 +861,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                     block_size);
 #endif
                             task->remaining_lba -= submit_lba_count;
+                            if (task->timing) {
+                                ++task->timing->submitted_sub_io_count;
+                                if (task->remaining_lba == 0) {
+                                    task->timing->last_submit_at =
+                                        std::chrono::steady_clock::now();
+                                }
+                            }
                             nof_qos->inflight_blocks[i] += submit_lba_count;
                             submitted_for_op = true;
                             nof_qos->max_inflight_blocks = std::max(
@@ -1482,6 +1543,10 @@ ErrorCode TransferFuture::wait() {
 
 ErrorCode TransferFuture::get() { return wait(); }
 
+std::optional<NofTransferTiming> TransferFuture::nofTiming() const {
+    return state_->nof_timing();
+}
+
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
 }
@@ -2093,7 +2158,11 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool track_timing =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    auto state =
+        std::make_shared<SpdkNofOperationState>(trace_id, track_timing);
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
                      size / block_size, op_code, state);
     spdk_nvmf_pool_->submitTask(std::move(task));
