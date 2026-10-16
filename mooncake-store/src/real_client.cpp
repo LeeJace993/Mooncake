@@ -5351,12 +5351,6 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
-    return batch_get_into(keys, buffers, sizes, nullptr);
-}
-
-std::vector<int64_t> RealClient::batch_get_into(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, QueryResultCache *query_result_cache) {
     mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
@@ -5364,8 +5358,7 @@ std::vector<int64_t> RealClient::batch_get_into(
                 SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_INTO_INTERNAL,
                                           SpDiag::PerfLevel::KEY_MODULE);
                 pt_full.Start();
-                auto result = batch_get_into_internal(
-                    keys, buffers, sizes, query_result_cache);
+                auto result = batch_get_into_internal(keys, buffers, sizes);
                 pt_full.End(0);
                 return result;
             },
@@ -5613,8 +5606,7 @@ RealClient::get_into_ranges_shm_helper(
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes,
-                                    QueryResultCache *query_result_cache) {
+                                    const std::vector<size_t> &sizes) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
@@ -5646,78 +5638,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return results;
     }
 
-    // Query metadata for cache misses. Refresh shortly before expiry so the
-    // lease remains valid through a normal batch transfer.
+    // Query metadata for all keys
     SpDiag::PerfPoint pt_query(PerfKey::GET_BATCH_INTO_INTERNAL_QUERY,
                                SpDiag::PerfLevel::MODULE);
     pt_query.Start();
-    constexpr auto kQueryCacheRefreshMargin = std::chrono::milliseconds(100);
-    const auto query_now = std::chrono::steady_clock::now();
-    size_t query_cache_hits = 0;
-    size_t query_cache_misses = num_keys;
-    auto query_results = [&]() {
-        if (query_result_cache == nullptr) {
-            return client_->BatchQuery(keys);
-        }
-
-        std::vector<std::optional<tl::expected<QueryResult, ErrorCode>>>
-            query_result_slots(num_keys);
-        std::vector<std::string> missing_keys;
-        std::vector<size_t> missing_indices;
-        missing_keys.reserve(num_keys);
-        missing_indices.reserve(num_keys);
-
-        for (size_t i = 0; i < num_keys; ++i) {
-            bool cache_hit = false;
-            auto cached = query_result_cache->find(keys[i]);
-            if (cached != query_result_cache->end() && cached->second &&
-                cached->second->lease_timeout >
-                    query_now + kQueryCacheRefreshMargin) {
-                query_result_slots[i].emplace(cached->second);
-                cache_hit = true;
-                ++query_cache_hits;
-            } else if (cached != query_result_cache->end()) {
-                query_result_cache->erase(cached);
-            }
-            if (!cache_hit) {
-                missing_keys.push_back(keys[i]);
-                missing_indices.push_back(i);
-            }
-        }
-
-        query_cache_misses = missing_keys.size();
-        if (!missing_keys.empty()) {
-            auto fresh_results = client_->BatchQuery(missing_keys);
-            if (fresh_results.size() != missing_keys.size()) {
-                LOG(ERROR) << "Batch query response size mismatch in "
-                              "batch_get_into: expected "
-                           << missing_keys.size() << ", got "
-                           << fresh_results.size();
-            } else {
-                for (size_t i = 0; i < fresh_results.size(); ++i) {
-                    const size_t result_index = missing_indices[i];
-                    query_result_slots[result_index].emplace(fresh_results[i]);
-                    query_result_cache->erase(missing_keys[i]);
-                    if (fresh_results[i]) {
-                        query_result_cache->emplace(missing_keys[i],
-                                                    fresh_results[i]);
-                    }
-                }
-            }
-        }
-
-        std::vector<tl::expected<QueryResult, ErrorCode>> resolved_results;
-        resolved_results.reserve(num_keys);
-        for (auto &slot : query_result_slots) {
-            if (slot.has_value()) {
-                resolved_results.emplace_back(*slot);
-            } else {
-                resolved_results.emplace_back(
-                    tl::unexpected(ErrorCode::RPC_FAIL));
-            }
-        }
-        return resolved_results;
-    }();
+    const auto query_results = client_->BatchQuery(keys);
     if (breakdown_log) t_query = std::chrono::steady_clock::now();
     pt_query.End(0);
 
@@ -5880,10 +5805,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     .count();
             MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
                          << "] start_time[" << FormatWallClock(t0_wall)
-                         << "] query_us[" << query_us
-                         << "] query_cache_hits[" << query_cache_hits
-                         << "] query_cache_misses[" << query_cache_misses
-                         << "] prep_us[" << prep_us
+                         << "] query_us[" << query_us << "] prep_us[" << prep_us
                          << "] read_us[0] total_us[" << total_us
                          << "] mem_ops[0] nof_ops[0] disk_ops[0] ssd_offload_ops[0]"
                          << " success[0] replicas[" << replica_types_log << "]";
@@ -6095,9 +6017,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                             .count();
         MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
                      << "] start_time[" << FormatWallClock(t0_wall)
-                     << "] query_us[" << query_us << "] query_cache_hits["
-                     << query_cache_hits << "] query_cache_misses["
-                     << query_cache_misses << "] prep_us[" << prep_us
+                     << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
                      << "] mem_ops[" << (valid_operations.size() - nof_count)
                      << "] nof_ops[" << nof_count << "] disk_ops["

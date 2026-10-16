@@ -239,9 +239,9 @@ class ClientRequester {
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
-    // Lease-bounded cache of fresh batch_query() results. Read paths must
-    // reject or refresh entries before lease_timeout; callers that retain the
-    // cache across requests must also serialize access to it.
+    // Request-scoped cache of fresh batch_query() results that can be reused by
+    // subsequent ranged reads in the same operation. Callers should not retain
+    // entries across independent requests.
     using QueryResultCache =
         std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
 

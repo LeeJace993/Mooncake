@@ -311,10 +311,6 @@ DEFINE_uint64(batch_size, 32,
               "Batch size for reads and per-thread buffer sizing");
 DEFINE_uint64(num_threads, 1,
               "Number of concurrent benchmark worker threads");
-DEFINE_bool(batch_query_cache, false,
-            "Reuse unexpired BatchQuery results in batch_get_into. Each "
-            "benchmark thread owns an independent cache; false preserves the "
-            "historical always-query workload.");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
 DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
@@ -1486,10 +1482,6 @@ class StressBenchmark {
             threads.emplace_back([&, t, keys_per_thread, total_keys]() {
                 bindToSocket(t % NR_SOCKETS);
                 char* my_buf = thread_buffers_[t].ptr;
-                mooncake::PyClient::QueryResultCache query_cache;
-                if (FLAGS_batch_query_cache) {
-                    query_cache.reserve(keys_per_thread);
-                }
 
                 start_latch.arrive_and_wait();
 
@@ -1543,12 +1535,8 @@ class StressBenchmark {
                         }
 
                         auto t0 = Clock::now();
-                        auto results = FLAGS_batch_query_cache
-                                           ? client_->batch_get_into(
-                                                 keys, bufs, sizes,
-                                                 &query_cache)
-                                           : client_->batch_get_into(
-                                                 keys, bufs, sizes);
+                        auto results =
+                            client_->batch_get_into(keys, bufs, sizes);
                         auto t1 = Clock::now();
                         int64_t latency_ns = ElapsedNanos(t0, t1);
 
@@ -2317,10 +2305,6 @@ class StressBenchmark {
         result.latencies_ns.reserve(my_keys);
 
         char* my_buf = thread_buffers_[tid].ptr;
-        mooncake::PyClient::QueryResultCache query_cache;
-        if (FLAGS_batch_query_cache) {
-            query_cache.reserve(my_keys);
-        }
 
         ready_latch.count_down();
         start_latch.arrive_and_wait();
@@ -2386,12 +2370,8 @@ class StressBenchmark {
                         }
 
                         auto t0 = Clock::now();
-                        auto results = FLAGS_batch_query_cache
-                                           ? client_->batch_get_into(
-                                                 key_list, bufs, sizes,
-                                                 &query_cache)
-                                           : client_->batch_get_into(
-                                                 key_list, bufs, sizes);
+                        auto results =
+                            client_->batch_get_into(key_list, bufs, sizes);
                         auto t1 = Clock::now();
 
                         int64_t lat_ns = ElapsedNanos(t0, t1);
@@ -3070,8 +3050,6 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MiB";
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
-    LOG(INFO) << "  Batch query cache: "
-              << (FLAGS_batch_query_cache ? "enabled" : "disabled");
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
     LOG(INFO) << "  Memory replicas: " << FLAGS_replica_num;
     LOG(INFO) << "  NoF replicas:   " << FLAGS_nof_replica_num;
