@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -7,6 +8,7 @@
 #include <mutex>
 #include <stack>
 #include <string>
+#include <thread>
 #include <vector>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -123,6 +125,9 @@ class SpdkWrapper {
     explicit SpdkWrapper();
     ~SpdkWrapper();
 
+    nof_seg_handle *OpenNofSegmentWithLaneCount(
+        const std::string &tr_str, uint32_t requested_lane_count);
+
     int ParseTransPortStr(const std::string &tr_str, tr_info *info);
     int ConnectController(const struct spdk_nvme_transport_id *trid,
                           ctrlr_info *info);
@@ -139,6 +144,7 @@ class SpdkWrapper {
     ProbeRequestContext *AcquireProbeRequestContext();
     void RecycleProbeRequestContext(ProbeRequestContext *ctx);
     void ReplenishProbeRequestContextPoolLocked(size_t count);
+    void AdminPollThreadFunc();
     static void ProbeReadComplete(void *ctx, const struct spdk_nvme_cpl *cpl);
 
     std::atomic<bool> initialized{false};
@@ -150,6 +156,10 @@ class SpdkWrapper {
     std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;
     std::stack<ProbeRequestContext *> probe_request_context_pool_;
     std::mutex probe_request_context_pool_mutex_;
+    std::atomic<bool> admin_poll_running_{false};
+    std::thread admin_poll_thread_;
+    std::mutex admin_poll_mutex_;
+    std::condition_variable admin_poll_cv_;
 };
 
 }  // namespace mooncake

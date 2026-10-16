@@ -62,7 +62,13 @@ uint32_t GetNofQpairsPerSegment() {
 void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
     uint64_t v = 0;
     bool bv = false;
-    opts->keep_alive_timeout_ms = 0;
+
+    // Keep SPDK's default KATO (currently 10 seconds). When a benchmark is
+    // terminated before Cleanup() can detach its controller, target-side KATO
+    // is the fallback that reclaims the orphaned controller and qpairs.
+    if (ParseEnvU64("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", &v)) {
+        opts->keep_alive_timeout_ms = static_cast<uint32_t>(v);
+    }
 
     if (ParseEnvU64("MC_NVME_NUM_IO_QUEUES", &v)) {
         opts->num_io_queues = static_cast<uint32_t>(v);
@@ -110,13 +116,13 @@ struct nof_io_lane {
 };
 
 struct nof_seg_handle {
-    struct spdk_nvme_ns *ns;
+    struct spdk_nvme_ns *ns = nullptr;
     /* Modified By Yida (v3): 业务 worker 与 heartbeat 分离 qpair。SPDK URMA
      * qpair 内部有 outstanding list 和同一条 TCP control socket，heartbeat
      * 线程与 worker 同时 submit/poll 同一 qpair 会产生竞争。每个业务 lane
      * 由一个 worker 独占，heartbeat 只用 probe_qpair。 */
     std::vector<std::unique_ptr<nof_io_lane>> io_lanes;
-    struct spdk_nvme_qpair *probe_qpair;
+    struct spdk_nvme_qpair *probe_qpair = nullptr;
     std::mutex probe_mutex;
 };
 
@@ -127,7 +133,8 @@ struct tr_info {
 };
 
 struct ctrlr_info {
-    struct spdk_nvme_ctrlr *ctrlr;
+    struct spdk_nvme_ctrlr *ctrlr = nullptr;
+    int32_t last_admin_poll_error = 0;
     std::map<uint32_t, std::unique_ptr<nof_seg_handle>> ns_seg;
     std::mutex ns_mutex;
 };
@@ -163,11 +170,20 @@ bool SpdkWrapper::InitializeEnv() {
 
     // Mark SPDK as initialized.
     initialized.store(true, std::memory_order_release);
+    admin_poll_running_.store(true, std::memory_order_release);
+    admin_poll_thread_ =
+        std::thread(&SpdkWrapper::AdminPollThreadFunc, this);
     return true;
 }
 
 void SpdkWrapper::Cleanup() {
     if (initialized.load(std::memory_order_acquire)) {
+        admin_poll_running_.store(false, std::memory_order_release);
+        admin_poll_cv_.notify_all();
+        if (admin_poll_thread_.joinable()) {
+            admin_poll_thread_.join();
+        }
+
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex);
             for (auto &[_, info] : connected_ctrlrs) {
@@ -210,6 +226,33 @@ void SpdkWrapper::Cleanup() {
         }
         spdk_env_fini();
         initialized.store(false, std::memory_order_release);
+    }
+}
+
+void SpdkWrapper::AdminPollThreadFunc() {
+    while (admin_poll_running_.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+            for (auto &[endpoint, info] : connected_ctrlrs) {
+                if (!info || !info->ctrlr) {
+                    continue;
+                }
+                const int32_t rc =
+                    spdk_nvme_ctrlr_process_admin_completions(info->ctrlr);
+                if (rc < 0 && rc != info->last_admin_poll_error) {
+                    LOG(WARNING)
+                        << "NoF controller admin poll failed endpoint="
+                        << endpoint << " rc=" << rc;
+                }
+                info->last_admin_poll_error = rc < 0 ? rc : 0;
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(admin_poll_mutex_);
+        admin_poll_cv_.wait_for(
+            lock, std::chrono::seconds(1), [this] {
+                return !admin_poll_running_.load(std::memory_order_acquire);
+            });
     }
 }
 
@@ -448,10 +491,23 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
         info->ctrlr = ctrlr;
     };
 
-    return spdk_nvme_probe(trid, (void *)info, probe_cb, attach_cb, NULL);
+    const int rc =
+        spdk_nvme_probe(trid, (void *)info, probe_cb, attach_cb, NULL);
+    if (rc != 0) {
+        return rc;
+    }
+    // Some transport attach failures complete the probe without invoking the
+    // attach callback. Treat a missing controller as a failed connection even
+    // when the top-level probe return code is zero.
+    return info->ctrlr != nullptr ? 0 : -ENODEV;
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+    return OpenNofSegmentWithLaneCount(tr_str, GetNofQpairsPerSegment());
+}
+
+nof_seg_handle *SpdkWrapper::OpenNofSegmentWithLaneCount(
+    const std::string &tr_str, uint32_t requested_lane_count) {
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {
@@ -467,7 +523,10 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             info = new_info.get();
 
             ret = ConnectController(&tr.trid, info);
-            if (ret != 0) {
+            if (ret != 0 || info->ctrlr == nullptr) {
+                LOG(ERROR) << "Failed to attach NoF controller endpoint="
+                           << tr_str << " rc=" << ret
+                           << " ctrlr=" << info->ctrlr;
                 return nullptr;
             }
 
@@ -475,6 +534,14 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         } else {
             info = it->second.get();
         }
+    }
+
+    // spdk_nvme_probe() may finish without invoking attach_cb when the remote
+    // target rejects controller creation. Never pass that missing controller
+    // into SPDK namespace helpers; they require a non-null controller.
+    if (info == nullptr || info->ctrlr == nullptr) {
+        LOG(ERROR) << "NoF controller is unavailable endpoint=" << tr_str;
+        return nullptr;
     }
 
     nof_seg_handle *seg_handle = nullptr;
@@ -485,7 +552,41 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         std::lock_guard<std::mutex> lock(info->ns_mutex);
         auto ns_it = ns_seg.find(tr.ns);
         if (ns_it != ns_seg.end()) {
-            return ns_it->second.get();
+            seg_handle = ns_it->second.get();
+            if (seg_handle->io_lanes.size() >= requested_lane_count) {
+                return seg_handle;
+            }
+
+            // A heartbeat can create a probe-only segment before a data
+            // client opens the same namespace in the same process. Add the
+            // missing business lanes without replacing the probe qpair.
+            while (seg_handle->io_lanes.size() < requested_lane_count) {
+                auto lane = std::make_unique<nof_io_lane>();
+                lane->qpair =
+                    spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+                if (!lane->qpair) {
+                    if (seg_handle->io_lanes.empty()) {
+                        LOG(ERROR)
+                            << "alloc SPDK NoF I/O qpair failed lane=0"
+                            << " requested_lanes=" << requested_lane_count;
+                        return nullptr;
+                    }
+                    LOG(WARNING)
+                        << "SPDK controller could not allocate all requested "
+                           "NoF I/O qpairs; continuing with lanes="
+                        << seg_handle->io_lanes.size()
+                        << " requested_lanes=" << requested_lane_count;
+                    break;
+                }
+                lane->index =
+                    static_cast<uint32_t>(seg_handle->io_lanes.size());
+                lane->segment = seg_handle;
+                seg_handle->io_lanes.push_back(std::move(lane));
+            }
+            LOG(INFO) << "Expanded NoF segment ns=" << tr.ns
+                      << " io_qpairs=" << seg_handle->io_lanes.size()
+                      << " requested_io_qpairs=" << requested_lane_count;
+            return seg_handle;
         }
 
         if (spdk_nvme_ctrlr_is_active_ns(info->ctrlr, tr.ns)) {
@@ -495,7 +596,6 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             return nullptr;
         }
 
-        const uint32_t requested_lane_count = GetNofQpairsPerSegment();
         if (requested_lane_count > 1) {
             LOG(INFO) << "NoF multi-qpair mode enabled: requested_lanes="
                       << requested_lane_count
@@ -661,7 +761,10 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         return false;
     }
 
-    nof_seg_handle *seg_handle = OpenNofSegment(tr_str);
+    // Master heartbeat only submits one probe read. Allocating the default
+    // data-plane lanes here creates unnecessary target queues and can amplify
+    // stale-controller pressure during register/unregister operations.
+    nof_seg_handle *seg_handle = OpenNofSegmentWithLaneCount(tr_str, 0);
     if (!seg_handle) {
         if (error_reason) {
             *error_reason = "open_fail";
