@@ -104,6 +104,74 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
+static inline int64_t ElapsedMicros(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+static inline void MarkNofTaskAsQosHead(
+    mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing &&
+        task->timing->qos_head_at ==
+            std::chrono::steady_clock::time_point{}) {
+        task->timing->qos_head_at = now;
+    }
+}
+
+static inline void StartNofCreditWait(
+    mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && !task->timing->credit_wait_active) {
+        task->timing->credit_wait_active = true;
+        task->timing->credit_wait_started_at = now;
+    }
+}
+
+static inline void StopNofCreditWait(
+    mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && task->timing->credit_wait_active) {
+        task->timing->credit_wait_us +=
+            ElapsedMicros(task->timing->credit_wait_started_at, now);
+        task->timing->credit_wait_active = false;
+    }
+}
+
+static inline void UpdateNofOccupancy(
+    mooncake::SpdkNofQos* nof_qos,
+    std::chrono::steady_clock::time_point now) {
+    const auto elapsed_us = static_cast<uint64_t>(
+        std::max<int64_t>(0, ElapsedMicros(nof_qos->last_occupancy_update,
+                                           now)));
+    nof_qos->last_occupancy_update = now;
+
+    const int inflight = nof_qos->inflight_blocks[0] +
+                         nof_qos->inflight_blocks[1];
+    const bool pending = !nof_qos->Empty();
+    nof_qos->occupancy_total_us += elapsed_us;
+    if (inflight == 0) {
+        if (pending) {
+            nof_qos->occupancy_active_us += elapsed_us;
+            nof_qos->inflight_zero_with_pending_us += elapsed_us;
+        } else {
+            nof_qos->inflight_idle_us += elapsed_us;
+        }
+        return;
+    }
+
+    nof_qos->occupancy_active_us += elapsed_us;
+    if (inflight >= nof_qos->inflight_blocks_limit) {
+        nof_qos->inflight_full_us += elapsed_us;
+        if (pending) nof_qos->inflight_full_with_pending_us += elapsed_us;
+    } else {
+        nof_qos->inflight_partial_us += elapsed_us;
+        if (pending) nof_qos->inflight_partial_with_pending_us += elapsed_us;
+    }
+}
+
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
     // A failed completion may leave a task on the QoS queue. Publish only
     // after it is popped, so the queue and callback cannot complete it twice.
@@ -114,6 +182,10 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
             task->timing->submitted_sub_io_count > 0 &&
             task->timing->completed_sub_io_count > 0 &&
             task->timing->worker_dequeued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_enqueued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_head_at !=
                 std::chrono::steady_clock::time_point{} &&
             task->timing->last_submit_at !=
                 std::chrono::steady_clock::time_point{} &&
@@ -130,6 +202,18 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
             timing->sub_io_count = task->timing->submitted_sub_io_count;
             timing->dispatch_queue_us =
                 elapsed_us(task->queued_at, task->timing->worker_dequeued_at);
+            timing->worker_setup_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->qos_enqueued_at);
+            timing->qos_fifo_wait_us =
+                elapsed_us(task->timing->qos_enqueued_at,
+                           task->timing->qos_head_at);
+            timing->head_to_first_submit_us =
+                elapsed_us(task->timing->qos_head_at,
+                           task->timing->first_submit_at);
+            timing->credit_wait_us = task->timing->credit_wait_us;
+            timing->first_credit_wait_us =
+                task->timing->first_credit_wait_us;
             timing->qos_queue_us =
                 elapsed_us(task->timing->worker_dequeued_at,
                            task->timing->first_submit_at);
@@ -142,6 +226,9 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
                 elapsed_us(task->timing->last_submit_at, completed_at);
             timing->first_submit_to_first_completion_us =
                 elapsed_us(task->timing->first_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_minus_last_submit_us =
+                elapsed_us(task->timing->last_submit_at,
                            task->timing->first_completion_at);
             timing->first_completion_to_complete_us =
                 elapsed_us(task->timing->first_completion_at, completed_at);
@@ -167,17 +254,32 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofTask* task = sub_task->task;
     mooncake::SpdkNofQos* nof_qos = task->nof_qos;
     int op = task->op;
+    const bool debug_timing = sub_task->track_latency;
+    bool releases_sampled_credit = false;
+    if (nof_qos->sampled_timing_tasks > 0) {
+        for (int pending_op = 0; pending_op < mooncake::kSpdkNofOpNum;
+             ++pending_op) {
+            releases_sampled_credit =
+                releases_sampled_credit ||
+                (nof_qos->head[pending_op] &&
+                 nof_qos->head[pending_op]->timing &&
+                 nof_qos->head[pending_op]->timing->credit_wait_active);
+        }
+    }
+    const auto completion_now =
+        (task->timing || debug_timing || releases_sampled_credit)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
     if (task->timing) {
         if (task->timing->completed_sub_io_count == 0) {
-            task->timing->first_completion_at =
-                std::chrono::steady_clock::now();
+            task->timing->first_completion_at = completion_now;
         }
         ++task->timing->completed_sub_io_count;
     }
-    if (sub_task->track_latency) {
+    if (debug_timing) {
         const auto latency_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - sub_task->submitted_at)
+                completion_now - sub_task->submitted_at)
                 .count());
         ++nof_qos->completion_latency_samples;
         nof_qos->completion_latency_us += latency_us;
@@ -193,7 +295,22 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
+    if (debug_timing) {
+        UpdateNofOccupancy(nof_qos, completion_now);
+    }
     nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
+    if (nof_qos->inflight_blocks[0] + nof_qos->inflight_blocks[1] <
+        nof_qos->inflight_blocks_limit) {
+        for (int pending_op = 0; pending_op < mooncake::kSpdkNofOpNum;
+             ++pending_op) {
+            if (nof_qos->head[pending_op] &&
+                nof_qos->head[pending_op]->timing &&
+                nof_qos->head[pending_op]
+                    ->timing->credit_wait_active) {
+                StopNofCreditWait(nof_qos->head[pending_op], completion_now);
+            }
+        }
+    }
     if (nof_qos->inflight_blocks[op] < 0) {
         LOG(ERROR) << "task outstanding io < 0";
     }
@@ -692,7 +809,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     }
                 }
 #endif
+                const bool lane_was_empty = nof_qos->head[task->op] == nullptr;
+                const bool capture_enqueue_time = task->timing || debug_enabled;
+                const auto qos_enqueue_now =
+                    capture_enqueue_time
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                if (debug_enabled) {
+                    UpdateNofOccupancy(nof_qos, qos_enqueue_now);
+                }
+                if (task->timing) {
+                    task->timing->qos_enqueued_at = qos_enqueue_now;
+                    ++nof_qos->sampled_timing_tasks;
+                }
                 nof_qos->PushTask(task);
+                if (lane_was_empty) {
+                    MarkNofTaskAsQosHead(task, qos_enqueue_now);
+                }
                 task_queue.pop();
             }
         }
@@ -709,6 +842,18 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[0] -
                                    nof_qos->inflight_blocks[1];
+                if (nof_qos->head[i]) {
+                    const auto credit_state_now =
+                        nof_qos->head[i]->timing
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    if (avail_blocks <= 0) {
+                        StartNofCreditWait(nof_qos->head[i],
+                                           credit_state_now);
+                    } else {
+                        StopNofCreditWait(nof_qos->head[i], credit_state_now);
+                    }
+                }
                 bool submitted_for_op = false;
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
@@ -828,12 +973,20 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                 sub_task->submitted_at =
                                     std::chrono::steady_clock::now();
                                 sub_task->track_latency = true;
+                                UpdateNofOccupancy(
+                                    nof_qos, sub_task->submitted_at);
                             }
                             if (!task->first_sub_io_submitted) {
                                 task->first_sub_io_submitted = true;
                                 if (task->timing) {
                                     task->timing->first_submit_at =
                                         std::chrono::steady_clock::now();
+                                    // Credit waited while at the head before
+                                    // this first successful submit.  Submits
+                                    // only run with avail_blocks > 0, so any
+                                    // active wait was already stopped.
+                                    task->timing->first_credit_wait_us =
+                                        task->timing->credit_wait_us;
                                 }
                                 ++nof_qos->first_submit_count;
                                 nof_qos->first_submit_wait_us +=
@@ -877,14 +1030,36 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             avail_blocks -= submit_lba_count;
                             task->outstanding_sub_io++;
                             total_outstanding_io++;
+                            if (task->timing && task->remaining_lba > 0 &&
+                                avail_blocks <= 0) {
+                                StartNofCreditWait(
+                                    task, std::chrono::steady_clock::now());
+                            }
                         }
                     }
                     if (qpair_backpressured) {
                         break;
                     }
                     if (task->remaining_lba == 0) {
+                        const bool capture_pop_time =
+                            debug_enabled ||
+                            (task->nxt != nullptr && task->nxt->timing);
+                        const auto pop_now =
+                            capture_pop_time
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+                        if (debug_enabled) {
+                            UpdateNofOccupancy(nof_qos, pop_now);
+                        }
                         nof_qos->PopTask(i);
+                        if (task->timing) {
+                            --nof_qos->sampled_timing_tasks;
+                        }
                         task->on_chain = false;
+                        MarkNofTaskAsQosHead(nof_qos->head[i], pop_now);
+                        if (nof_qos->head[i] && avail_blocks <= 0) {
+                            StartNofCreditWait(nof_qos->head[i], pop_now);
+                        }
                         SpdkNofTaskCompletion(task);
                     }
                 }
@@ -950,8 +1125,18 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 #endif
                         total_outstanding_io -= task->outstanding_sub_io;
                         task->outstanding_sub_io = 0;
+                        if (task->timing && task->on_chain) {
+                            // Still queued on the dead lane's chain, so its
+                            // push-time sample count has not been released.
+                            --qos.sampled_timing_tasks;
+                        }
                         task->on_chain = false;
                         SpdkNofTaskCompletion(task);
+                    }
+                    if (debug_enabled) {
+                        // Close the occupancy window with the pre-reset state
+                        // so the failed lane's inflight time is attributed.
+                        UpdateNofOccupancy(&qos, now);
                     }
                     for (int op = 0; op < kSpdkNofOpNum; ++op) {
                         qos.head[op] = qos.tail[op] = nullptr;
@@ -968,6 +1153,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     now - last_debug_snapshot);
             if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
                 for (const auto& [io_lane, nof_qos] : lane_to_qos) {
+                    UpdateNofOccupancy(nof_qos.get(), now);
                     const double empty_poll_ratio =
                         nof_qos->poll_calls == 0
                             ? 0.0
@@ -996,6 +1182,39 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             ? 0
                             : nof_qos->submit_backpressure_wait_us /
                                   nof_qos->submit_backpressure_recoveries;
+                    const double inflight_idle_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->inflight_idle_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_partial_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_partial_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_full_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->inflight_full_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_zero_pending_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_zero_with_pending_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double pending_no_credit_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_full_with_pending_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
                         << " io_lane=" << io_lane
@@ -1012,6 +1231,28 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " total_outstanding_io=" << total_outstanding_io
                         << " max_inflight_blocks="
                         << nof_qos->max_inflight_blocks
+                        << " occupancy_total_us="
+                        << nof_qos->occupancy_total_us
+                        << " occupancy_active_us="
+                        << nof_qos->occupancy_active_us
+                        << " inflight_idle_us=" << nof_qos->inflight_idle_us
+                        << " inflight_partial_us="
+                        << nof_qos->inflight_partial_us
+                        << " inflight_full_us=" << nof_qos->inflight_full_us
+                        << " inflight_zero_with_pending_us="
+                        << nof_qos->inflight_zero_with_pending_us
+                        << " inflight_partial_with_pending_us="
+                        << nof_qos->inflight_partial_with_pending_us
+                        << " inflight_full_with_pending_us="
+                        << nof_qos->inflight_full_with_pending_us
+                        << " inflight_partial_ratio="
+                        << inflight_partial_ratio
+                        << " inflight_full_ratio=" << inflight_full_ratio
+                        << " inflight_idle_ratio=" << inflight_idle_ratio
+                        << " inflight_zero_pending_ratio="
+                        << inflight_zero_pending_ratio
+                        << " pending_no_credit_ratio="
+                        << pending_no_credit_ratio
                         << " submit_attempts=" << nof_qos->submit_attempts
                         << " submit_successes=" << nof_qos->submit_successes
                         << " submit_eagain=" << nof_qos->submit_eagain

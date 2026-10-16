@@ -1555,6 +1555,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     int64_t slowest_task_us = 0;
     int64_t nof_dispatch_queue_sum_us = 0;
     int64_t nof_dispatch_queue_max_us = 0;
+    int64_t nof_worker_setup_sum_us = 0;
+    int64_t nof_worker_setup_max_us = 0;
+    int64_t nof_qos_fifo_wait_sum_us = 0;
+    int64_t nof_qos_fifo_wait_max_us = 0;
+    int64_t nof_head_to_submit_sum_us = 0;
+    int64_t nof_head_to_submit_max_us = 0;
+    int64_t nof_credit_wait_sum_us = 0;
+    int64_t nof_credit_wait_max_us = 0;
+    int64_t nof_first_credit_wait_sum_us = 0;
+    int64_t nof_first_credit_wait_max_us = 0;
+    int64_t nof_submit_credit_wait_sum_us = 0;
+    int64_t nof_submit_credit_wait_max_us = 0;
     int64_t nof_qos_queue_sum_us = 0;
     int64_t nof_qos_queue_max_us = 0;
     int64_t nof_queue_to_submit_sum_us = 0;
@@ -1565,12 +1577,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     int64_t nof_drain_max_us = 0;
     int64_t nof_first_completion_sum_us = 0;
     int64_t nof_first_completion_max_us = 0;
+    int64_t nof_completion_submit_gap_sum_us = 0;
+    int64_t nof_completion_submit_gap_min_us =
+        std::numeric_limits<int64_t>::max();
+    int64_t nof_completion_submit_gap_max_us =
+        std::numeric_limits<int64_t>::min();
+    size_t nof_completion_before_last_submit = 0;
     int64_t nof_completion_span_sum_us = 0;
     int64_t nof_completion_span_max_us = 0;
     int64_t nof_task_total_sum_us = 0;
     int64_t nof_task_total_max_us = 0;
     int64_t nof_observe_delay_sum_us = 0;
     int64_t nof_observe_delay_max_us = 0;
+    NofTransferTiming slowest_task_timing;
 
     // Submit all transfers in parallel
     const auto submit_start =
@@ -1674,6 +1693,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 nof_dispatch_queue_sum_us += timing->dispatch_queue_us;
                 nof_dispatch_queue_max_us = std::max(
                     nof_dispatch_queue_max_us, timing->dispatch_queue_us);
+                nof_worker_setup_sum_us += timing->worker_setup_us;
+                nof_worker_setup_max_us = std::max(
+                    nof_worker_setup_max_us, timing->worker_setup_us);
+                nof_qos_fifo_wait_sum_us += timing->qos_fifo_wait_us;
+                nof_qos_fifo_wait_max_us = std::max(
+                    nof_qos_fifo_wait_max_us, timing->qos_fifo_wait_us);
+                nof_head_to_submit_sum_us +=
+                    timing->head_to_first_submit_us;
+                nof_head_to_submit_max_us = std::max(
+                    nof_head_to_submit_max_us,
+                    timing->head_to_first_submit_us);
+                nof_credit_wait_sum_us += timing->credit_wait_us;
+                nof_credit_wait_max_us =
+                    std::max(nof_credit_wait_max_us, timing->credit_wait_us);
+                nof_first_credit_wait_sum_us +=
+                    timing->first_credit_wait_us;
+                nof_first_credit_wait_max_us =
+                    std::max(nof_first_credit_wait_max_us,
+                             timing->first_credit_wait_us);
+                const int64_t submit_credit_wait_us =
+                    timing->credit_wait_us - timing->first_credit_wait_us;
+                nof_submit_credit_wait_sum_us += submit_credit_wait_us;
+                nof_submit_credit_wait_max_us = std::max(
+                    nof_submit_credit_wait_max_us, submit_credit_wait_us);
                 nof_qos_queue_sum_us += timing->qos_queue_us;
                 nof_qos_queue_max_us =
                     std::max(nof_qos_queue_max_us, timing->qos_queue_us);
@@ -1693,6 +1736,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 nof_first_completion_max_us = std::max(
                     nof_first_completion_max_us,
                     timing->first_submit_to_first_completion_us);
+                nof_completion_submit_gap_sum_us +=
+                    timing->first_completion_minus_last_submit_us;
+                nof_completion_submit_gap_min_us = std::min(
+                    nof_completion_submit_gap_min_us,
+                    timing->first_completion_minus_last_submit_us);
+                nof_completion_submit_gap_max_us = std::max(
+                    nof_completion_submit_gap_max_us,
+                    timing->first_completion_minus_last_submit_us);
+                if (timing->first_completion_minus_last_submit_us < 0) {
+                    ++nof_completion_before_last_submit;
+                }
                 nof_completion_span_sum_us +=
                     timing->first_completion_to_complete_us;
                 nof_completion_span_max_us = std::max(
@@ -1708,6 +1762,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 if (timing->total_us > slowest_task_us) {
                     slowest_task_us = timing->total_us;
                     slowest_lane = timing->lane;
+                    slowest_task_timing = *timing;
                 }
             }
         }
@@ -1826,6 +1881,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << " dispatch_queue_avg_us="
                 << average(nof_dispatch_queue_sum_us)
                 << " dispatch_queue_max_us=" << nof_dispatch_queue_max_us
+                << " worker_setup_avg_us="
+                << average(nof_worker_setup_sum_us)
+                << " worker_setup_max_us=" << nof_worker_setup_max_us
+                << " qos_fifo_wait_avg_us="
+                << average(nof_qos_fifo_wait_sum_us)
+                << " qos_fifo_wait_max_us=" << nof_qos_fifo_wait_max_us
+                << " head_to_submit_avg_us="
+                << average(nof_head_to_submit_sum_us)
+                << " head_to_submit_max_us=" << nof_head_to_submit_max_us
+                << " credit_wait_avg_us=" << average(nof_credit_wait_sum_us)
+                << " credit_wait_max_us=" << nof_credit_wait_max_us
+                << " first_credit_wait_avg_us="
+                << average(nof_first_credit_wait_sum_us)
+                << " first_credit_wait_max_us="
+                << nof_first_credit_wait_max_us
+                << " submit_credit_wait_avg_us="
+                << average(nof_submit_credit_wait_sum_us)
+                << " submit_credit_wait_max_us="
+                << nof_submit_credit_wait_max_us
                 << " qos_queue_avg_us=" << average(nof_qos_queue_sum_us)
                 << " qos_queue_max_us=" << nof_qos_queue_max_us
                 << " queue_to_submit_avg_us="
@@ -1841,6 +1915,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << average(nof_first_completion_sum_us)
                 << " first_completion_max_us="
                 << nof_first_completion_max_us
+                << " completion_submit_gap_avg_us="
+                << average(nof_completion_submit_gap_sum_us)
+                << " completion_submit_gap_min_us="
+                << nof_completion_submit_gap_min_us
+                << " completion_submit_gap_max_us="
+                << nof_completion_submit_gap_max_us
+                << " completion_before_last_submit="
+                << nof_completion_before_last_submit
                 << " completion_span_avg_us="
                 << average(nof_completion_span_sum_us)
                 << " completion_span_max_us="
@@ -1851,7 +1933,36 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << average(nof_observe_delay_sum_us)
                 << " observe_delay_max_us=" << nof_observe_delay_max_us
                 << " slowest_lane=" << slowest_lane
-                << " slowest_task_us=" << slowest_task_us;
+                << " slowest_task_us=" << slowest_task_us
+                << " slowest_qos_queue_us="
+                << slowest_task_timing.qos_queue_us
+                << " slowest_dispatch_queue_us="
+                << slowest_task_timing.dispatch_queue_us
+                << " slowest_worker_setup_us="
+                << slowest_task_timing.worker_setup_us
+                << " slowest_qos_fifo_wait_us="
+                << slowest_task_timing.qos_fifo_wait_us
+                << " slowest_head_to_submit_us="
+                << slowest_task_timing.head_to_first_submit_us
+                << " slowest_credit_wait_us="
+                << slowest_task_timing.credit_wait_us
+                << " slowest_first_credit_wait_us="
+                << slowest_task_timing.first_credit_wait_us
+                << " slowest_submit_credit_wait_us="
+                << (slowest_task_timing.credit_wait_us -
+                    slowest_task_timing.first_credit_wait_us)
+                << " slowest_submit_span_us="
+                << slowest_task_timing.first_to_last_submit_us
+                << " slowest_drain_us="
+                << slowest_task_timing.last_submit_to_complete_us
+                << " slowest_first_completion_us="
+                << slowest_task_timing.first_submit_to_first_completion_us
+                << " slowest_completion_submit_gap_us="
+                << slowest_task_timing.first_completion_minus_last_submit_us
+                << " slowest_completion_span_us="
+                << slowest_task_timing.first_completion_to_complete_us
+                << " slowest_observe_delay_us="
+                << slowest_task_timing.complete_to_observe_us;
         }
     }
 

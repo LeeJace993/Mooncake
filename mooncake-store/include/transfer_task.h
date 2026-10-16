@@ -54,11 +54,20 @@ struct NofTransferTiming {
     uint32_t lane = 0;
     uint32_t sub_io_count = 0;
     int64_t dispatch_queue_us = 0;
+    int64_t worker_setup_us = 0;
+    int64_t qos_fifo_wait_us = 0;
+    int64_t head_to_first_submit_us = 0;
+    int64_t credit_wait_us = 0;
+    // Credit wait accumulated while at the lane head before the first submit
+    // succeeded; credit_wait_us - first_credit_wait_us is the post-first-
+    // submit stall.  Overlaps head_to_first_submit_us and the drain phases.
+    int64_t first_credit_wait_us = 0;
     int64_t qos_queue_us = 0;
     int64_t queue_to_first_submit_us = 0;
     int64_t first_to_last_submit_us = 0;
     int64_t last_submit_to_complete_us = 0;
     int64_t first_submit_to_first_completion_us = 0;
+    int64_t first_completion_minus_last_submit_us = 0;
     int64_t first_completion_to_complete_us = 0;
     int64_t total_us = 0;
     int64_t complete_to_observe_us = 0;
@@ -435,9 +444,16 @@ struct SpdkNofQos;
 
 struct SpdkNofTaskTiming {
     std::chrono::steady_clock::time_point worker_dequeued_at;
+    std::chrono::steady_clock::time_point qos_enqueued_at;
+    std::chrono::steady_clock::time_point qos_head_at;
     std::chrono::steady_clock::time_point first_submit_at;
     std::chrono::steady_clock::time_point last_submit_at;
     std::chrono::steady_clock::time_point first_completion_at;
+    std::chrono::steady_clock::time_point credit_wait_started_at;
+    int64_t credit_wait_us = 0;
+    // Snapshot of credit_wait_us taken when the first submit succeeds.
+    int64_t first_credit_wait_us = 0;
+    bool credit_wait_active = false;
     uint32_t submitted_sub_io_count = 0;
     uint32_t completed_sub_io_count = 0;
 };
@@ -542,6 +558,17 @@ struct SpdkNofQos {
     uint64_t polled_completions = 0;
     uint64_t first_submit_count = 0;
     uint64_t first_submit_wait_us = 0;
+    uint32_t sampled_timing_tasks = 0;
+    uint64_t occupancy_total_us = 0;
+    uint64_t occupancy_active_us = 0;
+    uint64_t inflight_idle_us = 0;
+    uint64_t inflight_partial_us = 0;
+    uint64_t inflight_full_us = 0;
+    uint64_t inflight_zero_with_pending_us = 0;
+    uint64_t inflight_partial_with_pending_us = 0;
+    uint64_t inflight_full_with_pending_us = 0;
+    std::chrono::steady_clock::time_point last_occupancy_update =
+        std::chrono::steady_clock::now();
     int max_inflight_blocks = 0;
     std::chrono::steady_clock::time_point last_progress =
         std::chrono::steady_clock::now();
