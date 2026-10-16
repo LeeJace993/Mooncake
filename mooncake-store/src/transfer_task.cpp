@@ -337,6 +337,26 @@ void FilereadWorkerPool::workerThread() {
 // threads.
 
 #ifdef USE_NOF
+std::shared_ptr<SpdkNofWorkerPool> SpdkNofWorkerPool::Acquire(
+    int numa_socket_id) {
+    // Construct the wrapper before the factory so it outlives every pool.
+    (void)SpdkWrapper::GetInstance();
+    static std::mutex mutex;
+    static std::weak_ptr<SpdkNofWorkerPool> shared_pool;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto pool = shared_pool.lock();
+    if (!pool) {
+        pool = std::make_shared<SpdkNofWorkerPool>(numa_socket_id);
+        shared_pool = pool;
+    } else if (pool->numa_socket_id_ != numa_socket_id) {
+        LOG_FIRST_N(WARNING, 1)
+            << "Sharing NoF dispatcher on NUMA node " << pool->numa_socket_id_
+            << "; requested node " << numa_socket_id
+            << " differs from the first client's selection";
+    }
+    return pool;
+}
+
 SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
     : worker_count_(GetSpdkNofWorkerCount()),
       numa_socket_id_(numa_socket_id),
@@ -369,6 +389,11 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
         }
     }
 
+    for (const auto& [seg, binding] : seg_to_workers_) {
+        (void)binding;
+        SpdkWrapper::GetInstance().ReleaseIoLanes(seg, this);
+    }
+
     VLOG(1) << "SpdkNofWorkerPool destroyed";
 }
 
@@ -399,6 +424,11 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
         bool new_binding = false;
         auto binding_it = seg_to_workers_.find(seg);
         if (binding_it == seg_to_workers_.end()) {
+            if (!wrapper.ClaimIoLanes(seg, this)) {
+                LOG(ERROR) << "NoF segment is owned by another dispatcher";
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
             SegmentLaneBinding binding;
             binding.worker_indices.reserve(lane_count);
             for (size_t lane_index = 0; lane_index < lane_count;
@@ -410,10 +440,26 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
             new_binding = true;
         }
         auto& binding = binding_it->second;
-        const size_t lane_index = binding.next_lane++ % lane_count;
-        task.io_lane = wrapper.GetIoLane(seg, lane_index);
-        task.io_lane_index = static_cast<uint32_t>(lane_index);
-        worker_idx = binding.worker_indices[lane_index];
+        if (binding.worker_indices.size() != lane_count) {
+            LOG(ERROR) << "NoF lane count changed after dispatcher binding";
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
+        // Only dispatch new operations to healthy lanes. In-flight operations
+        // on a failed lane are completed as errors, never replayed here.
+        for (size_t attempt = 0; attempt < lane_count; ++attempt) {
+            const size_t lane_index = binding.next_lane++ % lane_count;
+            auto* lane = wrapper.GetIoLane(seg, lane_index);
+            if (!wrapper.IsIoLaneHealthy(lane)) continue;
+            task.io_lane = lane;
+            task.io_lane_index = static_cast<uint32_t>(lane_index);
+            worker_idx = binding.worker_indices[lane_index];
+            break;
+        }
+        if (worker_idx < 0) {
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
         if (new_binding && IsSpdkNofDebugEnabled()) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
                       << " lanes=" << lane_count;
@@ -496,10 +542,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
-    if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
-        return;
-    }
-
     while (true) {
         // Wait for task or shutdown signal
         {
@@ -516,11 +558,21 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
 
             while (!task_queue.empty()) {
+                if (!SpdkWrapper::GetInstance().IsIoLaneHealthy(
+                        task_queue.front().io_lane)) {
+                    task_queue.front().state->set_completed(
+                        ErrorCode::TRANSFER_FAIL);
+                    task_queue.pop();
+                    continue;
+                }
                 SpdkNofTask* task = new (std::nothrow)
                     SpdkNofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
                     LOG(ERROR)
                         << "alloc SpdkNofTask failed, worker " << work_idx;
+                    task_queue.front().state->set_completed(
+                        ErrorCode::TRANSFER_FAIL);
+                    task_queue.pop();
                     continue;
                 }
 
@@ -530,14 +582,17 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     const size_t lane_count =
                         SpdkWrapper::GetInstance().GetIoLaneCount(
                             task->seg_handle);
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle),
-                        lane_count);
+                    auto qos = std::unique_ptr<SpdkNofQos>(
+                        new (std::nothrow) SpdkNofQos(
+                            SpdkWrapper::GetInstance().GetBlockSize(
+                                task->seg_handle),
+                            lane_count));
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc SpdkNofQos failed, worker " << work_idx;
+                        task->state->set_completed(ErrorCode::TRANSFER_FAIL);
                         delete task;
+                        task_queue.pop();
                         continue;
                     }
                     nof_qos = qos.get();
@@ -689,6 +744,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                 break;
                             }
                             ++nof_qos->submit_fatal_errors;
+                            if (ret == -ENXIO || ret == -ENODEV) {
+                                SpdkWrapper::GetInstance().MarkIoLaneFailed(
+                                    task->io_lane);
+                                qpair_backpressured = true;
+                            }
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle
                                        << " lane=" << task->io_lane_index
@@ -776,12 +836,19 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
 
-        if (total_outstanding_io > 0) {
+        {
             int64_t ret = 0;
             for (auto& it : lane_to_qos) {
                 if (it.second->poisoned) continue;
-                ret = SpdkWrapper::GetInstance().PollIoLane(
-                    it.first, 0);
+                const bool healthy =
+                    SpdkWrapper::GetInstance().IsIoLaneHealthy(it.first);
+                if (healthy && it.second->inflight_blocks[0] == 0 &&
+                    it.second->inflight_blocks[1] == 0) {
+                    continue;
+                }
+                ret = healthy ? SpdkWrapper::GetInstance().PollIoLane(
+                                    it.first, 0)
+                              : -ENXIO;
                 auto& qos = *it.second;
                 ++qos.poll_calls;
                 if (ret == 0) {
@@ -801,6 +868,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                << SpdkWrapper::GetInstance().GetIoLaneIndex(
                                       it.first);
                     qos.poisoned = true;
+                    SpdkWrapper::GetInstance().MarkIoLaneFailed(it.first);
                     // Keep queued tasks alive while SPDK invokes abort callbacks.
                     for (auto* task : live_tasks) {
                         if (task->io_lane == it.first) {
@@ -1431,7 +1499,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(nullptr),
 #ifdef USE_NOF
-      spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
+      spdk_nvmf_pool_(SpdkNofWorkerPool::Acquire(numa_socket_id)),
 #endif
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),

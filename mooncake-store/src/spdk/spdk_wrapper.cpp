@@ -113,6 +113,7 @@ struct nof_io_lane {
     struct spdk_nvme_qpair *qpair = nullptr;
     struct nof_seg_handle *segment = nullptr;
     uint32_t index = 0;
+    std::atomic<bool> healthy{true};
 };
 
 struct nof_seg_handle {
@@ -122,6 +123,9 @@ struct nof_seg_handle {
      * 线程与 worker 同时 submit/poll 同一 qpair 会产生竞争。每个业务 lane
      * 由一个 worker 独占，heartbeat 只用 probe_qpair。 */
     std::vector<std::unique_ptr<nof_io_lane>> io_lanes;
+    mutable std::mutex lanes_mutex;
+    bool io_lanes_initialized = false;
+    const void *io_owner = nullptr;
     struct spdk_nvme_qpair *probe_qpair = nullptr;
     std::mutex probe_mutex;
 };
@@ -323,12 +327,16 @@ int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
 }
 
 size_t SpdkWrapper::GetIoLaneCount(const nof_seg_handle *seg_handle) const {
-    return seg_handle == nullptr ? 0 : seg_handle->io_lanes.size();
+    if (seg_handle == nullptr) return 0;
+    std::lock_guard<std::mutex> lock(seg_handle->lanes_mutex);
+    return seg_handle->io_lanes.size();
 }
 
 nof_io_lane *SpdkWrapper::GetIoLane(nof_seg_handle *seg_handle,
                                     size_t lane_index) const {
-    if (seg_handle == nullptr || lane_index >= seg_handle->io_lanes.size()) {
+    if (seg_handle == nullptr) return nullptr;
+    std::lock_guard<std::mutex> lock(seg_handle->lanes_mutex);
+    if (lane_index >= seg_handle->io_lanes.size()) {
         return nullptr;
     }
     return seg_handle->io_lanes[lane_index].get();
@@ -336,6 +344,28 @@ nof_io_lane *SpdkWrapper::GetIoLane(nof_seg_handle *seg_handle,
 
 uint32_t SpdkWrapper::GetIoLaneIndex(const nof_io_lane *lane) const {
     return lane == nullptr ? 0 : lane->index;
+}
+
+bool SpdkWrapper::ClaimIoLanes(nof_seg_handle *seg, const void *owner) {
+    if (!seg || !owner) return false;
+    std::lock_guard<std::mutex> lock(seg->lanes_mutex);
+    if (seg->io_owner != nullptr && seg->io_owner != owner) return false;
+    seg->io_owner = owner;
+    return true;
+}
+
+void SpdkWrapper::ReleaseIoLanes(nof_seg_handle *seg, const void *owner) {
+    if (!seg) return;
+    std::lock_guard<std::mutex> lock(seg->lanes_mutex);
+    if (seg->io_owner == owner) seg->io_owner = nullptr;
+}
+
+bool SpdkWrapper::IsIoLaneHealthy(const nof_io_lane *lane) const {
+    return lane != nullptr && lane->healthy.load(std::memory_order_acquire);
+}
+
+void SpdkWrapper::MarkIoLaneFailed(nof_io_lane *lane) {
+    if (lane) lane->healthy.store(false, std::memory_order_release);
 }
 
 int64_t SpdkWrapper::PollIoLane(nof_io_lane *lane,
@@ -354,7 +384,9 @@ void SpdkWrapper::DrainFailedNofSegment(nof_seg_handle *seg) {
 }
 
 void SpdkWrapper::DrainFailedIoLane(nof_io_lane *lane) {
-    if (!lane || !lane->qpair) return;
+    if (!lane) return;
+    MarkIoLaneFailed(lane);
+    if (!lane->qpair) return;
     auto* qpair = lane->qpair;
     lane->qpair = nullptr;
     spdk_nvme_ctrlr_free_io_qpair(qpair);
@@ -466,10 +498,10 @@ int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
                       std::string(info->trid.subnqn) + "|" +
                       std::to_string(static_cast<int>(info->trid.trtype));
 
-    LOG(INFO) << "traddr:" << info->trid.traddr
-              << "trsvcid:" << info->trid.trsvcid << "ns:" << info->ns
-              << "subnqn:" << info->trid.subnqn
-              << "trtype:" << info->trid.trtype;
+    VLOG(1) << "traddr:" << info->trid.traddr
+            << "trsvcid:" << info->trid.trsvcid << "ns:" << info->ns
+            << "subnqn:" << info->trid.subnqn
+            << "trtype:" << info->trid.trtype;
 
     return 0;
 }
@@ -553,7 +585,12 @@ nof_seg_handle *SpdkWrapper::OpenNofSegmentWithLaneCount(
         auto ns_it = ns_seg.find(tr.ns);
         if (ns_it != ns_seg.end()) {
             seg_handle = ns_it->second.get();
-            if (seg_handle->io_lanes.size() >= requested_lane_count) {
+            std::lock_guard<std::mutex> lanes_lock(seg_handle->lanes_mutex);
+            // A probe-only segment may acquire business lanes once. After a
+            // partial allocation, preserve the published lane count as well:
+            // workers already use that count for binding and QoS budgets.
+            if (requested_lane_count == 0 ||
+                seg_handle->io_lanes_initialized) {
                 return seg_handle;
             }
 
@@ -583,6 +620,7 @@ nof_seg_handle *SpdkWrapper::OpenNofSegmentWithLaneCount(
                 lane->segment = seg_handle;
                 seg_handle->io_lanes.push_back(std::move(lane));
             }
+            seg_handle->io_lanes_initialized = true;
             LOG(INFO) << "Expanded NoF segment ns=" << tr.ns
                       << " io_qpairs=" << seg_handle->io_lanes.size()
                       << " requested_io_qpairs=" << requested_lane_count;
@@ -641,6 +679,7 @@ nof_seg_handle *SpdkWrapper::OpenNofSegmentWithLaneCount(
         auto new_seg = std::make_unique<nof_seg_handle>();
         new_seg->ns = ns;
         new_seg->io_lanes = std::move(io_lanes);
+        new_seg->io_lanes_initialized = requested_lane_count != 0;
         new_seg->probe_qpair = probe_qpair;
         for (auto& lane : new_seg->io_lanes) {
             lane->segment = new_seg.get();

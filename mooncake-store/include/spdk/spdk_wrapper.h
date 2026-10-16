@@ -66,6 +66,13 @@ class SpdkWrapper {
 
     uint32_t GetIoLaneIndex(const nof_io_lane *lane) const;
 
+    // A segment's business lanes have one dispatcher owner. Release only
+    // after its workers have drained all submitted requests.
+    bool ClaimIoLanes(nof_seg_handle *seg, const void *owner);
+    void ReleaseIoLanes(nof_seg_handle *seg, const void *owner);
+    bool IsIoLaneHealthy(const nof_io_lane *lane) const;
+    void MarkIoLaneFailed(nof_io_lane *lane);
+
     int64_t PollIoLane(nof_io_lane *lane, uint32_t max_completions);
 
     // Called by the owning worker after polling has returned. SPDK aborts

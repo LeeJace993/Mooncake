@@ -508,6 +508,10 @@ struct SpdkNofQos {
 constexpr int kDefaultSpdkNofWorkers = 4;
 class SpdkNofWorkerPool {
    public:
+    // Clients in one process share the dispatcher because SpdkWrapper shares
+    // the underlying namespace qpairs. The first client selects its NUMA node.
+    static std::shared_ptr<SpdkNofWorkerPool> Acquire(int numa_socket_id = 0);
+
     explicit SpdkNofWorkerPool(int numa_socket_id = 0);
     ~SpdkNofWorkerPool();
 
@@ -683,7 +687,7 @@ class TransferSubmitter {
     const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
-    std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+    std::shared_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
