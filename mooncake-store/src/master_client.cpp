@@ -457,7 +457,20 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto total_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     auto pool = client_accessor_.GetClientPool();
+    const auto pool_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    uint64_t rpc_call_us = 0;
+    uint64_t result_get_us = 0;
+    uint64_t result_parse_us = 0;
+    bool rpc_transport_ok = false;
 
     // Increment RPC counter
     if (metrics_) {
@@ -465,7 +478,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
             auto ret = co_await pool->send_request(
@@ -474,12 +487,27 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            if (breakdown_log) {
+                rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - pool_end)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
                 co_return std::vector<tl::expected<ResultType, ErrorCode>>(
                     input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
             }
+            const auto result_get_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto result = co_await std::move(ret.value());
+            if (breakdown_log) {
+                result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 const ErrorCode err_code =
                     (result.error().code == coro_rpc::errc::timed_out)
@@ -493,6 +521,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 }
                 co_return error_results;
             }
+            rpc_transport_ok = true;
             if (metrics_) {
                 auto end_time = std::chrono::steady_clock::now();
                 auto latency =
@@ -501,8 +530,36 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
-            co_return result->result();
+            const auto result_parse_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto response = result->result();
+            if (breakdown_log) {
+                result_parse_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_parse_start)
+                        .count();
+            }
+            co_return std::move(response);
         }());
+    if (breakdown_log) {
+        MC_LOG(INFO) << "master_rpc_client_breakdown method="
+                     << RpcNameTraits<ServiceMethod>::value
+                     << " pool_lookup_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            pool_end - total_start)
+                            .count()
+                     << " rpc_call_us=" << rpc_call_us
+                     << " result_get_us=" << result_get_us
+                     << " result_parse_us=" << result_parse_us
+                     << " total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - total_start)
+                            .count()
+                     << " status="
+                     << (rpc_transport_ok ? "ok" : "rpc_fail");
+    }
+    return rpc_result;
 }
 
 MasterClient::~MasterClient() = default;

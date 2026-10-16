@@ -350,36 +350,19 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_keys);
 
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto item_start = sample ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
-        results.emplace_back(
-            master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
-        if (sample) {
-            const auto item_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - item_start)
-                    .count();
-            const auto& item = results.back();
-            MC_LOG(INFO)
-                << "BatchGetReplicaListItem key=" << keys[i]
-                << " batch_index=" << i << " replica_count="
-                << (item ? item->replicas.size() : 0)
-                << " latency_us=" << item_us << " status="
-                << (item ? "ok" : toString(item.error()));
-        }
-    }
-
-    results = WithRequestTenantBatch(
+    const auto metadata_query_start =
+        sample ? std::chrono::steady_clock::now()
+               : std::chrono::steady_clock::time_point{};
+    auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchGetReplicaList(keys,
                                                        resolved_tenant_id);
         });
+    const auto metadata_query_end =
+        sample ? std::chrono::steady_clock::now()
+               : std::chrono::steady_clock::time_point{};
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -409,15 +392,24 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     if (sample) {
+        const auto result_scan_end = std::chrono::steady_clock::now();
         const auto latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0)
+                result_scan_end - t0)
                 .count();
         MC_LOG(INFO) << "BatchGetReplicaList host="
                      << ResolveClientHost(master_service_, client_id)
                      << " tenant=" << tenant_id << " keys_count=" << total_keys
                      << " success=" << (results.size() - failure_count)
                      << " failures=" << failure_count
+                     << " metadata_query_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            metadata_query_end - metadata_query_start)
+                            .count()
+                     << " result_scan_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            result_scan_end - metadata_query_end)
+                            .count()
                      << " latency_us=" << latency_us;
     }
     pt.End(failure_count == total_keys ? -1 : 0);
