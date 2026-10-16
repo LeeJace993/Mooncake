@@ -53,14 +53,23 @@ enum class TransferStrategy {
 struct NofTransferTiming {
     uint32_t lane = 0;
     uint32_t sub_io_count = 0;
+    uint32_t qos_tasks_ahead_at_enqueue = 0;
     int64_t dispatch_queue_us = 0;
     int64_t worker_setup_us = 0;
     int64_t qos_fifo_wait_us = 0;
+    // Decompose qos_fifo_wait_us by the lane occupancy observed while this
+    // task was behind another task.  These fields distinguish backpressure
+    // from task-level head-of-line blocking with unused credit.
+    int64_t qos_fifo_full_wait_us = 0;
+    int64_t qos_fifo_partial_wait_us = 0;
+    int64_t qos_fifo_zero_wait_us = 0;
     int64_t head_to_first_submit_us = 0;
     int64_t credit_wait_us = 0;
     // Credit wait accumulated while at the lane head before the first submit
     // succeeded; credit_wait_us - first_credit_wait_us is the post-first-
-    // submit stall.  Overlaps head_to_first_submit_us and the drain phases.
+    // submit stall.  These values overlap head_to_first_submit_us and
+    // first_to_last_submit_us respectively; they are causal annotations, not
+    // additional non-overlapping phases.
     int64_t first_credit_wait_us = 0;
     int64_t qos_queue_us = 0;
     int64_t queue_to_first_submit_us = 0;
@@ -450,10 +459,17 @@ struct SpdkNofTaskTiming {
     std::chrono::steady_clock::time_point last_submit_at;
     std::chrono::steady_clock::time_point first_completion_at;
     std::chrono::steady_clock::time_point credit_wait_started_at;
+    uint64_t qos_full_pending_at_enqueue_us = 0;
+    uint64_t qos_partial_pending_at_enqueue_us = 0;
+    uint64_t qos_zero_pending_at_enqueue_us = 0;
     int64_t credit_wait_us = 0;
+    int64_t qos_fifo_full_wait_us = 0;
+    int64_t qos_fifo_partial_wait_us = 0;
+    int64_t qos_fifo_zero_wait_us = 0;
     // Snapshot of credit_wait_us taken when the first submit succeeds.
     int64_t first_credit_wait_us = 0;
     bool credit_wait_active = false;
+    uint32_t qos_tasks_ahead_at_enqueue = 0;
     uint32_t submitted_sub_io_count = 0;
     uint32_t completed_sub_io_count = 0;
 };

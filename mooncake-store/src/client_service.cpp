@@ -1552,13 +1552,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     size_t nof_timing_count = 0;
     uint64_t nof_sub_io_count = 0;
     uint32_t slowest_lane = 0;
+    size_t slowest_task_index = 0;
     int64_t slowest_task_us = 0;
     int64_t nof_dispatch_queue_sum_us = 0;
     int64_t nof_dispatch_queue_max_us = 0;
     int64_t nof_worker_setup_sum_us = 0;
     int64_t nof_worker_setup_max_us = 0;
+    uint64_t nof_qos_tasks_ahead_sum = 0;
+    uint32_t nof_qos_tasks_ahead_max = 0;
     int64_t nof_qos_fifo_wait_sum_us = 0;
     int64_t nof_qos_fifo_wait_max_us = 0;
+    int64_t nof_qos_fifo_full_wait_sum_us = 0;
+    int64_t nof_qos_fifo_full_wait_max_us = 0;
+    int64_t nof_qos_fifo_partial_wait_sum_us = 0;
+    int64_t nof_qos_fifo_partial_wait_max_us = 0;
+    int64_t nof_qos_fifo_zero_wait_sum_us = 0;
+    int64_t nof_qos_fifo_zero_wait_max_us = 0;
+    int64_t nof_qos_fifo_unattributed_sum_us = 0;
+    int64_t nof_qos_fifo_unattributed_max_us = 0;
     int64_t nof_head_to_submit_sum_us = 0;
     int64_t nof_head_to_submit_max_us = 0;
     int64_t nof_credit_wait_sum_us = 0;
@@ -1696,9 +1707,40 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 nof_worker_setup_sum_us += timing->worker_setup_us;
                 nof_worker_setup_max_us = std::max(
                     nof_worker_setup_max_us, timing->worker_setup_us);
+                nof_qos_tasks_ahead_sum +=
+                    timing->qos_tasks_ahead_at_enqueue;
+                nof_qos_tasks_ahead_max = std::max(
+                    nof_qos_tasks_ahead_max,
+                    timing->qos_tasks_ahead_at_enqueue);
                 nof_qos_fifo_wait_sum_us += timing->qos_fifo_wait_us;
                 nof_qos_fifo_wait_max_us = std::max(
                     nof_qos_fifo_wait_max_us, timing->qos_fifo_wait_us);
+                nof_qos_fifo_full_wait_sum_us +=
+                    timing->qos_fifo_full_wait_us;
+                nof_qos_fifo_full_wait_max_us = std::max(
+                    nof_qos_fifo_full_wait_max_us,
+                    timing->qos_fifo_full_wait_us);
+                nof_qos_fifo_partial_wait_sum_us +=
+                    timing->qos_fifo_partial_wait_us;
+                nof_qos_fifo_partial_wait_max_us = std::max(
+                    nof_qos_fifo_partial_wait_max_us,
+                    timing->qos_fifo_partial_wait_us);
+                nof_qos_fifo_zero_wait_sum_us +=
+                    timing->qos_fifo_zero_wait_us;
+                nof_qos_fifo_zero_wait_max_us = std::max(
+                    nof_qos_fifo_zero_wait_max_us,
+                    timing->qos_fifo_zero_wait_us);
+                const int64_t qos_fifo_attributed_us =
+                    timing->qos_fifo_full_wait_us +
+                    timing->qos_fifo_partial_wait_us +
+                    timing->qos_fifo_zero_wait_us;
+                const int64_t qos_fifo_unattributed_us = std::max<int64_t>(
+                    0, timing->qos_fifo_wait_us - qos_fifo_attributed_us);
+                nof_qos_fifo_unattributed_sum_us +=
+                    qos_fifo_unattributed_us;
+                nof_qos_fifo_unattributed_max_us = std::max(
+                    nof_qos_fifo_unattributed_max_us,
+                    qos_fifo_unattributed_us);
                 nof_head_to_submit_sum_us +=
                     timing->head_to_first_submit_us;
                 nof_head_to_submit_max_us = std::max(
@@ -1759,9 +1801,46 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 nof_observe_delay_max_us = std::max(
                     nof_observe_delay_max_us,
                     timing->complete_to_observe_us);
+                MC_LOG(INFO)
+                    << "batch_get_nof_task_breakdown trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " sub_io_count=" << timing->sub_io_count
+                    << " tasks_ahead_at_enqueue="
+                    << timing->qos_tasks_ahead_at_enqueue
+                    << " dispatch_queue_us=" << timing->dispatch_queue_us
+                    << " worker_setup_us=" << timing->worker_setup_us
+                    << " qos_fifo_wait_us=" << timing->qos_fifo_wait_us
+                    << " qos_fifo_full_wait_us="
+                    << timing->qos_fifo_full_wait_us
+                    << " qos_fifo_partial_wait_us="
+                    << timing->qos_fifo_partial_wait_us
+                    << " qos_fifo_zero_wait_us="
+                    << timing->qos_fifo_zero_wait_us
+                    << " qos_fifo_unattributed_us="
+                    << qos_fifo_unattributed_us
+                    << " head_to_submit_us="
+                    << timing->head_to_first_submit_us
+                    << " first_credit_wait_us="
+                    << timing->first_credit_wait_us
+                    << " submit_credit_wait_us="
+                    << (timing->credit_wait_us -
+                        timing->first_credit_wait_us)
+                    << " submit_span_us="
+                    << timing->first_to_last_submit_us
+                    << " drain_us=" << timing->last_submit_to_complete_us
+                    << " first_completion_us="
+                    << timing->first_submit_to_first_completion_us
+                    << " completion_submit_gap_us="
+                    << timing->first_completion_minus_last_submit_us
+                    << " completion_span_us="
+                    << timing->first_completion_to_complete_us
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us;
                 if (timing->total_us > slowest_task_us) {
                     slowest_task_us = timing->total_us;
                     slowest_lane = timing->lane;
+                    slowest_task_index = index;
                     slowest_task_timing = *timing;
                 }
             }
@@ -1884,9 +1963,28 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << " worker_setup_avg_us="
                 << average(nof_worker_setup_sum_us)
                 << " worker_setup_max_us=" << nof_worker_setup_max_us
+                << " tasks_ahead_avg="
+                << average(static_cast<int64_t>(nof_qos_tasks_ahead_sum))
+                << " tasks_ahead_max=" << nof_qos_tasks_ahead_max
                 << " qos_fifo_wait_avg_us="
                 << average(nof_qos_fifo_wait_sum_us)
                 << " qos_fifo_wait_max_us=" << nof_qos_fifo_wait_max_us
+                << " qos_fifo_full_wait_avg_us="
+                << average(nof_qos_fifo_full_wait_sum_us)
+                << " qos_fifo_full_wait_max_us="
+                << nof_qos_fifo_full_wait_max_us
+                << " qos_fifo_partial_wait_avg_us="
+                << average(nof_qos_fifo_partial_wait_sum_us)
+                << " qos_fifo_partial_wait_max_us="
+                << nof_qos_fifo_partial_wait_max_us
+                << " qos_fifo_zero_wait_avg_us="
+                << average(nof_qos_fifo_zero_wait_sum_us)
+                << " qos_fifo_zero_wait_max_us="
+                << nof_qos_fifo_zero_wait_max_us
+                << " qos_fifo_unattributed_avg_us="
+                << average(nof_qos_fifo_unattributed_sum_us)
+                << " qos_fifo_unattributed_max_us="
+                << nof_qos_fifo_unattributed_max_us
                 << " head_to_submit_avg_us="
                 << average(nof_head_to_submit_sum_us)
                 << " head_to_submit_max_us=" << nof_head_to_submit_max_us
@@ -1921,7 +2019,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << nof_completion_submit_gap_min_us
                 << " completion_submit_gap_max_us="
                 << nof_completion_submit_gap_max_us
-                << " completion_before_last_submit="
+                << " completion_before_last_submit_tasks="
                 << nof_completion_before_last_submit
                 << " completion_span_avg_us="
                 << average(nof_completion_span_sum_us)
@@ -1933,6 +2031,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << average(nof_observe_delay_sum_us)
                 << " observe_delay_max_us=" << nof_observe_delay_max_us
                 << " slowest_lane=" << slowest_lane
+                << " slowest_task_index=" << slowest_task_index
                 << " slowest_task_us=" << slowest_task_us
                 << " slowest_qos_queue_us="
                 << slowest_task_timing.qos_queue_us
@@ -1942,6 +2041,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << slowest_task_timing.worker_setup_us
                 << " slowest_qos_fifo_wait_us="
                 << slowest_task_timing.qos_fifo_wait_us
+                << " slowest_tasks_ahead_at_enqueue="
+                << slowest_task_timing.qos_tasks_ahead_at_enqueue
+                << " slowest_qos_fifo_full_wait_us="
+                << slowest_task_timing.qos_fifo_full_wait_us
+                << " slowest_qos_fifo_partial_wait_us="
+                << slowest_task_timing.qos_fifo_partial_wait_us
+                << " slowest_qos_fifo_zero_wait_us="
+                << slowest_task_timing.qos_fifo_zero_wait_us
+                << " slowest_qos_fifo_unattributed_us="
+                << std::max<int64_t>(
+                       0, slowest_task_timing.qos_fifo_wait_us -
+                              slowest_task_timing.qos_fifo_full_wait_us -
+                              slowest_task_timing.qos_fifo_partial_wait_us -
+                              slowest_task_timing.qos_fifo_zero_wait_us)
                 << " slowest_head_to_submit_us="
                 << slowest_task_timing.head_to_first_submit_us
                 << " slowest_credit_wait_us="
