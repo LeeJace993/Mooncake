@@ -1,4 +1,5 @@
 #include "../benchmarks/stress_bench_validation.h"
+#include "../benchmarks/latency_histogram.h"
 #include "nof_gpu_direct_report.h"
 #include "gpu_direct_read.h"
 #include "../../mooncake-transfer-engine/include/ub_gpu_direct_stats.h"
@@ -12,6 +13,43 @@ namespace {
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void TestMergedLatencyHistogram() {
+    mooncake::bench::LatencyHistogram all;
+    Require(all.Count() == 0 && all.PercentileNs(0.99) == 0,
+            "empty histogram must have no latency");
+    mooncake::bench::LatencyHistogram slow_window;
+    // An entire slow window is less than 1% of all requests. Taking the
+    // maximum window P99 would incorrectly report 1 second globally.
+    for (int i = 0; i < 10000; ++i) all.Record(1000);
+    for (int i = 0; i < 10; ++i) slow_window.Record(1000000000);
+    all.Merge(slow_window);
+    Require(all.Count() == 10010 && all.PercentileNs(0.99) < 1020,
+            "global P99 must be weighted by requests, not windows");
+    Require(all.PercentileNs(0.9999) == 1000000000,
+            "tail latency samples must survive histogram merging");
+    mooncake::bench::LatencyHistogram final_partial_window;
+    final_partial_window.Record(2000000000);
+    all.Merge(final_partial_window);
+    Require(all.Count() == 10011 && all.MaxNs() == 2000000000,
+            "the final partial window must contribute to count and maximum");
+    Require(all.MinNs() == 1000 && all.MeanNs() > 1000000,
+            "minimum and mean must include every window");
+
+    for (unsigned exponent = 0; exponent < 64; ++exponent) {
+        const uint64_t boundary = uint64_t{1} << exponent;
+        for (uint64_t value : {boundary - 1, boundary, boundary + 1}) {
+            mooncake::bench::LatencyHistogram sample;
+            sample.Record(value);
+            sample.Record(std::numeric_limits<uint64_t>::max());
+            const uint64_t upper = sample.PercentileNs(0.5);
+            Require(upper >= value &&
+                        static_cast<long double>(upper - value) <=
+                            static_cast<long double>(value) / 64,
+                    "bucket boundaries must preserve the error bound");
+        }
+    }
 }
 
 void TestGpuPaths() {
@@ -199,6 +237,7 @@ int main() {
         TestPayloadAndExitStatus();
         TestGpuAcceptance();
         TestMeasuredEvidence();
+        TestMergedLatencyHistogram();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

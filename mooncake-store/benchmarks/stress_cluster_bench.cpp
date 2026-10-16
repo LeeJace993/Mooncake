@@ -33,6 +33,7 @@
 #include "ub_allocator.h"
 #include "ub_gpu_direct_stats.h"
 #include "stress_bench_validation.h"
+#include "latency_histogram.h"
 
 #include <ylt/struct_json/json_reader.h>
 
@@ -1386,7 +1387,7 @@ class StressBenchmark {
     }
 
     struct IntervalLatencyStats {
-        std::vector<int64_t> latencies_ns;
+        mooncake::bench::LatencyHistogram histogram;
         int64_t min_latency_ns = std::numeric_limits<int64_t>::max();
         int64_t max_latency_ns = 0;
         double p50_latency_ns = 0;
@@ -1395,63 +1396,20 @@ class StressBenchmark {
         double p999_latency_ns = 0;
         double p9999_latency_ns = 0;
         double avg_latency_ns = 0;
-        double throughput_mbps = 0;
-        double keys_per_sec = 0;
-        double queries_per_sec = 0;
 
         void Finalize() {
-            if (latencies_ns.empty()) return;
-            std::sort(latencies_ns.begin(), latencies_ns.end());
-            min_latency_ns = latencies_ns.front();
-            max_latency_ns = latencies_ns.back();
-            size_t n = latencies_ns.size();
-            avg_latency_ns =
-                std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) /
-                n;
-            auto percentile = [&](double p) -> double {
-                if (n == 0) return 0;
-                size_t idx = static_cast<size_t>(p / 100.0 * (n - 1));
-                return static_cast<double>(latencies_ns[idx]);
-            };
-            p50_latency_ns = percentile(50);
-            p90_latency_ns = percentile(90);
-            if (n >= 100) {
-                p99_latency_ns = latencies_ns[static_cast<size_t>(n * 0.99)];
-            }
-            if (n >= 1000) {
-                p999_latency_ns = latencies_ns[static_cast<size_t>(n * 0.999)];
-            }
-            if (n >= 10000) {
-                p9999_latency_ns =
-                    latencies_ns[static_cast<size_t>(n * 0.9999)];
-            }
-        }
-
-        void Aggregate(const IntervalLatencyStats& other) {
-            min_latency_ns = std::min(min_latency_ns, other.min_latency_ns);
-            max_latency_ns = std::max(max_latency_ns, other.max_latency_ns);
-            p50_latency_ns = std::max(p50_latency_ns, other.p50_latency_ns);
-            p90_latency_ns = std::max(p90_latency_ns, other.p90_latency_ns);
-            p99_latency_ns = std::max(p99_latency_ns, other.p99_latency_ns);
-            p999_latency_ns = std::max(p999_latency_ns, other.p999_latency_ns);
-            p9999_latency_ns =
-                std::max(p9999_latency_ns, other.p9999_latency_ns);
-            throughput_mbps += other.throughput_mbps;
-            keys_per_sec += other.keys_per_sec;
-            queries_per_sec += other.queries_per_sec;
-            // Weighted average: accumulate sum and count
-            total_latency_sum_ns +=
-                other.avg_latency_ns *
-                static_cast<double>(other.latencies_ns.size());
-            total_samples += other.latencies_ns.size();
-            if (total_samples > 0) {
-                avg_latency_ns =
-                    total_latency_sum_ns / static_cast<double>(total_samples);
-            }
+            total_samples = histogram.Count();
+            min_latency_ns = histogram.MinNs();
+            max_latency_ns = histogram.MaxNs();
+            avg_latency_ns = histogram.MeanNs();
+            p50_latency_ns = histogram.PercentileNs(0.50);
+            p90_latency_ns = histogram.PercentileNs(0.90);
+            p99_latency_ns = histogram.PercentileNs(0.99);
+            p999_latency_ns = histogram.PercentileNs(0.999);
+            p9999_latency_ns = histogram.PercentileNs(0.9999);
         }
 
         size_t total_samples = 0;
-        double total_latency_sum_ns = 0;
     };
 
     int RunSegmentReadDuration(
@@ -1468,10 +1426,12 @@ class StressBenchmark {
         std::atomic<size_t> global_bytes{0};
         std::atomic<size_t> global_failed{0};
 
-        std::vector<std::vector<int64_t>> thread_latencies(FLAGS_num_threads);
+        std::vector<mooncake::bench::LatencyHistogram> thread_latencies(
+            FLAGS_num_threads);
         std::vector<std::mutex> latency_mutexes(FLAGS_num_threads);
 
-        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::vector<std::thread> threads;
 
         size_t total_keys = all_keys.size();
@@ -1483,6 +1443,7 @@ class StressBenchmark {
                 bindToSocket(t % NR_SOCKETS);
                 char* my_buf = thread_buffers_[t].ptr;
 
+                ready_latch.count_down();
                 start_latch.arrive_and_wait();
 
                 size_t key_offset = t * keys_per_thread;
@@ -1500,7 +1461,7 @@ class StressBenchmark {
                         {
                             std::lock_guard<std::mutex> lock(
                                 latency_mutexes[t]);
-                            thread_latencies[t].push_back(latency_ns);
+                            thread_latencies[t].Record(latency_ns);
                         }
 
                         AccountMeasuredIo(key, ret, false);
@@ -1543,7 +1504,7 @@ class StressBenchmark {
                         {
                             std::lock_guard<std::mutex> lock(
                                 latency_mutexes[t]);
-                            thread_latencies[t].push_back(latency_ns);
+                            thread_latencies[t].Record(latency_ns);
                         }
 
                         for (size_t k = 0; k < keys.size(); ++k) {
@@ -1565,7 +1526,9 @@ class StressBenchmark {
             });
         }
 
+        ready_latch.wait();
         auto bench_start = Clock::now();
+        start_latch.arrive_and_wait();
         auto bench_end = bench_start + std::chrono::seconds(FLAGS_duration);
         auto next_statis =
             bench_start + std::chrono::seconds(FLAGS_statis_interval);
@@ -1576,7 +1539,9 @@ class StressBenchmark {
         size_t prev_failed = 0;
         auto prev_time = bench_start;
 
-        std::vector<IntervalLatencyStats> interval_stats_list;
+        IntervalLatencyStats overall;
+        double peak_throughput_mbps = 0;
+        double cur_throughput_mbps = 0;
 
         std::cout << "\n";
         std::cout << "========================================"
@@ -1618,18 +1583,16 @@ class StressBenchmark {
                         : 0;
 
                 IntervalLatencyStats interval_stats;
-                interval_stats.throughput_mbps = interval_throughput_mbps;
-                interval_stats.keys_per_sec = interval_keys_per_sec;
-                interval_stats.queries_per_sec = interval_queries_per_sec;
                 for (size_t t = 0; t < FLAGS_num_threads; ++t) {
                     std::lock_guard<std::mutex> lock(latency_mutexes[t]);
-                    interval_stats.latencies_ns.insert(
-                        interval_stats.latencies_ns.end(),
-                        thread_latencies[t].begin(), thread_latencies[t].end());
-                    thread_latencies[t].clear();
+                    interval_stats.histogram.Merge(thread_latencies[t]);
+                    thread_latencies[t] = {};
                 }
                 interval_stats.Finalize();
-                interval_stats_list.push_back(interval_stats);
+                overall.histogram.Merge(interval_stats.histogram);
+                peak_throughput_mbps =
+                    std::max(peak_throughput_mbps, interval_throughput_mbps);
+                cur_throughput_mbps = interval_throughput_mbps;
 
                 double total_sec = NanosToSec(ElapsedNanos(bench_start, now));
                 double total_throughput_mbps =
@@ -1695,23 +1658,19 @@ class StressBenchmark {
             (total_sec > 0) ? static_cast<double>(final_queries) / total_sec
                             : 0;
 
-        IntervalLatencyStats overall;
-        for (const auto& stats : interval_stats_list) {
-            overall.Aggregate(stats);
+        // Workers have joined: include the final partial interval and requests
+        // that completed after the stop flag, using the same wall-time bound.
+        for (const auto& histogram : thread_latencies) {
+            overall.histogram.Merge(histogram);
         }
-        double avg_throughput_mbps =
-            !interval_stats_list.empty()
-                ? overall.throughput_mbps / interval_stats_list.size()
-                : 0;
-        double peak_throughput_mbps = 0;
-        for (const auto& stats : interval_stats_list) {
+        overall.Finalize();
+        const double tail_sec = NanosToSec(ElapsedNanos(prev_time, final_time));
+        if (tail_sec > 0 && final_queries > prev_queries) {
+            cur_throughput_mbps =
+                static_cast<double>(final_bytes - prev_bytes) / MB / tail_sec;
             peak_throughput_mbps =
-                std::max(peak_throughput_mbps, stats.throughput_mbps);
+                std::max(peak_throughput_mbps, cur_throughput_mbps);
         }
-        double cur_throughput_mbps =
-            !interval_stats_list.empty()
-                ? interval_stats_list.back().throughput_mbps
-                : 0;
         size_t total_latency_samples = overall.total_samples;
 
         std::cout << "\n  FINAL SUMMARY\n";
@@ -1745,6 +1704,8 @@ class StressBenchmark {
         std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
 
         if (total_latency_samples > 0) {
+            std::cout << "  Percentiles: merged histogram upper bounds "
+                         "(bucket width <= 1.6%)\n";
             std::cout << "\n  Latency (us)      [n=" << total_latency_samples
                       << ", per-query]\n";
             std::cout << "    Min:   " << std::setw(12)
