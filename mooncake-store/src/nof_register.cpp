@@ -1,62 +1,25 @@
-#include <glog/logging.h>
-
-#include <charconv>
-#include <cstddef>
-#include <iostream>
-#include <string>
-#include <string_view>
-#include <system_error>
-
 #include "ssd_register_client.h"
+#include <iostream>
+#include <cstdlib>
 
-namespace {
-
-constexpr size_t kDefaultSegmentSize = 1ULL << 40;  // 1 TiB
-
-bool ParseSize(std::string_view text, size_t* value) {
-    if (text.empty()) return false;
-    const char* begin = text.data();
-    const char* end = begin + text.size();
-    auto [ptr, error] = std::from_chars(begin, end, *value);
-    return error == std::errc{} && ptr == end;
-}
-
-void PrintUsage(const char* program) {
-    std::cerr << "Usage: " << program
-              << " <nqn> <nsid> <traddr> <trsvcid> <trtype> <master_addr> "
-                 "[size_bytes]\n";
-}
-
-}  // namespace
-
-int main(int argc, char** argv) {
-    google::InitGoogleLogging(argv[0]);
-    FLAGS_logtostderr = true;
-
-    if (argc != 7 && argc != 8) {
-        PrintUsage(argv[0]);
-        return 2;
-    }
-
-    size_t nsid = 0;
-    size_t trsvcid = 0;
-    size_t size = kDefaultSegmentSize;
-    if (!ParseSize(argv[2], &nsid) || nsid == 0 ||
-        !ParseSize(argv[4], &trsvcid) || trsvcid == 0 ||
-        (argc == 8 && (!ParseSize(argv[7], &size) || size == 0))) {
-        std::cerr << "Invalid nsid, trsvcid, or size_bytes\n";
-        PrintUsage(argv[0]);
-        return 2;
-    }
-
-    mooncake::NoFRegisterClient client;
-    const int result = client.set_register(
-        argv[1], nsid, argv[3], trsvcid, argv[5], 0, size, argv[6]);
-    if (result != OPERATION_OK) {
-        std::cerr << "NoF registration failed\n";
+int main(int argc, char* argv[]) {
+    if (argc < 7) {
+        std::cerr << "Usage: " << argv[0] << " <nqn> <nsid> <traddr> <trsvcid> <trtype> <master_addr> [size_bytes]\n";
         return 1;
     }
-
-    std::cout << "NoF registration succeeded\n";
-    return 0;
+    std::string nqn = argv[1];
+    size_t nsid = std::stoul(argv[2]);
+    std::string traddr = argv[3];
+    size_t trsvcid = std::stoul(argv[4]);
+    std::string trtype = argv[5];
+    std::string master_addr = argv[6];
+    uintptr_t base = 0;
+    size_t size = (argc >= 8) ? std::stoull(argv[7]) : 0;
+    std::cout << "Registering: nqn=" << nqn << " nsid=" << nsid
+              << " traddr=" << traddr << " trsvcid=" << trsvcid
+              << " trtype=" << trtype << " base=" << base << " size=" << size << "\n";
+    mooncake::NoFRegisterClient client;
+    int ret = client.set_register(nqn, nsid, traddr, trsvcid, trtype, base, size, master_addr);
+    if (ret == 0) { std::cout << "NoF registration succeeded\n"; return 0; }
+    else { std::cerr << "NoF registration failed\n"; return 1; }
 }
