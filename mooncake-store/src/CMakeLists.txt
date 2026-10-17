@@ -596,3 +596,16 @@ if(WITH_STORE_C_SHARED)
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
 endif()
+
+# NoF segment register/unregister tools (local helper binaries)
+add_executable(nof_register nof_register.cpp)
+target_link_libraries(nof_register PRIVATE mooncake_store mooncake_common
+                                           pthread asio_shared
+                                           SpDiag::spdiag_lib)
+target_link_options(nof_register PRIVATE "LINKER:--as-needed")
+
+add_executable(nof_unregister nof_unregister.cpp)
+target_link_libraries(nof_unregister PRIVATE mooncake_store mooncake_common
+                                             pthread asio_shared
+                                             SpDiag::spdiag_lib)
+target_link_options(nof_unregister PRIVATE "LINKER:--as-needed")
