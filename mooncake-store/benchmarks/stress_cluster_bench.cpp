@@ -307,6 +307,9 @@ DEFINE_string(scenario, "local_memory",
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
+DEFINE_bool(key_include_value_size, false,
+            "Append the value size to segment keys so runs with different "
+            "--value_size values do not collide");
 DEFINE_uint64(num_keys, 100, "Number of keys to write/read");
 DEFINE_uint64(batch_size, 32,
               "Batch size for reads and per-thread buffer sizing");
@@ -1148,8 +1151,13 @@ class StressBenchmark {
         // Keep memory keys compatible with earlier benchmark runs.
         const char* prefix = segment.kind == SegmentKind::NOF ? "nof_seg_"
                                                               : "seg_";
-        return std::string(prefix) + SanitizeSegmentName(segment.name) +
-               "_key_" + std::to_string(idx);
+        std::string key = std::string(prefix) +
+                          SanitizeSegmentName(segment.name) + "_key_" +
+                          std::to_string(idx);
+        if (FLAGS_key_include_value_size) {
+            key += "_vs" + std::to_string(FLAGS_value_size);
+        }
+        return key;
     }
 
     // Key generator for remove/batch_remove scenarios. Uses a distinct
@@ -3009,6 +3017,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  GPU mode:       " << gpu_config.mode;
     LOG(INFO) << "  GPU device:     " << FLAGS_gpu_device;
     LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MiB";
+    LOG(INFO) << "  Key value size suffix: "
+              << (FLAGS_key_include_value_size ? "enabled" : "disabled");
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
