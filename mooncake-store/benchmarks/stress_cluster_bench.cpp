@@ -16,6 +16,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <optional>
@@ -49,6 +51,11 @@ constexpr size_t GB = 1024 * MB;
 
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
+
+static bool VerifyReadPlacementEnabled() {
+    const char* value = std::getenv("MC_BENCH_VERIFY_READ_PLACEMENT");
+    return value && std::string_view(value) == "1";
+}
 
 static void bindToSocket(int socket_id) {
     if (numa_available() < 0) return;
@@ -1293,6 +1300,11 @@ class StressBenchmark {
 
         std::vector<BenchmarkSegment> read_segments(
             segments.begin(), segments.begin() + read_segment_nums);
+
+        if (VerifyReadPlacementEnabled() &&
+            !ConfigureReadPlacementValidation(read_segments)) {
+            return 1;
+        }
 
         LOG(INFO) << "=== SEGMENT READ MODE ===";
         LOG(INFO) << "Reading keys for " << read_segment_nums << " segments";
@@ -2640,7 +2652,8 @@ class StressBenchmark {
             }
             append(std::move(nof_segments), SegmentKind::NOF);
         }
-        if (FLAGS_strict_segment_placement || FLAGS_require_gpu_direct) {
+        if (FLAGS_strict_segment_placement || FLAGS_require_gpu_direct ||
+            VerifyReadPlacementEnabled()) {
             if (!LoadSegmentRegions(segments)) return {};
         }
         return segments;
@@ -2782,6 +2795,77 @@ class StressBenchmark {
             }
         }
         return true;
+    }
+
+    static bool ReplicaMatchesSegment(
+        const mooncake::Replica::Descriptor& replica,
+        const BenchmarkSegment& segment) {
+        const mooncake::AllocatedBuffer::Descriptor* descriptor = nullptr;
+        if (segment.kind == SegmentKind::NOF && replica.is_nof_replica()) {
+            descriptor = &replica.get_nof_descriptor().buffer_descriptor;
+        } else if (segment.kind == SegmentKind::MEMORY &&
+                   replica.is_memory_replica()) {
+            descriptor = &replica.get_memory_descriptor().buffer_descriptor;
+        }
+        if (!descriptor) return false;
+        for (const auto& region : segment.regions) {
+            if (region.Contains(descriptor->buffer_address_, descriptor->size_,
+                                descriptor->transport_endpoint_)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ConfigureReadPlacementValidation(
+        const std::vector<BenchmarkSegment>& segments) {
+        // Only expectations are retained; object metadata is queried afresh by
+        // each read. The guard runs after the Store's final replica selection.
+        std::unordered_map<std::string, size_t> expected_segments;
+        for (size_t s = 0; s < segments.size(); ++s) {
+            for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+                if (!expected_segments.emplace(MakeSegmentKey(segments[s], i),
+                                                s).second) {
+                    LOG(ERROR) << "Ambiguous segment benchmark key namespace";
+                    return false;
+                }
+            }
+        }
+        const bool installed = client_->set_read_replica_validator(
+            [segments, expected = std::move(expected_segments)](
+                const std::string& key,
+                const mooncake::Replica::Descriptor& replica) {
+                const auto found = expected.find(key);
+                if (found != expected.end() &&
+                    ReplicaMatchesSegment(replica, segments[found->second])) {
+                    return true;
+                }
+                const auto* descriptor = replica.is_memory_replica()
+                    ? &replica.get_memory_descriptor().buffer_descriptor
+                    : replica.is_nof_replica()
+                        ? &replica.get_nof_descriptor().buffer_descriptor
+                        : nullptr;
+                LOG_EVERY_N(ERROR, 100)
+                    << "Read placement rejected key=" << key
+                    << " expected_segment="
+                    << (found == expected.end() ? "unknown"
+                                               : segments[found->second].name)
+                    << " actual_type="
+                    << (replica.is_memory_replica() ? "memory"
+                        : replica.is_nof_replica() ? "nof" : "other")
+                    << " actual_endpoint="
+                    << (descriptor ? descriptor->transport_endpoint_ : "-")
+                    << " actual_address="
+                    << (descriptor ? descriptor->buffer_address_ : 0)
+                    << " actual_size=" << (descriptor ? descriptor->size_ : 0);
+                return false;
+            });
+        if (installed) {
+            LOG(INFO) << "Actual read placement validation enabled; mismatch "
+                         "fails the read, including hot-cache redirection. "
+                         "No additional metadata queries or metadata cache.";
+        }
+        return installed;
     }
 
     bool VerifyPlacement(const std::string& key,

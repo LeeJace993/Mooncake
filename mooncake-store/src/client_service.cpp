@@ -1157,7 +1157,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
-    pt.End(0);
+    pt.End(std::all_of(results.begin(), results.end(),
+                       [](const auto& result) { return result.has_value(); })
+               ? 0 : -1);
     return results;
 }
 
@@ -1268,6 +1270,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         cache_used = RedirectToHotCache(object_key, replica);
     }
 
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
+        if (cache_used) hot_cache_->ReleaseHotKey(object_key);
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
 
@@ -1331,6 +1339,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (!replica.is_memory_replica()) {
         LOG(ERROR) << "Range read only supported for memory replicas, key="
                    << object_key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
@@ -1398,6 +1411,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
+        }
+
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -1602,6 +1621,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     int64_t nof_observe_delay_max_us = 0;
     NofTransferTiming slowest_task_timing;
 
+    // One submit sample per batch; wait samples below are per future.
+    SpDiag::PerfPoint submit_point(PerfKey::GET_BATCH_SUBMIT,
+                                   SpDiag::PerfLevel::MODULE);
+    submit_point.Start();
     // Submit all transfers in parallel
     const auto submit_start =
         breakdown_log ? std::chrono::steady_clock::now()
@@ -1635,6 +1658,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             if (cache_used) {
                 total_cache_hits++;
             }
+        }
+
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
         }
 
         // Submit transfer operation asynchronously
@@ -1675,6 +1704,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
     }
+    submit_point.End(pending_transfers.size() == object_keys.size() ? 0 : -1);
     const auto submit_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -1691,7 +1721,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         const auto wait_start =
             breakdown_log ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
+        SpDiag::PerfPoint wait_point(PerfKey::GET_BATCH_WAIT,
+                                     SpDiag::PerfLevel::MODULE);
+        wait_point.Start();
         ErrorCode result = future.get();
+        wait_point.End(result == ErrorCode::OK ? 0 : -1);
         if (breakdown_log) {
             const int64_t future_wait_us =
                 elapsed_us(wait_start, std::chrono::steady_clock::now());
@@ -4428,11 +4462,22 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
 
+    const bool read = op_code == TransferRequest::READ;
+    SpDiag::PerfPoint full_point(read ? PerfKey::GET_SINGLE_TRANSFER_FULL
+                                     : PerfKey::PUT_SINGLE_TRANSFER_FULL,
+                                 SpDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint submit_point(read ? PerfKey::GET_SINGLE_TRANSFER_SUBMIT
+                                       : PerfKey::PUT_SINGLE_TRANSFER_SUBMIT,
+                                   SpDiag::PerfLevel::MODULE);
+    full_point.Start();
+    submit_point.Start();
     std::optional<TransferFuture> future;
     if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
+            submit_point.End(-1);
+            full_point.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
         future = transfer_submitter_->submit(replica_descriptor, slices,
@@ -4442,8 +4487,10 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         future =
             transfer_submitter_->submit(replica_descriptor, slices, op_code);
     }
+    submit_point.End(future ? 0 : -1);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        full_point.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
 
@@ -4453,7 +4500,13 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     const TransferStrategy strategy = future->strategy();
     VLOG(1) << "Using transfer strategy: " << strategy;
 
+    SpDiag::PerfPoint wait_point(read ? PerfKey::GET_SINGLE_TRANSFER_WAIT
+                                     : PerfKey::PUT_SINGLE_TRANSFER_WAIT,
+                                 SpDiag::PerfLevel::MODULE);
+    wait_point.Start();
     const ErrorCode result = future->get();
+    wait_point.End(result == ErrorCode::OK ? 0 : -1);
+    full_point.End(result == ErrorCode::OK ? 0 : -1);
     if (breakdown_log) {
         const auto wait_end = std::chrono::steady_clock::now();
         size_t bytes = 0;

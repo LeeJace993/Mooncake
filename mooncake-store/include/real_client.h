@@ -113,6 +113,13 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+    // Install before concurrent I/O. No metadata lookup is added by this hook.
+    bool set_read_replica_validator(Client::ReadReplicaValidator validator) {
+        if (!client_) return false;
+        client_->SetReadReplicaValidator(std::move(validator));
+        return true;
+    }
+
     struct WritableBufferRegion {
         void *base{nullptr};
         size_t size{0};

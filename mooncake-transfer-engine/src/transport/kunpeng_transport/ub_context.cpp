@@ -17,16 +17,40 @@
 #include <memory>
 #include <utility>
 #include <cassert>
+#include <cstdlib>
+#include <cerrno>
 #include <sys/epoll.h>
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 #include "memory_location.h"
+#include "transport/kunpeng_transport/ub_diagnostics.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 namespace {
 constexpr uint64_t kNumaAffinitySampleInterval = 10000;
+thread_local UbWorkerMetrics* current_worker_metrics = nullptr;
+
+uint64_t WorkerDiagnosticIntervalNs() {
+    static const uint64_t interval = [] {
+        const char* value = std::getenv("MC_UB_WORKER_DIAG_INTERVAL_MS");
+        if (!value) return uint64_t{1000000000};
+        char* end = nullptr;
+        errno = 0;
+        const auto ms = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || *value == '-' ||
+            ms == 0 || ms > 60000) {
+            LOG(WARNING) << "Invalid MC_UB_WORKER_DIAG_INTERVAL_MS; using 1000";
+            return uint64_t{1000000000};
+        }
+        return static_cast<uint64_t>(ms) * 1000000;
+    }();
+    return interval;
+}
 
 std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
     uint64_t trace_id) {
@@ -36,6 +60,16 @@ std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
     return std::make_unique<mooncake::logging::ScopedTraceId>(trace_id);
 }
 }  // namespace
+
+bool UbWorkerDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MC_UB_WORKER_DIAG");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+UbWorkerMetrics* CurrentUbWorkerMetrics() { return current_worker_metrics; }
 
 std::shared_ptr<UbEndPoint> UbSIEVEEndpointStore::getEndpoint(
     const std::string& peer_nic_path) {
@@ -319,6 +353,9 @@ int UbWorkerPool::submitPostSend(
                         peer_segment_desc->devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
+        // Until POSTED, diagnostics reuse ts for the latest queue entry.
+        // The endpoint replaces it with the post timestamp before submission.
+        if (UbWorkerDiagnosticsEnabled()) slice->ts = getCurrentTimeInNano();
         slice_list_map[shard_id].push_back(slice);
         submitted_slice_count++;
     }
@@ -348,6 +385,9 @@ void UbWorkerPool::performPostSend(int thread_id) {
         for (auto& entry : slice_queue_[shard_id]) {
             for (auto& slice : entry.second)
                 local_slice_queue[entry.first].push_back(slice);
+            if (auto* metrics = CurrentUbWorkerMetrics()) {
+                metrics->dequeued_slices += entry.second.size();
+            }
             entry.second.clear();
         }
         slice_queue_count_[shard_id].store(0, std::memory_order_relaxed);
@@ -429,7 +469,22 @@ void UbWorkerPool::performPostSend(int thread_id) {
         for (auto& slice : entry.second) {
             slice->ub.endpoint = endpoint.get();
         }
-        endpoint->submitPostSend(entry.second, failed_slice_list);
+        if (auto* metrics = CurrentUbWorkerMetrics()) {
+            ++metrics->post_calls;
+            SpDiag::PerfPoint point(PerfKey::UB_WORKER_POST_SEND,
+                                    SpDiag::PerfLevel::MODULE);
+            point.Start();
+            const auto start = getCurrentTimeInNano();
+            const auto failed_before = metrics->post_failed_slices;
+            const int rc = endpoint->submitPostSend(entry.second,
+                                                    failed_slice_list);
+            metrics->post_call_ns += getCurrentTimeInNano() - start;
+            const bool failed =
+                rc != 0 || metrics->post_failed_slices > failed_before;
+            point.End(failed ? -1 : 0);
+        } else {
+            endpoint->submitPostSend(entry.second, failed_slice_list);
+        }
 #endif
     }
 
@@ -452,9 +507,24 @@ void UbWorkerPool::performPoll(int thread_id) {
          jfc_index += kTransferWorkerCount) {
         UbTransport::Slice* failed[kPollCount];
         int num_failed = 0;
-        int nr_poll = context_.poll(kPollCount, failed, num_failed,
+        int nr_poll;
+        if (auto* metrics = CurrentUbWorkerMetrics()) {
+            ++metrics->poll_calls;
+            SpDiag::PerfPoint point(PerfKey::UB_WORKER_POLL,
+                                    SpDiag::PerfLevel::MODULE);
+            point.Start();
+            const auto start = getCurrentTimeInNano();
+            nr_poll = context_.poll(kPollCount, failed, num_failed,
                                     deferred_success_slices, jetty_depth_set,
                                     jfc_index);
+            metrics->poll_call_ns += getCurrentTimeInNano() - start;
+            metrics->poll_errors += nr_poll < 0;
+            point.End(nr_poll < 0 || num_failed > 0 ? -1 : 0);
+        } else {
+            nr_poll = context_.poll(kPollCount, failed, num_failed,
+                                    deferred_success_slices, jetty_depth_set,
+                                    jfc_index);
+        }
         if (nr_poll < 0) {
             LOG(ERROR) << "Worker: Failed to poll jetty for complete";
             continue;
@@ -479,6 +549,10 @@ void UbWorkerPool::performPoll(int thread_id) {
             } else {
                 collective_slice_queue_[thread_id][slice->peer_nic_path]
                     .push_back(slice);
+                if (auto* metrics = CurrentUbWorkerMetrics()) {
+                    slice->ts = getCurrentTimeInNano();
+                    ++metrics->retry_enqueues;
+                }
                 redispatch_counter_++;
             }
         }
@@ -574,24 +648,81 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+            if (auto* metrics = CurrentUbWorkerMetrics()) {
+                slice->ts = getCurrentTimeInNano();
+                ++metrics->retry_enqueues;
+            }
         }
     }
 }
 
 void UbWorkerPool::transferWorker(int thread_id) {
-    thread_local struct {
-        uint64_t post_send_count = 0;
-        uint64_t post_send_total_ns = 0;
-        std::array<uint64_t, 6> post_send_buckets{};
-
-        uint64_t poll_jfc_count = 0;
-        uint64_t poll_jfc_total_ns = 0;
-        std::array<uint64_t, 6> poll_jfc_buckets{};
-    } stats;
     bindToSocket(numa_socket_id_);
+    const bool diagnostics = UbWorkerDiagnosticsEnabled();
+    UbWorkerMetrics metrics;
+    current_worker_metrics = diagnostics ? &metrics : nullptr;
+    uint64_t last_report_ns = diagnostics ? getCurrentTimeInNano() : 0;
+    const auto report = [&](uint64_t now_ns, bool final) {
+        size_t assigned_shards = 0, assigned_jfcs = 0;
+        for (int s = thread_id; s < kShardCount; s += kTransferWorkerCount) {
+            ++assigned_shards;
+        }
+        for (int q = thread_id; q < context_.jfcCount();
+             q += kTransferWorkerCount) {
+            ++assigned_jfcs;
+        }
+        const auto completions =
+            metrics.completed_slices + metrics.failed_completions;
+        const auto queue_wait_avg_us = metrics.queue_wait_count
+            ? metrics.queue_wait_ns / metrics.queue_wait_count / 1000 : 0;
+        const auto post_to_cq_avg_us = completions
+            ? metrics.completion_wait_ns / completions / 1000 : 0;
+        MC_LOG(INFO) << "ub_worker_breakdown nic=" << context_.nicPath()
+                     << " worker=" << thread_id
+                     << " configured_workers=" << kTransferWorkerCount
+                     << " assigned_shards=" << assigned_shards
+                     << " assigned_jfcs=" << assigned_jfcs
+                     << " interval_us=" << (now_ns - last_report_ns) / 1000
+                     << " iterations=" << metrics.iterations
+                     << " dequeued_slices=" << metrics.dequeued_slices
+                     << " post_calls=" << metrics.post_calls
+                     << " post_attempt_slices=" << metrics.post_attempt_slices
+                     << " post_attempt_bytes=" << metrics.post_attempt_bytes
+                     << " posted_slices=" << metrics.posted_slices
+                     << " post_failed_slices=" << metrics.post_failed_slices
+                     << " queue_blocked_calls=" << metrics.queue_blocked_calls
+                     << " jetty_full_calls=" << metrics.jetty_full_calls
+                     << " jfc_full_calls=" << metrics.jfc_full_calls
+                     << " queue_wait_samples=" << metrics.queue_wait_count
+                     << " queue_wait_avg_us=" << queue_wait_avg_us
+                     << " queue_wait_max_us="
+                     << metrics.queue_wait_max_ns / 1000
+                     << " poll_calls=" << metrics.poll_calls
+                     << " poll_errors=" << metrics.poll_errors
+                     << " completed_slices=" << metrics.completed_slices
+                     << " completed_bytes=" << metrics.completed_bytes
+                     << " failed_completions=" << metrics.failed_completions
+                     << " post_to_cq_avg_us=" << post_to_cq_avg_us
+                     << " post_to_cq_max_us="
+                     << metrics.completion_wait_max_ns / 1000
+                     << " retry_enqueues=" << metrics.retry_enqueues
+                     << " post_call_us=" << metrics.post_call_ns / 1000
+                     << " poll_call_us=" << metrics.poll_call_ns / 1000
+                     << " pending_context_slices=" << pendingSliceCount()
+                     << " final=" << final;
+        metrics = {};
+        last_report_ns = now_ns;
+    };
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
+        if (diagnostics) {
+            ++metrics.iterations;
+            const auto now = getCurrentTimeInNano();
+            if (now - last_report_ns >= WorkerDiagnosticIntervalNs()) {
+                report(now, false);
+            }
+        }
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
@@ -612,6 +743,8 @@ void UbWorkerPool::transferWorker(int thread_id) {
         performPoll(thread_id);
 #endif
     }
+    if (diagnostics) report(getCurrentTimeInNano(), true);
+    current_worker_metrics = nullptr;
 }
 
 void UbWorkerPool::monitorWorker() {

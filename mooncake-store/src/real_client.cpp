@@ -5359,7 +5359,10 @@ std::vector<int64_t> RealClient::batch_get_into(
                                           SpDiag::PerfLevel::KEY_MODULE);
                 pt_full.Start();
                 auto result = batch_get_into_internal(keys, buffers, sizes);
-                pt_full.End(0);
+                const bool success = std::all_of(
+                    result.begin(), result.end(),
+                    [](const auto& item) { return item.has_value(); });
+                pt_full.End(success ? 0 : -1);
                 return result;
             },
             [](const auto &) { return true; },
@@ -5644,7 +5647,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     pt_query.Start();
     const auto query_results = client_->BatchQuery(keys);
     if (breakdown_log) t_query = std::chrono::steady_clock::now();
-    pt_query.End(0);
+    const bool query_success = std::all_of(
+        query_results.begin(), query_results.end(),
+        [](const auto& item) { return item.has_value(); });
+    pt_query.End(query_success ? 0 : -1);
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
