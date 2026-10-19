@@ -208,12 +208,14 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
-      suspended_flag_(0),
       redispatch_counter_(0),
+      worker_signals_(std::make_unique<UbWorkerSignal[]>(kTransferWorkerCount)),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     for (auto& i : slice_queue_count_) i.store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
+    LOG(INFO) << "UB worker scheduling: per-worker wait, workers="
+              << kTransferWorkerCount << " jfcs=" << context_.jfcCount();
     for (int i = 0; i < kTransferWorkerCount; ++i) {
         worker_thread_.emplace_back([this, i] { transferWorker(i); });
     }
@@ -221,11 +223,11 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
 }
 
 UbWorkerPool::~UbWorkerPool() {
-    if (workers_running_) {
-        cond_var_.notify_all();
-        workers_running_.store(false);
-        for (auto& entry : worker_thread_) entry.join();
+    workers_running_.store(false);
+    for (int i = 0; i < kTransferWorkerCount; ++i) {
+        worker_signals_[i].notify();
     }
+    for (auto& entry : worker_thread_) entry.join();
 }
 
 int UbWorkerPool::submitPostSend(
@@ -359,22 +361,25 @@ int UbWorkerPool::submitPostSend(
         slice_list_map[shard_id].push_back(slice);
         submitted_slice_count++;
     }
+    // Account before publishing: a woken worker may complete immediately.
+    submitted_slice_count_.fetch_add(submitted_slice_count,
+                                     std::memory_order_relaxed);
     for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
         if (slice_list_map[shard_id].empty()) continue;
         slice_queue_lock_[shard_id].lock();
         for (auto& slice : slice_list_map[shard_id])
             slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
         slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
-                                               std::memory_order_relaxed);
+                                               std::memory_order_release);
         slice_queue_lock_[shard_id].unlock();
+        worker_signals_[shard_id % kTransferWorkerCount].notify();
     }
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
     return 0;
 }
 
 void UbWorkerPool::performPostSend(int thread_id) {
+    auto* metrics = CurrentUbWorkerMetrics();
+    const auto dequeue_start = metrics ? getCurrentTimeInNano() : 0;
     auto& local_slice_queue = collective_slice_queue_[thread_id];
     for (int shard_id = thread_id; shard_id < kShardCount;
          shard_id += kTransferWorkerCount) {
@@ -393,6 +398,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
         slice_queue_count_[shard_id].store(0, std::memory_order_relaxed);
         slice_queue_lock_[shard_id].unlock();
     }
+    if (metrics) metrics->dequeue_ns += getCurrentTimeInNano() - dequeue_start;
 
     // Redispatch slices to other endpoints, for temporary failures
     thread_local int tl_redispatch_counter = 0;
@@ -419,8 +425,11 @@ void UbWorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
+    bool advanced = false;
     for (auto& entry : local_slice_queue) {
         if (entry.second.empty()) continue;
+        [[maybe_unused]] const auto prepare_start =
+            metrics ? getCurrentTimeInNano() : 0;
         [[maybe_unused]] auto trace =
             RestoreTraceIfMissing(entry.second.front()->trace_id);
 
@@ -469,6 +478,14 @@ void UbWorkerPool::performPostSend(int thread_id) {
         for (auto& slice : entry.second) {
             slice->ub.endpoint = endpoint.get();
         }
+        if (metrics) {
+            const auto elapsed = getCurrentTimeInNano() - prepare_start;
+            metrics->endpoint_prepare_ns += elapsed;
+            metrics->endpoint_prepare_max_ns = std::max(
+                metrics->endpoint_prepare_max_ns,
+                static_cast<uint64_t>(elapsed));
+        }
+        const auto before = entry.second.size();
         if (auto* metrics = CurrentUbWorkerMetrics()) {
             ++metrics->post_calls;
             SpDiag::PerfPoint point(PerfKey::UB_WORKER_POST_SEND,
@@ -478,15 +495,23 @@ void UbWorkerPool::performPostSend(int thread_id) {
             const auto failed_before = metrics->post_failed_slices;
             const int rc = endpoint->submitPostSend(entry.second,
                                                     failed_slice_list);
-            metrics->post_call_ns += getCurrentTimeInNano() - start;
+            const auto elapsed = getCurrentTimeInNano() - start;
+            metrics->post_call_ns += elapsed;
+            metrics->post_call_max_ns = std::max(
+                metrics->post_call_max_ns, static_cast<uint64_t>(elapsed));
             const bool failed =
                 rc != 0 || metrics->post_failed_slices > failed_before;
             point.End(failed ? -1 : 0);
         } else {
             endpoint->submitPostSend(entry.second, failed_slice_list);
         }
+        advanced |= entry.second.size() < before;
 #endif
     }
+
+    // Posting publishes JFC outstanding credits. Wake the owners after that
+    // publication, even when they observed zero credits and went to sleep.
+    if (advanced) wakePollingWorkers(thread_id);
 
     if (!failed_slice_list.empty()) {
         for (auto& slice : failed_slice_list) slice->ub.retry_cnt++;
@@ -505,6 +530,10 @@ void UbWorkerPool::performPoll(int thread_id) {
     std::vector<UbTransport::Slice*> deferred_success_slices;
     for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
          jfc_index += kTransferWorkerCount) {
+        if (__atomic_load_n(context_.outstandingCount(jfc_index),
+                            __ATOMIC_ACQUIRE) <= 0) {
+            continue;
+        }
         UbTransport::Slice* failed[kPollCount];
         int num_failed = 0;
         int nr_poll;
@@ -656,12 +685,43 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
     }
 }
 
+bool UbWorkerPool::hasWorkerWork(int thread_id) {
+    for (int shard = thread_id; shard < kShardCount;
+         shard += kTransferWorkerCount) {
+        if (slice_queue_count_[shard].load(std::memory_order_acquire) != 0)
+            return true;
+    }
+    // Only this worker accesses its private retry/post queues.
+    for (const auto& entry : collective_slice_queue_[thread_id]) {
+        if (!entry.second.empty()) return true;
+    }
+    for (int jfc = thread_id; jfc < context_.jfcCount();
+         jfc += kTransferWorkerCount) {
+        if (__atomic_load_n(context_.outstandingCount(jfc),
+                            __ATOMIC_ACQUIRE) > 0)
+            return true;
+    }
+    return false;
+}
+
+void UbWorkerPool::wakePollingWorkers(int posting_thread_id) {
+    for (int jfc = 0; jfc < context_.jfcCount(); ++jfc) {
+        const int owner = jfc % kTransferWorkerCount;
+        if (owner != posting_thread_id &&
+            __atomic_load_n(context_.outstandingCount(jfc),
+                            __ATOMIC_ACQUIRE) > 0) {
+            worker_signals_[owner].notify();
+        }
+    }
+}
+
 void UbWorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const bool diagnostics = UbWorkerDiagnosticsEnabled();
     UbWorkerMetrics metrics;
     current_worker_metrics = diagnostics ? &metrics : nullptr;
     uint64_t last_report_ns = diagnostics ? getCurrentTimeInNano() : 0;
+    uint64_t last_active_ns = 0;
     const auto report = [&](uint64_t now_ns, bool final) {
         size_t assigned_shards = 0, assigned_jfcs = 0;
         for (int s = thread_id; s < kShardCount; s += kTransferWorkerCount) {
@@ -678,6 +738,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
         const auto post_to_cq_avg_us = completions
             ? metrics.completion_wait_ns / completions / 1000 : 0;
         MC_LOG(INFO) << "ub_worker_breakdown nic=" << context_.nicPath()
+                     << " scope=interval"
                      << " worker=" << thread_id
                      << " configured_workers=" << kTransferWorkerCount
                      << " assigned_shards=" << assigned_shards
@@ -694,6 +755,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
                      << " jetty_full_calls=" << metrics.jetty_full_calls
                      << " jfc_full_calls=" << metrics.jfc_full_calls
                      << " queue_wait_samples=" << metrics.queue_wait_count
+                     << " queue_wait_sum_us=" << metrics.queue_wait_ns / 1000
                      << " queue_wait_avg_us=" << queue_wait_avg_us
                      << " queue_wait_max_us="
                      << metrics.queue_wait_max_ns / 1000
@@ -703,41 +765,60 @@ void UbWorkerPool::transferWorker(int thread_id) {
                      << " completed_bytes=" << metrics.completed_bytes
                      << " failed_completions=" << metrics.failed_completions
                      << " post_to_cq_avg_us=" << post_to_cq_avg_us
+                     << " post_to_cq_sum_us="
+                     << metrics.completion_wait_ns / 1000
                      << " post_to_cq_max_us="
                      << metrics.completion_wait_max_ns / 1000
                      << " retry_enqueues=" << metrics.retry_enqueues
                      << " post_call_us=" << metrics.post_call_ns / 1000
+                     << " post_call_max_us=" << metrics.post_call_max_ns / 1000
                      << " poll_call_us=" << metrics.poll_call_ns / 1000
+                     << " dequeue_us=" << metrics.dequeue_ns / 1000
+                     << " endpoint_prepare_us="
+                     << metrics.endpoint_prepare_ns / 1000
+                     << " endpoint_prepare_max_us="
+                     << metrics.endpoint_prepare_max_ns / 1000
+                     << " active_loop_gap_max_us="
+                     << metrics.active_loop_gap_max_ns / 1000
+                     << " idle_wait_calls=" << metrics.idle_wait_calls
+                     << " idle_wait_us=" << metrics.idle_wait_ns / 1000
                      << " pending_context_slices=" << pendingSliceCount()
                      << " final=" << final;
         metrics = {};
         last_report_ns = now_ns;
     };
-    const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
-    uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
         if (diagnostics) {
             ++metrics.iterations;
             const auto now = getCurrentTimeInNano();
+            if (last_active_ns && now >= last_active_ns) {
+                metrics.active_loop_gap_max_ns = std::max(
+                    metrics.active_loop_gap_max_ns, now - last_active_ns);
+            }
             if (now - last_report_ns >= WorkerDiagnosticIntervalNs()) {
                 report(now, false);
             }
         }
-        auto processed_slice_count =
-            processed_slice_count_.load(std::memory_order_relaxed);
-        auto submitted_slice_count =
-            submitted_slice_count_.load(std::memory_order_relaxed);
-        if (processed_slice_count == submitted_slice_count) {
-            uint64_t curr_wait_ts = getCurrentTimeInNano();
-            if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
-                std::unique_lock<std::mutex> lock(cond_mutex_);
-                suspended_flag_.fetch_add(1);
-                cond_var_.wait_for(lock, std::chrono::seconds(1));
-                suspended_flag_.fetch_sub(1);
-                last_wait_ts = curr_wait_ts;
+        if (!hasWorkerWork(thread_id)) {
+            last_active_ns = 0;
+            const auto ready = [&] {
+                return !workers_running_.load(std::memory_order_relaxed) ||
+                       hasWorkerWork(thread_id);
+            };
+            if (diagnostics) {
+                ++metrics.idle_wait_calls;
+                const auto start = getCurrentTimeInNano();
+                // Timed waits keep idle-worker interval reports available.
+                worker_signals_[thread_id].waitFor(
+                    ready,
+                    std::chrono::nanoseconds(WorkerDiagnosticIntervalNs()));
+                metrics.idle_wait_ns += getCurrentTimeInNano() - start;
+            } else {
+                worker_signals_[thread_id].wait(ready);
             }
             continue;
         }
+        if (diagnostics) last_active_ns = getCurrentTimeInNano();
         performPostSend(thread_id);
 #ifndef USE_FAKE_POST_SEND
         performPoll(thread_id);

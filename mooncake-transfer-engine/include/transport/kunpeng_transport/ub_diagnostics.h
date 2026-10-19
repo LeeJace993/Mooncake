@@ -35,6 +35,13 @@ struct UbWorkerMetrics {
     uint64_t retry_enqueues = 0;
     uint64_t post_call_ns = 0;
     uint64_t poll_call_ns = 0;
+    uint64_t post_call_max_ns = 0;
+    uint64_t dequeue_ns = 0;
+    uint64_t endpoint_prepare_ns = 0;
+    uint64_t endpoint_prepare_max_ns = 0;
+    uint64_t active_loop_gap_max_ns = 0;
+    uint64_t idle_wait_calls = 0;
+    uint64_t idle_wait_ns = 0;
 
     void RecordQueueWait(uint64_t queued_ns, uint64_t now_ns) {
         if (!queued_ns || now_ns < queued_ns) return;

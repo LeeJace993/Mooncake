@@ -20,6 +20,35 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
+namespace {
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+// UB has dedicated posting/polling workers. Long Store-side busy waits can
+// compete with those workers; retain a short spin for fast completions first.
+int ReadUbPollDelayUs(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno || end == value || *end || parsed < 0 || parsed > 1000000) {
+        LOG(WARNING) << "Invalid " << name << "; using " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+int UbPollSpinUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SPIN_US", 50);
+    return value;
+}
+
+int UbPollSleepUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 50);
+    return value;
+}
+#endif
+}  // namespace
+
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -1783,26 +1812,46 @@ void TransferEngineOperationState::wait_for_completion() {
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
-        }
+    const bool ub_transport = engine_.getTransport("ub") != nullptr;
+    const auto sleep_time = std::chrono::microseconds(
+        ub_transport ? UbPollSleepUs() : 0);
+    const auto spin_time = std::chrono::microseconds(
+        ub_transport ? UbPollSpinUs() : 0);
+    auto spin_until = std::chrono::steady_clock::now() + spin_time;
+    if (ub_transport) {
+        LOG_FIRST_N(INFO, 1) << "UB completion polling: spin_us="
+                             << spin_time.count()
+                             << " sleep_us=" << sleep_time.count()
+                             << " (MC_STORE_UB_POLL_SLEEP_US=0 restores "
+                                "busy polling)";
+    }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (result_.has_value()) return;
+            if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_
+                        << " with result: " << static_cast<int>(result_.value());
+                break;
+            }
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        // Release mutex_ before sleeping so another observer can see progress.
+        // This only observes completion; it never resubmits or caches metadata.
+        if (sleep_time.count() > 0 &&
+            std::chrono::steady_clock::now() >= spin_until) {
+            std::this_thread::sleep_for(sleep_time);
+            spin_until = std::chrono::steady_clock::now() + spin_time;
+        }
     }
 #endif
 }
