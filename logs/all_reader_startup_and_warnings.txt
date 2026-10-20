@@ -1,0 +1,362 @@
+
+Authorized users only. All activities may be monitored and reported.
+================ J0_cross_60s_nosample ================
+--- head 40 (startup config) ---
+I20261020 10:11:00.140746 3384069 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 10:11:00.140777 3384069 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 10:11:00.140784 3384069 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 10:11:00.140787 3384069 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 10:11:00.140790 3384069 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 10:11:00.140794 3384069 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 10:11:00.140798 3384069 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 10:11:00.140801 3384069 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 10:11:00.140803 3384069 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 10:11:00.140806 3384069 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 10:11:00.140810 3384069 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 10:11:00.140812 3384069 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 10:11:00.140815 3384069 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 10:11:00.140818 3384069 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 10:11:00.140821 3384069 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 10:11:00.140823 3384069 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 10:11:00.140826 3384069 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 10:11:00.140829 3384069 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 10:11:00.140832 3384069 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 10:11:00.140836 3384069 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 10:11:00.140838 3384069 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 10:11:00.140841 3384069 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 10:11:00.140843 3384069 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 10:11:00.140846 3384069 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0
+I20261020 10:11:00.140857 3384069 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 10:11:00.140861 3384069 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 10:11:00.140866 3384069 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 10:11:00.140870 3384069 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (0 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 10:11:00.341385 3384069 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 10:11:00.341420 3384069 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 10:11:00.343315 3384069 client_service.cpp:319] client_id=15656406144865239382-11122828354480870035
+I20261020 10:11:00.343335 3384069 client_service.cpp:321] client_id=15656406144865239382-11122828354480870035, host_id=141.61.84.247
+I20261020 10:11:00.343341 3384069 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 10:11:00.346680 3384069 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 10:11:00.423858 3384069 master_client.cpp:716] Master RPC pool warmup completed: 100/100 succeeded
+I20261020 10:11:00.424546 3384069 client_service.cpp:972] Storage root directory is not set. persisting data is disabled.
+I20261020 10:11:00.424618 3384069 transfer_engine_impl.cpp:987] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I20261020 10:11:00.424640 3384069 transfer_engine_impl.cpp:115] Transfer Engine parseHostNameWithPort. server_name: 141.61.84.247 port: 50601
+I20261020 10:11:00.424683 3384069 transfer_engine_impl.cpp:182] Transfer Engine RPC using new RPC mapping, listening on 141.61.84.247:15359
+I20261020 10:11:00.425602 3384069 client_service.cpp:782] Transfer engine auto discovery is disabled for protocol: ub
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 10:11:00.435329 3384069 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J1_cross_60s_sample05 ================
+--- head 40 (startup config) ---
+I20261020 10:13:37.239835 3387664 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 10:13:37.239867 3387664 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 10:13:37.239874 3387664 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 10:13:37.239877 3387664 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 10:13:37.239880 3387664 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 10:13:37.239884 3387664 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 10:13:37.239888 3387664 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 10:13:37.239892 3387664 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 10:13:37.239894 3387664 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 10:13:37.239897 3387664 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 10:13:37.239900 3387664 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 10:13:37.239902 3387664 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 10:13:37.239905 3387664 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 10:13:37.239908 3387664 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 10:13:37.239912 3387664 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 10:13:37.239914 3387664 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 10:13:37.239917 3387664 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 10:13:37.239920 3387664 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 10:13:37.239923 3387664 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 10:13:37.239925 3387664 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 10:13:37.239928 3387664 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 10:13:37.239931 3387664 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 10:13:37.239934 3387664 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 10:13:37.239936 3387664 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0.05
+I20261020 10:13:37.239949 3387664 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 10:13:37.239952 3387664 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 10:13:37.239957 3387664 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 10:13:37.239961 3387664 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (0 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 10:13:37.421129 3387664 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 10:13:37.421162 3387664 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 10:13:37.423027 3387664 client_service.cpp:319] client_id=11765903415947789606-3648988275880819644
+I20261020 10:13:37.423045 3387664 client_service.cpp:321] client_id=11765903415947789606-3648988275880819644, host_id=141.61.84.247
+I20261020 10:13:37.423051 3387664 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 10:13:37.429649 3387664 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 10:13:37.459033 3388103 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=611 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=602 pool_acquire_dispatch_us=0 client_submit_us=592 pool_after_submit_us=9 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3387916 callback_tid=3387916 submit_tid=3387688 pool_return_tid=3387688 rpc_begin_steady_ns=80133157806080 rpc_end_steady_ns=80133158408310 total_us=10340 status=ok
+I20261020 10:13:37.459076 3388103 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=91 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=89 pool_acquire_dispatch_us=1 client_submit_us=21 pool_after_submit_us=66 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3388004 callback_tid=3388004 submit_tid=3387688 pool_return_tid=3387688 rpc_begin_steady_ns=80133161490830 rpc_end_steady_ns=80133161580340 total_us=7901 status=ok
+I20261020 10:13:37.459088 3388103 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=84 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=82 pool_acquire_dispatch_us=0 client_submit_us=20 pool_after_submit_us=61 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3388000 callback_tid=3388000 submit_tid=3387688 pool_return_tid=3387688 rpc_begin_steady_ns=80133161305990 rpc_end_steady_ns=80133161388360 total_us=8037 status=ok
+I20261020 10:13:37.459154 3388103 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=106 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=91 pool_acquire_dispatch_us=1 client_submit_us=40 pool_after_submit_us=50 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3387913 callback_tid=3387913 submit_tid=3387689 pool_return_tid=3387689 rpc_begin_steady_ns=80133157635270 rpc_end_steady_ns=80133157727010 total_us=8091 status=ok
+I20261020 10:13:37.496628 3388104 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=57105 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=57095 pool_acquire_dispatch_us=56982 client_submit_us=16 pool_after_submit_us=96 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3387856 callback_tid=3387681 submit_tid=3387681 pool_return_tid=3387681 rpc_begin_steady_ns=80133152197580 rpc_end_steady_ns=80133209293490 total_us=59246 status=ok
+I20261020 10:13:37.496680 3388104 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=57404 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=57394 pool_acquire_dispatch_us=57277 client_submit_us=17 pool_after_submit_us=100 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3387859 callback_tid=3387684 submit_tid=3387684 pool_return_tid=3387684 rpc_begin_steady_ns=80133152265380 rpc_end_steady_ns=80133209659750 total_us=59265 status=ok
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 10:13:37.511663 3387664 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r1_J0 ================
+--- head 40 (startup config) ---
+I20261020 10:56:50.357563 3579292 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 10:56:50.357586 3579292 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 10:56:50.357592 3579292 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 10:56:50.357596 3579292 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 10:56:50.357599 3579292 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 10:56:50.357602 3579292 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 10:56:50.357606 3579292 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 10:56:50.357609 3579292 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 10:56:50.357612 3579292 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 10:56:50.357615 3579292 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 10:56:50.357618 3579292 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 10:56:50.357620 3579292 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 10:56:50.357623 3579292 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 10:56:50.357626 3579292 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 10:56:50.357630 3579292 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 10:56:50.357632 3579292 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 10:56:50.357635 3579292 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 10:56:50.357637 3579292 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 10:56:50.357640 3579292 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 10:56:50.357643 3579292 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 10:56:50.357646 3579292 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 10:56:50.357648 3579292 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 10:56:50.357651 3579292 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 10:56:50.357654 3579292 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0
+I20261020 10:56:50.357666 3579292 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 10:56:50.357668 3579292 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 10:56:50.357676 3579292 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 10:56:50.357678 3579292 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 10:56:50.357682 3579292 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 10:56:50.541170 3579292 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 10:56:50.541204 3579292 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 10:56:50.543035 3579292 client_service.cpp:319] client_id=12773389860768607457-5317490818987834241
+I20261020 10:56:50.543056 3579292 client_service.cpp:321] client_id=12773389860768607457-5317490818987834241, host_id=141.61.84.247
+I20261020 10:56:50.544288 3579292 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 10:56:50.549196 3579292 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 10:56:50.619359 3579292 master_client.cpp:716] Master RPC pool warmup completed: 100/100 succeeded
+I20261020 10:56:50.620164 3579292 client_service.cpp:972] Storage root directory is not set. persisting data is disabled.
+I20261020 10:56:50.620235 3579292 transfer_engine_impl.cpp:987] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I20261020 10:56:50.620260 3579292 transfer_engine_impl.cpp:115] Transfer Engine parseHostNameWithPort. server_name: 141.61.84.247 port: 50611
+I20261020 10:56:50.620303 3579292 transfer_engine_impl.cpp:182] Transfer Engine RPC using new RPC mapping, listening on 141.61.84.247:16936
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 10:56:50.629850 3579292 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r2_J1 ================
+--- head 40 (startup config) ---
+I20261020 10:58:52.120151 3582164 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 10:58:52.120180 3582164 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 10:58:52.120187 3582164 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 10:58:52.120190 3582164 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 10:58:52.120193 3582164 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 10:58:52.120198 3582164 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 10:58:52.120201 3582164 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 10:58:52.120204 3582164 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 10:58:52.120208 3582164 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 10:58:52.120209 3582164 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 10:58:52.120213 3582164 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 10:58:52.120215 3582164 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 10:58:52.120218 3582164 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 10:58:52.120221 3582164 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 10:58:52.120223 3582164 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 10:58:52.120226 3582164 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 10:58:52.120229 3582164 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 10:58:52.120232 3582164 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 10:58:52.120235 3582164 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 10:58:52.120237 3582164 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 10:58:52.120240 3582164 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 10:58:52.120244 3582164 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 10:58:52.120246 3582164 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 10:58:52.120249 3582164 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0.05
+I20261020 10:58:52.120261 3582164 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 10:58:52.120265 3582164 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 10:58:52.120271 3582164 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 10:58:52.120275 3582164 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 10:58:52.120277 3582164 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 10:58:52.319619 3582164 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 10:58:52.319648 3582164 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 10:58:52.323273 3582164 client_service.cpp:319] client_id=18396234668921412501-11004066866395364487
+I20261020 10:58:52.323297 3582164 client_service.cpp:321] client_id=18396234668921412501-11004066866395364487, host_id=141.61.84.247
+I20261020 10:58:52.323303 3582164 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 10:58:52.328593 3582164 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 10:58:52.349730 3582501 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=1502 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=288 pool_acquire_dispatch_us=0 client_submit_us=277 pool_after_submit_us=10 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3582309 callback_tid=3582309 submit_tid=3582173 pool_return_tid=3582173 rpc_begin_steady_ns=82848046876270 rpc_end_steady_ns=82848047165260 total_us=14032 status=ok
+I20261020 10:58:52.349778 3582501 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=240 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=218 pool_acquire_dispatch_us=1 client_submit_us=27 pool_after_submit_us=190 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3582364 callback_tid=3582364 submit_tid=3582177 pool_return_tid=3582177 rpc_begin_steady_ns=82848054668220 rpc_end_steady_ns=82848054887120 total_us=7587 status=ok
+I20261020 10:58:52.351593 3582501 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=75 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=74 pool_acquire_dispatch_us=0 client_submit_us=24 pool_after_submit_us=49 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3582477 callback_tid=3582477 submit_tid=3582183 pool_return_tid=3582183 rpc_begin_steady_ns=82848061349030 rpc_end_steady_ns=82848061423330 total_us=5325 status=ok
+I20261020 10:58:52.396061 3582164 master_client.cpp:716] Master RPC pool warmup completed: 100/100 succeeded
+I20261020 10:58:52.397225 3582164 client_service.cpp:972] Storage root directory is not set. persisting data is disabled.
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 10:58:52.406849 3582164 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r3_J0 ================
+--- head 40 (startup config) ---
+I20261020 11:00:36.623343 3584973 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 11:00:36.623370 3584973 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 11:00:36.623377 3584973 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 11:00:36.623381 3584973 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 11:00:36.623384 3584973 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 11:00:36.623387 3584973 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 11:00:36.623391 3584973 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 11:00:36.623395 3584973 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 11:00:36.623399 3584973 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 11:00:36.623401 3584973 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 11:00:36.623404 3584973 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 11:00:36.623406 3584973 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 11:00:36.623409 3584973 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 11:00:36.623412 3584973 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 11:00:36.623415 3584973 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 11:00:36.623418 3584973 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 11:00:36.623421 3584973 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 11:00:36.623425 3584973 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 11:00:36.623427 3584973 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 11:00:36.623430 3584973 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 11:00:36.623433 3584973 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 11:00:36.623436 3584973 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 11:00:36.623440 3584973 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 11:00:36.623442 3584973 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0
+I20261020 11:00:36.623453 3584973 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 11:00:36.623456 3584973 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 11:00:36.623463 3584973 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 11:00:36.623466 3584973 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 11:00:36.623471 3584973 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 11:00:36.805295 3584973 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 11:00:36.805323 3584973 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 11:00:36.808048 3584973 client_service.cpp:319] client_id=1532513348460300702-8279416451803211952
+I20261020 11:00:36.808069 3584973 client_service.cpp:321] client_id=1532513348460300702-8279416451803211952, host_id=141.61.84.247
+I20261020 11:00:36.808075 3584973 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 11:00:36.813555 3584973 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 11:00:36.875053 3584973 master_client.cpp:716] Master RPC pool warmup completed: 100/100 succeeded
+I20261020 11:00:36.875329 3584973 client_service.cpp:972] Storage root directory is not set. persisting data is disabled.
+I20261020 11:00:36.875398 3584973 transfer_engine_impl.cpp:987] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I20261020 11:00:36.875423 3584973 transfer_engine_impl.cpp:115] Transfer Engine parseHostNameWithPort. server_name: 141.61.84.247 port: 50613
+I20261020 11:00:36.875468 3584973 transfer_engine_impl.cpp:182] Transfer Engine RPC using new RPC mapping, listening on 141.61.84.247:16968
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 11:00:36.889169 3584973 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r4_J1 ================
+--- head 40 (startup config) ---
+I20261020 11:02:29.527029 3587523 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 11:02:29.527058 3587523 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 11:02:29.527065 3587523 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 11:02:29.527068 3587523 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 11:02:29.527071 3587523 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 11:02:29.527076 3587523 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 11:02:29.527079 3587523 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 11:02:29.527082 3587523 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 11:02:29.527086 3587523 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 11:02:29.527088 3587523 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 11:02:29.527091 3587523 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 11:02:29.527093 3587523 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 11:02:29.527096 3587523 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 11:02:29.527099 3587523 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 11:02:29.527102 3587523 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 11:02:29.527105 3587523 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 11:02:29.527108 3587523 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 11:02:29.527110 3587523 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 11:02:29.527113 3587523 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 11:02:29.527117 3587523 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 11:02:29.527119 3587523 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 11:02:29.527122 3587523 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 11:02:29.527124 3587523 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 11:02:29.527127 3587523 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0.05
+I20261020 11:02:29.527140 3587523 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 11:02:29.527143 3587523 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 11:02:29.527150 3587523 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 11:02:29.527153 3587523 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 11:02:29.527158 3587523 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 11:02:29.709136 3587523 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 11:02:29.709169 3587523 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 11:02:29.715145 3587523 client_service.cpp:319] client_id=12488049272652864542-16785983456924504489
+I20261020 11:02:29.715171 3587523 client_service.cpp:321] client_id=12488049272652864542-16785983456924504489, host_id=141.61.84.247
+I20261020 11:02:29.715178 3587523 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 11:02:29.718255 3587523 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 11:02:29.742564 3587962 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=107 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=92 pool_acquire_dispatch_us=4 client_submit_us=22 pool_after_submit_us=65 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3587733 callback_tid=3587733 submit_tid=3587540 pool_return_tid=3587540 rpc_begin_steady_ns=83065441939630 rpc_end_steady_ns=83065442032320 total_us=10406 status=ok
+I20261020 11:02:29.742614 3587962 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=371 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=365 pool_acquire_dispatch_us=0 client_submit_us=360 pool_after_submit_us=4 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3587825 callback_tid=3587825 submit_tid=3587539 pool_return_tid=3587539 rpc_begin_steady_ns=83065447693510 rpc_end_steady_ns=83065448058680 total_us=8934 status=ok
+I20261020 11:02:29.742622 3587962 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=91 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=81 pool_acquire_dispatch_us=0 client_submit_us=36 pool_after_submit_us=44 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3587815 callback_tid=3587815 submit_tid=3587539 pool_return_tid=3587539 rpc_begin_steady_ns=83065447178840 rpc_end_steady_ns=83065447260300 total_us=9320 status=ok
+I20261020 11:02:29.742627 3587962 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=101 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=85 pool_acquire_dispatch_us=0 client_submit_us=22 pool_after_submit_us=62 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3587747 callback_tid=3587747 submit_tid=3587540 pool_return_tid=3587540 rpc_begin_steady_ns=83065443570500 rpc_end_steady_ns=83065443656470 total_us=9599 status=ok
+I20261020 11:02:29.742712 3587962 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=115 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=112 pool_acquire_dispatch_us=1 client_submit_us=25 pool_after_submit_us=85 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3587867 callback_tid=3587867 submit_tid=3587540 pool_return_tid=3587540 rpc_begin_steady_ns=83065453512140 rpc_end_steady_ns=83065453624890 total_us=4271 status=ok
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 11:02:29.754412 3587523 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r5_J0 ================
+--- head 40 (startup config) ---
+I20261020 11:04:08.995563 3590108 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 11:04:08.995590 3590108 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 11:04:08.995597 3590108 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 11:04:08.995601 3590108 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 11:04:08.995604 3590108 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 11:04:08.995607 3590108 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 11:04:08.995611 3590108 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 11:04:08.995615 3590108 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 11:04:08.995618 3590108 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 11:04:08.995620 3590108 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 11:04:08.995623 3590108 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 11:04:08.995626 3590108 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 11:04:08.995630 3590108 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 11:04:08.995632 3590108 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 11:04:08.995635 3590108 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 11:04:08.995638 3590108 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 11:04:08.995640 3590108 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 11:04:08.995643 3590108 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 11:04:08.995646 3590108 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 11:04:08.995649 3590108 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 11:04:08.995652 3590108 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 11:04:08.995656 3590108 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 11:04:08.995658 3590108 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 11:04:08.995661 3590108 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0
+I20261020 11:04:08.995671 3590108 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 11:04:08.995674 3590108 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 11:04:08.995682 3590108 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 11:04:08.995685 3590108 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 11:04:08.995688 3590108 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 11:04:09.178066 3590108 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 11:04:09.178094 3590108 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 11:04:09.181072 3590108 client_service.cpp:319] client_id=17024560308346100848-16828728314320739262
+I20261020 11:04:09.181097 3590108 client_service.cpp:321] client_id=17024560308346100848-16828728314320739262, host_id=141.61.84.247
+I20261020 11:04:09.181103 3590108 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 11:04:09.185799 3590108 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 11:04:09.248186 3590108 master_client.cpp:716] Master RPC pool warmup completed: 100/100 succeeded
+I20261020 11:04:09.249452 3590108 client_service.cpp:972] Storage root directory is not set. persisting data is disabled.
+I20261020 11:04:09.249523 3590108 transfer_engine_impl.cpp:987] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I20261020 11:04:09.249548 3590108 transfer_engine_impl.cpp:115] Transfer Engine parseHostNameWithPort. server_name: 141.61.84.247 port: 50615
+I20261020 11:04:09.249590 3590108 transfer_engine_impl.cpp:182] Transfer Engine RPC using new RPC mapping, listening on 141.61.84.247:15181
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 11:04:09.259193 3590108 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs
+================ J2_r6_J1 ================
+--- head 40 (startup config) ---
+I20261020 11:05:53.192401 3592257 stress_cluster_bench.cpp:3098] Mooncake Stress Cluster Benchmark
+I20261020 11:05:53.192428 3592257 stress_cluster_bench.cpp:3099]   Scenario:       segment_read
+I20261020 11:05:53.192435 3592257 stress_cluster_bench.cpp:3100]   Protocol:       ub
+I20261020 11:05:53.192438 3592257 stress_cluster_bench.cpp:3101]   GPU mode:       host
+I20261020 11:05:53.192441 3592257 stress_cluster_bench.cpp:3102]   GPU device:     0
+I20261020 11:05:53.192445 3592257 stress_cluster_bench.cpp:3103]   Value size:     4 MiB
+I20261020 11:05:53.192449 3592257 stress_cluster_bench.cpp:3104]   Key value size suffix: disabled
+I20261020 11:05:53.192452 3592257 stress_cluster_bench.cpp:3106]   Num keys:       1000
+I20261020 11:05:53.192456 3592257 stress_cluster_bench.cpp:3107]   Batch size:     1
+I20261020 11:05:53.192458 3592257 stress_cluster_bench.cpp:3108]   Num threads:    16
+I20261020 11:05:53.192461 3592257 stress_cluster_bench.cpp:3109]   Memory replicas: 1
+I20261020 11:05:53.192464 3592257 stress_cluster_bench.cpp:3110]   NoF replicas:   0
+I20261020 11:05:53.192466 3592257 stress_cluster_bench.cpp:3111]   NoF whole-pool: auto/available
+I20261020 11:05:53.192469 3592257 stress_cluster_bench.cpp:3116]   NoF qpairs/segment: environment/default
+I20261020 11:05:53.192472 3592257 stress_cluster_bench.cpp:3120]   Hard pin:       no
+I20261020 11:05:53.192476 3592257 stress_cluster_bench.cpp:3121]   SSD offload:    no
+I20261020 11:05:53.192478 3592257 stress_cluster_bench.cpp:3124]   Memory segments: 141.61.84.149:12505
+I20261020 11:05:53.192481 3592257 stress_cluster_bench.cpp:3131]   NoF segments:   auto-discover from master
+I20261020 11:05:53.192484 3592257 stress_cluster_bench.cpp:3133]   Master admin:   9005
+I20261020 11:05:53.192487 3592257 stress_cluster_bench.cpp:3134]   Read seg nums:  0
+I20261020 11:05:53.192489 3592257 stress_cluster_bench.cpp:3135]   Duration:       60s
+I20261020 11:05:53.192492 3592257 stress_cluster_bench.cpp:3136]   Stats interval: 5s
+I20261020 11:05:53.192495 3592257 stress_cluster_bench.cpp:3137]   Client init wait: 0s
+I20261020 11:05:53.192498 3592257 stress_cluster_bench.cpp:3139]   Request trace sample rate: 0.05
+I20261020 11:05:53.192510 3592257 stress_cluster_bench.cpp:3171]   Build switches: USE_NOF=ON USE_NOF_URMA=ON USE_NOF_GPU_DIRECT=ON USE_CUDA=OFF USE_UB=ON
+I20261020 11:05:53.192514 3592257 stress_cluster_bench.cpp:3174]   NoF GPU Direct available: yes
+I20261020 11:05:53.192520 3592257 stress_cluster_bench.cpp:440] Set MC_UB_GPU_MODE=host
+I20261020 11:05:53.192524 3592257 stress_cluster_bench.cpp:3287] Requested memory path: ub/host
+W20261020 11:05:53.192528 3592257 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+I20261020 11:05:53.378322 3592257 client_metric.cpp:114] Client metrics enabled (default enabled)
+I20261020 11:05:53.378360 3592257 client_metric.cpp:115] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I20261020 11:05:53.382426 3592257 client_service.cpp:319] client_id=15658492527788242769-2361281259035147907
+I20261020 11:05:53.382454 3592257 client_service.cpp:321] client_id=15658492527788242769-2361281259035147907, host_id=141.61.84.247
+I20261020 11:05:53.382460 3592257 client_service.cpp:333] Client metrics enabled but reporting disabled (interval=0)
+I20261020 11:05:53.387118 3592257 master_client.cpp:697] Warming up master RPC pool to 100 connection(s), max_connection=100
+I20261020 11:05:53.407454 3592560 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=1102 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=1100 pool_acquire_dispatch_us=2 client_submit_us=1084 pool_after_submit_us=12 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3592360 callback_tid=3592360 submit_tid=3592264 pool_return_tid=3592264 rpc_begin_steady_ns=83269103627890 rpc_end_steady_ns=83269104728230 total_us=13438 status=ok
+I20261020 11:05:53.407552 3592560 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=5304 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=5292 pool_acquire_dispatch_us=4405 client_submit_us=16 pool_after_submit_us=870 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3592369 callback_tid=3592270 submit_tid=3592270 pool_return_tid=3592270 rpc_begin_steady_ns=83269105952460 rpc_end_steady_ns=83269111245340 total_us=13571 status=ok
+I20261020 11:05:53.407564 3592560 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=99 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=88 pool_acquire_dispatch_us=0 client_submit_us=61 pool_after_submit_us=25 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3592386 callback_tid=3592386 submit_tid=3592266 pool_return_tid=3592266 rpc_begin_steady_ns=83269109121170 rpc_end_steady_ns=83269109209210 total_us=10556 status=ok
+I20261020 11:05:53.409703 3592560 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=113 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=104 pool_acquire_dispatch_us=0 client_submit_us=20 pool_after_submit_us=83 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3592448 callback_tid=3592448 submit_tid=3592275 pool_return_tid=3592275 rpc_begin_steady_ns=83269111525530 rpc_end_steady_ns=83269111630020 total_us=13247 status=ok
+I20261020 11:05:53.410115 3592561 master_client.cpp:543] trace_id[none] master_rpc_client_breakdown method=ServiceReady pool_lookup_us=0 rpc_call_us=100 result_get_us=0 result_parse_us=0 phase_timing=pool_callback_v1 pool_call_us=87 pool_acquire_dispatch_us=0 client_submit_us=16 pool_after_submit_us=70 pool_callback_entered=1 client_submit_returned=1 rpc_client_id=1 caller_tid=3592473 callback_tid=3592473 submit_tid=3592274 pool_return_tid=3592274 rpc_begin_steady_ns=83269113626190 rpc_end_steady_ns=83269113713920 total_us=11580 status=ok
+--- overran/dropped warnings ---
+--- log buffer warnings ---
+I20261020 11:05:53.468915 3592257 client_service.cpp:884] Topology discovery complete with specified devices. Found 1 HCAs

@@ -1,0 +1,74 @@
+
+Authorized users only. All activities may be monitored and reported.
+==== J0_cross_60s_nosample ====
+--- W/E lines (warnings/errors) ---
+W20261020 10:11:00.140870 3384069 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (0 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 10:11:00.425617 3384069 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 10:11:00.425717 3384069 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 10:11:00.454232 3384069 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 10:12:00.940352 3384069 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 91 }
+--- count W/E ---
+5
+==== J1_cross_60s_sample05 ====
+--- W/E lines (warnings/errors) ---
+W20261020 10:13:37.239961 3387664 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (0 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 10:13:37.504149 3387664 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 10:13:37.504230 3387664 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 10:13:37.528940 3387664 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 10:14:37.907469 3387664 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 108 }
+--- count W/E ---
+5
+==== J2_r1_J0 ====
+--- W/E lines (warnings/errors) ---
+W20261020 10:56:50.357682 3579292 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 10:56:50.622299 3579292 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 10:56:50.622387 3579292 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 10:56:50.648945 3579292 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 10:57:52.822486 3579292 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 88 }
+--- count W/E ---
+5
+==== J2_r2_J1 ====
+--- W/E lines (warnings/errors) ---
+W20261020 10:58:52.120277 3582164 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 10:58:52.399349 3582164 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 10:58:52.399428 3582164 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 10:58:52.428951 3582164 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 10:59:54.605260 3582164 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 93 }
+--- count W/E ---
+5
+==== J2_r3_J0 ====
+--- W/E lines (warnings/errors) ---
+W20261020 11:00:36.623471 3584973 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 11:00:36.876901 3584973 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 11:00:36.877004 3584973 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 11:00:36.908383 3584973 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 11:01:39.088537 3584973 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 87 }
+--- count W/E ---
+5
+==== J2_r4_J1 ====
+--- W/E lines (warnings/errors) ---
+W20261020 11:02:29.527158 3587523 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 11:02:29.746750 3587523 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 11:02:29.746840 3587523 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 11:02:29.775573 3587523 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 11:03:31.013185 3587523 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 61 }
+--- count W/E ---
+5
+==== J2_r5_J0 ====
+--- W/E lines (warnings/errors) ---
+W20261020 11:04:08.995688 3590108 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 11:04:09.251579 3590108 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 11:04:09.251659 3590108 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 11:04:09.280306 3590108 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 11:05:11.454715 3590108 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 92 }
+--- count W/E ---
+5
+==== J2_r6_J1 ====
+--- W/E lines (warnings/errors) ---
+W20261020 11:05:53.192528 3592257 stress_cluster_bench.cpp:3308] Total data (4000 MiB) may exceed 95% of segment (4096 MiB). Master eviction may delete objects. Consider increasing --global_segment_size or decreasing --num_keys, or use --hard_pin=true.
+E20261020 11:05:53.461472 3592257 client_service.cpp:879] ub protocol entable device names is udmac0d1e2
+W20261020 11:05:53.461555 3592257 topology.cpp:205] No RDMA devices found, check your device installation
+W20261020 11:05:53.491629 3592257 urma_endpoint.cpp:561] Skipping urma_user_ctl SET_BONDING_MODE on udmac0d1e2 (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)
+W20261020 11:06:55.666750 3592257 urma_endpoint.cpp:94] finished destroy context : UrmaContext:{device_name : udmac0d1e2 ,max_endpoints : 65536 ,async_fd : 88 }
+--- count W/E ---
+5
