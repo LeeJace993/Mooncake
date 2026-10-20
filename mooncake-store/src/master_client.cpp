@@ -4,10 +4,15 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <chrono>
 #include <csignal>
 #include <future>
+#include <ostream>
 #include <string>
+#include <sys/syscall.h>
 #include <type_traits>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -344,6 +349,98 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
 
+namespace {
+
+// These boundaries deliberately surround the pool callback, not TCP packets.
+// The pool may await the response before returning, depending on reuse_limit.
+struct RpcPoolCallTiming {
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    TimePoint begin{};
+    TimePoint callback_enter{};
+    TimePoint submit_return{};
+    TimePoint pool_return{};
+    uint64_t caller_tid = 0;
+    uint64_t callback_tid = 0;
+    uint64_t submit_tid = 0;
+    uint64_t pool_return_tid = 0;
+    uint32_t client_id = 0;
+    bool callback_entered = false;
+    bool submit_returned = false;
+
+    void Start() {
+        caller_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+        begin = Clock::now();
+    }
+
+    void Finish() {
+        pool_return = Clock::now();
+        pool_return_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    }
+};
+
+std::ostream& operator<<(std::ostream& output, const RpcPoolCallTiming& timing) {
+    const auto us = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+            .count();
+    };
+    const auto ns = [](auto time) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   time.time_since_epoch())
+            .count();
+    };
+    // -1 means the boundary was not reached (for example, connection failure).
+    // Successful phase durations add up to pool_call_us, modulo us rounding.
+    return output << " phase_timing=pool_callback_v1"
+                  << " pool_call_us=" << us(timing.begin, timing.pool_return)
+                  << " pool_acquire_dispatch_us="
+                  << (timing.callback_entered
+                          ? us(timing.begin, timing.callback_enter)
+                          : -1)
+                  << " client_submit_us="
+                  << (timing.submit_returned
+                          ? us(timing.callback_enter, timing.submit_return)
+                          : -1)
+                  << " pool_after_submit_us="
+                  << (timing.submit_returned
+                          ? us(timing.submit_return, timing.pool_return)
+                          : -1)
+                  << " pool_callback_entered=" << timing.callback_entered
+                  << " client_submit_returned=" << timing.submit_returned
+                  << " rpc_client_id=" << timing.client_id
+                  << " caller_tid=" << timing.caller_tid
+                  << " callback_tid=" << timing.callback_tid
+                  << " submit_tid=" << timing.submit_tid
+                  << " pool_return_tid=" << timing.pool_return_tid
+                  << " rpc_begin_steady_ns=" << ns(timing.begin)
+                  << " rpc_end_steady_ns=" << ns(timing.pool_return);
+}
+
+template <auto ServiceMethod, typename... Args>
+auto MeasureRpcClientSubmit(coro_rpc::coro_rpc_client& client,
+                            RpcPoolCallTiming& timing, Args&&... args)
+    -> decltype(client.send_request<ServiceMethod>(
+        std::forward<Args>(args)...)) {
+    timing.callback_enter = RpcPoolCallTiming::Clock::now();
+    timing.callback_entered = true;
+    timing.callback_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    timing.client_id = client.get_client_id();
+
+    // Await only the outer submission coroutine. Return its response Lazy
+    // unchanged so the pool retains its existing response/connection lifetime.
+    // This interval includes preparation, write serialization and recv startup;
+    // it is not a measurement of async_write alone or of network RTT.
+    auto response = co_await client.send_request<ServiceMethod>(
+        std::forward<Args>(args)...);
+    timing.submit_return = RpcPoolCallTiming::Clock::now();
+    timing.submit_returned = true;
+    timing.submit_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    co_return std::move(response);
+}
+
+}  // namespace
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
@@ -359,6 +456,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     uint64_t rpc_call_us = 0;
     uint64_t result_get_us = 0;
     uint64_t result_parse_us = 0;
+    RpcPoolCallTiming pool_timing;
 
     // Increment RPC counter
     if (metrics_) {
@@ -368,16 +466,22 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            if (breakdown_log) pool_timing.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    if (breakdown_log) {
+                        return MeasureRpcClientSubmit<ServiceMethod>(
+                            client, pool_timing, std::forward<Args>(args)...);
+                    }
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
             if (breakdown_log) {
+                pool_timing.Finish();
                 rpc_call_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - pool_end)
+                        pool_timing.pool_return - pool_end)
                         .count();
             }
             if (!ret.has_value()) {
@@ -445,6 +549,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                      << " rpc_call_us=" << rpc_call_us
                      << " result_get_us=" << result_get_us
                      << " result_parse_us=" << result_parse_us
+                     << pool_timing
                      << " total_us="
                      << std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - total_start)
@@ -470,6 +575,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     uint64_t rpc_call_us = 0;
     uint64_t result_get_us = 0;
     uint64_t result_parse_us = 0;
+    RpcPoolCallTiming pool_timing;
     bool rpc_transport_ok = false;
 
     // Increment RPC counter
@@ -481,16 +587,22 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
+            if (breakdown_log) pool_timing.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    if (breakdown_log) {
+                        return MeasureRpcClientSubmit<ServiceMethod>(
+                            client, pool_timing, std::forward<Args>(args)...);
+                    }
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
             if (breakdown_log) {
+                pool_timing.Finish();
                 rpc_call_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - pool_end)
+                        pool_timing.pool_return - pool_end)
                         .count();
             }
             if (!ret.has_value()) {
@@ -552,6 +664,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                      << " rpc_call_us=" << rpc_call_us
                      << " result_get_us=" << result_get_us
                      << " result_parse_us=" << result_parse_us
+                     << pool_timing
                      << " total_us="
                      << std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - total_start)
