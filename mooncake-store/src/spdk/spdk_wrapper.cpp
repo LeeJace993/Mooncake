@@ -1,4 +1,5 @@
 #include <glog/logging.h>
+#include <sched.h>
 
 #include <atomic>
 #include <cerrno>
@@ -40,6 +41,29 @@ bool ParseEnvBool(const char *name, bool *out) {
     }
     *out = (v != 0);
     return true;
+}
+
+std::string FormatCpuAffinity(const cpu_set_t &cpuset) {
+    std::ostringstream out;
+    bool first = true;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &cpuset)) {
+            continue;
+        }
+        const int begin = cpu;
+        while (cpu + 1 < CPU_SETSIZE && CPU_ISSET(cpu + 1, &cpuset)) {
+            ++cpu;
+        }
+        if (!first) {
+            out << ',';
+        }
+        out << begin;
+        if (cpu != begin) {
+            out << '-' << cpu;
+        }
+        first = false;
+    }
+    return out.str();
 }
 
 uint32_t GetNofQpairsPerSegment() {
@@ -166,7 +190,54 @@ bool SpdkWrapper::InitializeEnv() {
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
 
+    // EAL pins its calling thread to the main lcore. Preserve the caller's
+    // placement so subsequently created RPC/helper threads do not inherit
+    // that restriction. This does not change EAL's own worker affinity.
+    bool restore_affinity = true;
+    ParseEnvBool("MC_SPDK_RESET_AFFINITY", &restore_affinity);
+    cpu_set_t original_affinity{};
+    if (restore_affinity && sched_getaffinity(0, sizeof(original_affinity),
+                                            &original_affinity) != 0) {
+        PLOG(ERROR) << "Cannot save CPU affinity before SPDK initialization";
+        return false;
+    }
+
     int rc = spdk_env_init(&opts);
+    if (restore_affinity) {
+        cpu_set_t eal_affinity{};
+        const bool have_eal_affinity =
+            sched_getaffinity(0, sizeof(eal_affinity), &eal_affinity) == 0;
+        // Restore even when initialization fails: EAL may already have
+        // changed the affinity before returning an error.
+        if (sched_setaffinity(0, sizeof(original_affinity),
+                              &original_affinity) != 0) {
+            // Do not retry a successful EAL initialization. Keep its lifecycle
+            // state below intact and make the placement failure explicit.
+            PLOG(ERROR) << "Failed to restore CPU affinity after spdk_env_init"
+                        << " (rc=" << rc << "), requested=["
+                        << FormatCpuAffinity(original_affinity)
+                        << "]; subsequently created threads may inherit "
+                           "EAL's CPU restriction";
+        } else {
+            cpu_set_t restored_affinity{};
+            const bool have_restored_affinity =
+                sched_getaffinity(0, sizeof(restored_affinity),
+                                  &restored_affinity) == 0;
+            LOG(INFO) << "SPDK initialization CPU affinity: before=["
+                      << FormatCpuAffinity(original_affinity)
+                      << "] after_init=["
+                      << (have_eal_affinity ? FormatCpuAffinity(eal_affinity)
+                                           : "unknown")
+                      << "] restored=["
+                      << (have_restored_affinity
+                              ? FormatCpuAffinity(restored_affinity)
+                              : "unknown")
+                      << "] init_rc=" << rc;
+        }
+    } else {
+        LOG(INFO) << "SPDK CPU affinity restoration disabled by "
+                     "MC_SPDK_RESET_AFFINITY=0";
+    }
     if (rc != 0) {
         fprintf(stderr, "SPDK init failed: %d\n", rc);
         return false;
