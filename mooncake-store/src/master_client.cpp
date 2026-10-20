@@ -6,7 +6,9 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <future>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <sys/syscall.h>
@@ -24,6 +26,11 @@
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
+
+#if defined(MOONCAKE_RPC_SUBMIT_DIAG_BUILD) && \
+    !defined(MOONCAKE_RPC_SUBMIT_TRACE_VERSION)
+#error "RPC diagnostics require the build-local instrumented coro_rpc headers"
+#endif
 
 namespace mooncake {
 
@@ -351,6 +358,21 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
 
 namespace {
 
+bool RpcSubmitDiagnosticsRequested() {
+    static const bool enabled = [] {
+        const bool requested =
+            Environ::GetBool("MC_STORE_RPC_SUBMIT_DIAG", false);
+#ifndef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+        if (requested) {
+            LOG(WARNING) << "MC_STORE_RPC_SUBMIT_DIAG requires rebuilding with "
+                            "-DMC_ENABLE_RPC_SUBMIT_DIAG=ON";
+        }
+#endif
+        return requested;
+    }();
+    return enabled;
+}
+
 // These boundaries deliberately surround the pool callback, not TCP packets.
 // The pool may await the response before returning, depending on reuse_limit.
 struct RpcPoolCallTiming {
@@ -366,8 +388,15 @@ struct RpcPoolCallTiming {
     uint64_t submit_tid = 0;
     uint64_t pool_return_tid = 0;
     uint32_t client_id = 0;
+    // get_client_id() is copied from pool configuration, not a connection ID.
+    // These identify live objects within this process, not socket generations.
+    uintptr_t client_object = 0;
+    uintptr_t executor_object = 0;
     bool callback_entered = false;
     bool submit_returned = false;
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    std::optional<coro_rpc::mooncake_submit_trace_t> submit_trace;
+#endif
 
     void Start() {
         caller_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
@@ -392,29 +421,49 @@ std::ostream& operator<<(std::ostream& output, const RpcPoolCallTiming& timing) 
     };
     // -1 means the boundary was not reached (for example, connection failure).
     // Successful phase durations add up to pool_call_us, modulo us rounding.
-    return output << " phase_timing=pool_callback_v1"
-                  << " pool_call_us=" << us(timing.begin, timing.pool_return)
-                  << " pool_acquire_dispatch_us="
-                  << (timing.callback_entered
-                          ? us(timing.begin, timing.callback_enter)
-                          : -1)
-                  << " client_submit_us="
-                  << (timing.submit_returned
-                          ? us(timing.callback_enter, timing.submit_return)
-                          : -1)
-                  << " pool_after_submit_us="
-                  << (timing.submit_returned
-                          ? us(timing.submit_return, timing.pool_return)
-                          : -1)
-                  << " pool_callback_entered=" << timing.callback_entered
-                  << " client_submit_returned=" << timing.submit_returned
-                  << " rpc_client_id=" << timing.client_id
-                  << " caller_tid=" << timing.caller_tid
-                  << " callback_tid=" << timing.callback_tid
-                  << " submit_tid=" << timing.submit_tid
-                  << " pool_return_tid=" << timing.pool_return_tid
-                  << " rpc_begin_steady_ns=" << ns(timing.begin)
-                  << " rpc_end_steady_ns=" << ns(timing.pool_return);
+    output << " phase_timing=pool_callback_v1"
+           << " pool_call_us=" << us(timing.begin, timing.pool_return)
+           << " pool_acquire_dispatch_us="
+           << (timing.callback_entered
+                   ? us(timing.begin, timing.callback_enter)
+                   : -1)
+           << " client_submit_us="
+           << (timing.submit_returned
+                   ? us(timing.callback_enter, timing.submit_return)
+                   : -1)
+           << " pool_after_submit_us="
+           << (timing.submit_returned
+                   ? us(timing.submit_return, timing.pool_return)
+                   : -1)
+           << " pool_callback_entered=" << timing.callback_entered
+           << " client_submit_returned=" << timing.submit_returned
+           << " rpc_client_id=" << timing.client_id
+           << " rpc_client_object=" << timing.client_object
+           << " rpc_executor_object=" << timing.executor_object
+           << " caller_tid=" << timing.caller_tid
+           << " callback_tid=" << timing.callback_tid
+           << " submit_tid=" << timing.submit_tid
+           << " pool_return_tid=" << timing.pool_return_tid
+           << " rpc_begin_steady_ns=" << ns(timing.begin)
+           << " rpc_end_steady_ns=" << ns(timing.pool_return);
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    if (timing.submit_trace) {
+        const auto& trace = *timing.submit_trace;
+        output << " b_wrapper_us="
+               << (trace.Has(coro_rpc::mooncake_submit_trace_t::Begin)
+                       ? us(timing.callback_enter,
+                            trace.times[
+                                coro_rpc::mooncake_submit_trace_t::Begin])
+                       : -1)
+               << trace;
+    } else {
+        output << " b_diag=off";
+    }
+#else
+    output << " b_diag="
+           << (RpcSubmitDiagnosticsRequested() ? "not_built" : "off");
+#endif
+    return output;
 }
 
 template <auto ServiceMethod, typename... Args>
@@ -426,14 +475,32 @@ auto MeasureRpcClientSubmit(coro_rpc::coro_rpc_client& client,
     timing.callback_entered = true;
     timing.callback_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
     timing.client_id = client.get_client_id();
+    timing.client_object = reinterpret_cast<uintptr_t>(&client);
+    timing.executor_object = reinterpret_cast<uintptr_t>(&client.get_executor());
 
     // Await only the outer submission coroutine. Return its response Lazy
     // unchanged so the pool retains its existing response/connection lifetime.
     // This interval includes preparation, write serialization and recv startup;
     // it is not a measurement of async_write alone or of network RTT.
-    auto response = co_await client.send_request<ServiceMethod>(
-        std::forward<Args>(args)...);
+    auto submission = [&] {
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+        if (RpcSubmitDiagnosticsRequested()) {
+            coro_rpc::request_config_t config;
+            config.mooncake_submit_trace = &timing.submit_trace.emplace();
+            return client.send_request<ServiceMethod>(
+                std::move(config), std::forward<Args>(args)...);
+        }
+#endif
+        return client.send_request<ServiceMethod>(std::forward<Args>(args)...);
+    }();
+    auto response = co_await std::move(submission);
     timing.submit_return = RpcPoolCallTiming::Clock::now();
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    if (timing.submit_trace) {
+        timing.submit_trace->Mark(coro_rpc::mooncake_submit_trace_t::Done,
+                                  timing.submit_return);
+    }
+#endif
     timing.submit_returned = true;
     timing.submit_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
     co_return std::move(response);
