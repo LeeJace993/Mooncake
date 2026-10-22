@@ -44,15 +44,20 @@ enum class TransferStrategy {
     SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
-// Per-object NoF timing, captured only for sampled high-frequency traces.
+// Per-object NoF timing, captured for sampled high-frequency traces or while
+// the opt-in all-task slow-path trace is enabled.
 // The first three phases form a non-overlapping decomposition of total_us:
 // queue_to_first_submit_us + first_to_last_submit_us +
 // last_submit_to_complete_us ~= total_us.  Completion timings overlap the
 // submit span because completions may arrive while later sub-I/Os are still
 // being admitted to the qpair.
 struct NofTransferTiming {
+    int32_t worker_index = -1;
     uint32_t lane = 0;
+    uint16_t qpair_id = 0;
     uint32_t sub_io_count = 0;
+    uint64_t lane_task_sequence = 0;
+    uint64_t lane_completion_sequence = 0;
     uint32_t qos_tasks_ahead_at_enqueue = 0;
     int64_t dispatch_queue_us = 0;
     int64_t worker_setup_us = 0;
@@ -80,7 +85,38 @@ struct NofTransferTiming {
     int64_t first_completion_to_complete_us = 0;
     int64_t total_us = 0;
     int64_t complete_to_observe_us = 0;
+    // Absolute steady-clock timestamps make slow tasks orderable on one host
+    // without relying on the asynchronous logger's wall-clock prefix.
+    int64_t queued_mono_ns = 0;
+    int64_t first_submit_mono_ns = 0;
+    int64_t last_submit_mono_ns = 0;
+    int64_t completed_mono_ns = 0;
+    // The slowest sub-I/O splits aggregate drain into an initiator polling
+    // gap versus a downstream completion gap. CID/LBA allow target-side
+    // correlation when corresponding target tracing is enabled.
+    int64_t max_sub_io_latency_us = 0;
+    uint32_t max_sub_io_index = 0;
+    uint16_t max_sub_io_cid = 0;
+    uint64_t max_sub_io_lba = 0;
+    uint32_t max_sub_io_blocks = 0;
+    int64_t max_sub_io_submit_mono_ns = 0;
+    int64_t max_sub_io_complete_mono_ns = 0;
+    int64_t max_completion_gap_us = 0;
+    int64_t max_completion_gap_begin_mono_ns = 0;
+    int64_t max_completion_gap_end_mono_ns = 0;
+    int64_t max_poll_return_gap_us = 0;
+    int64_t max_poll_return_gap_begin_mono_ns = 0;
+    int64_t max_poll_return_gap_end_mono_ns = 0;
+    uint64_t poll_calls_during_task = 0;
+    uint64_t empty_polls_during_task = 0;
+    uint64_t polled_completions_during_task = 0;
 };
+
+#ifdef USE_NOF
+// Zero disables the opt-in all-task slow-path trace. Kept as a function so
+// the submitter and client-side observer share one parsed value.
+int64_t GetSpdkNofSlowTraceThresholdUs();
+#endif
 
 /**
  * @brief Stream operator for TransferStrategy
@@ -458,7 +494,25 @@ struct SpdkNofTaskTiming {
     std::chrono::steady_clock::time_point first_submit_at;
     std::chrono::steady_clock::time_point last_submit_at;
     std::chrono::steady_clock::time_point first_completion_at;
+    std::chrono::steady_clock::time_point previous_completion_at;
     std::chrono::steady_clock::time_point credit_wait_started_at;
+    uint64_t lane_task_sequence = 0;
+    uint64_t poll_calls_at_first_submit = 0;
+    uint64_t empty_polls_at_first_submit = 0;
+    uint64_t polled_completions_at_first_submit = 0;
+    int64_t max_sub_io_latency_us = 0;
+    uint32_t max_sub_io_index = 0;
+    uint16_t max_sub_io_cid = 0;
+    uint64_t max_sub_io_lba = 0;
+    uint32_t max_sub_io_blocks = 0;
+    int64_t max_sub_io_submit_mono_ns = 0;
+    int64_t max_sub_io_complete_mono_ns = 0;
+    int64_t max_completion_gap_us = 0;
+    int64_t max_completion_gap_begin_mono_ns = 0;
+    int64_t max_completion_gap_end_mono_ns = 0;
+    int64_t max_poll_return_gap_us = 0;
+    int64_t max_poll_return_gap_begin_mono_ns = 0;
+    int64_t max_poll_return_gap_end_mono_ns = 0;
     uint64_t qos_full_pending_at_enqueue_us = 0;
     uint64_t qos_partial_pending_at_enqueue_us = 0;
     uint64_t qos_zero_pending_at_enqueue_us = 0;
@@ -488,6 +542,7 @@ struct SpdkNofTask {
     int outstanding_sub_io;
     int op;   // kSpdkNofOpRead or kSpdkNofOpWrite
     int idx;  // subop idx
+    int worker_index;
     bool failed;
     bool on_chain;
     bool first_sub_io_submitted;
@@ -516,6 +571,7 @@ struct SpdkNofTask {
           outstanding_sub_io(0),
           op(op_code),
           idx(0),
+          worker_index(-1),
           failed(false),
           on_chain(false),
           first_sub_io_submitted(false),
@@ -534,6 +590,8 @@ struct SpdkNofSubTask {
     int submit_lba_count;
     std::stack<SpdkNofSubTask*>* sub_task_pool;
     bool track_latency = false;
+    uint32_t sub_io_index = 0;
+    uint64_t submit_lba = 0;
     std::chrono::steady_clock::time_point submitted_at;
 // Modified By Yida (v3): ext I/O 选项。必须是成员而非栈变量——SPDK 要求
 // 在 I/O 完成前保持有效；host 路径不使用（io_opts 以 nullptr 提交）。
@@ -586,6 +644,10 @@ struct SpdkNofQos {
     std::chrono::steady_clock::time_point last_occupancy_update =
         std::chrono::steady_clock::now();
     int max_inflight_blocks = 0;
+    uint64_t enqueued_task_sequence = 0;
+    uint64_t completed_task_sequence = 0;
+    std::chrono::steady_clock::time_point last_poll_return_at =
+        std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last_progress =
         std::chrono::steady_clock::now();
 

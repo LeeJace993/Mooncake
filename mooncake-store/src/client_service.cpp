@@ -1543,6 +1543,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     const bool breakdown_log =
         mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+#ifdef USE_NOF
+    const int64_t nof_slow_trace_threshold_us =
+        GetSpdkNofSlowTraceThresholdUs();
+#else
+    const int64_t nof_slow_trace_threshold_us = 0;
+#endif
     const auto batch_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -1870,7 +1876,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     << timing->first_completion_to_complete_us
                     << " task_total_us=" << timing->total_us
                     << " observe_delay_us="
-                    << timing->complete_to_observe_us;
+                    << timing->complete_to_observe_us
+                    << " worker_idx=" << timing->worker_index
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " lane_completion_seq="
+                    << timing->lane_completion_sequence
+                    << " max_subio_us=" << timing->max_sub_io_latency_us
+                    << " max_subio_idx=" << timing->max_sub_io_index
+                    << " max_subio_cid=" << timing->max_sub_io_cid
+                    << " max_completion_gap_us="
+                    << timing->max_completion_gap_us
+                    << " max_poll_return_gap_us="
+                    << timing->max_poll_return_gap_us
+                    << " poll_calls=" << timing->poll_calls_during_task
+                    << " empty_polls=" << timing->empty_polls_during_task
+                    << " polled_completions="
+                    << timing->polled_completions_during_task;
                 if (timing->total_us > slowest_task_us) {
                     slowest_task_us = timing->total_us;
                     slowest_lane = timing->lane;
@@ -1879,6 +1901,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 }
             }
         }
+#ifdef USE_NOF
+        if (!breakdown_log && nof_slow_trace_threshold_us > 0) {
+            if (auto timing = future.nofTiming();
+                timing.has_value() &&
+                timing->total_us >= nof_slow_trace_threshold_us) {
+                MC_LOG(INFO)
+                    << "batch_get_slow_task_observed trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us;
+            }
+        }
+#endif
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -1945,11 +1983,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
 
+    const auto t1_batch_get = std::chrono::steady_clock::now();
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - t0_batch_get)
+                            t1_batch_get - t0_batch_get)
                             .count();
     if (metrics_) {
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
+    }
+
+    if (nof_slow_trace_threshold_us > 0 &&
+        us_batch_get >= nof_slow_trace_threshold_us) {
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        const auto mono_ns = [](auto value) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       value.time_since_epoch())
+                .count();
+        };
+        MC_LOG(INFO) << "batch_get_slow_trace trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " start_mono_ns=" << mono_ns(t0_batch_get)
+                     << " end_mono_ns=" << mono_ns(t1_batch_get)
+                     << " total_us=" << us_batch_get
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
     }
 
     if (breakdown_log) {

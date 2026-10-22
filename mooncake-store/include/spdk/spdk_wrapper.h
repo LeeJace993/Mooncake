@@ -66,6 +66,8 @@ class SpdkWrapper {
 
     uint32_t GetIoLaneIndex(const nof_io_lane *lane) const;
 
+    uint16_t GetIoLaneQpairId(const nof_io_lane *lane) const;
+
     // A segment's business lanes have one dispatcher owner. Release only
     // after its workers have drained all submitted requests.
     bool ClaimIoLanes(nof_seg_handle *seg, const void *owner);

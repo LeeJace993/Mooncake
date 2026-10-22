@@ -11,6 +11,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 #include "device/accelerator_registry.h"
 #include "mooncake_logging.h"
@@ -84,6 +86,31 @@ static int GetSpdkNofDebugIntervalMs() {
     return interval_ms;
 }
 
+namespace mooncake {
+int64_t GetSpdkNofSlowTraceThresholdUs() {
+    static const int64_t threshold_us = []() -> int64_t {
+        const char* raw_value =
+            std::getenv("MC_NOF_SLOW_TRACE_THRESHOLD_US");
+        if (!raw_value || raw_value[0] == '\0') {
+            return 0;
+        }
+        errno = 0;
+        char* end_ptr = nullptr;
+        const long long parsed = std::strtoll(raw_value, &end_ptr, 10);
+        if (errno != 0 || end_ptr == raw_value ||
+            (end_ptr != nullptr && *end_ptr != '\0') || parsed < 0 ||
+            parsed > 60000000) {
+            LOG(WARNING) << "Invalid value for "
+                         << "MC_NOF_SLOW_TRACE_THRESHOLD_US: " << raw_value
+                         << ", disabling slow trace";
+            return 0;
+        }
+        return static_cast<int64_t>(parsed);
+    }();
+    return threshold_us;
+}
+}  // namespace mooncake
+
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -137,6 +164,13 @@ static inline int64_t ElapsedMicros(
     std::chrono::steady_clock::time_point begin,
     std::chrono::steady_clock::time_point end) {
     return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+static inline int64_t SteadyNanos(
+    std::chrono::steady_clock::time_point value) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               value.time_since_epoch())
         .count();
 }
 
@@ -218,6 +252,8 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
     // after it is popped, so the queue and callback cannot complete it twice.
     if (task->remaining_lba == 0 && task->outstanding_sub_io == 0 &&
         !task->on_chain) {
+        const uint64_t lane_completion_sequence =
+            task->nof_qos ? ++task->nof_qos->completed_task_sequence : 0;
         std::optional<mooncake::NofTransferTiming> timing;
         if (task->timing && task->first_sub_io_submitted &&
             task->timing->submitted_sub_io_count > 0 &&
@@ -239,8 +275,14 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
                     .count();
             };
             timing.emplace();
+            timing->worker_index = task->worker_index;
             timing->lane = task->io_lane_index;
+            timing->qpair_id =
+                mooncake::SpdkWrapper::GetInstance().GetIoLaneQpairId(
+                    task->io_lane);
             timing->sub_io_count = task->timing->submitted_sub_io_count;
+            timing->lane_task_sequence = task->timing->lane_task_sequence;
+            timing->lane_completion_sequence = lane_completion_sequence;
             timing->qos_tasks_ahead_at_enqueue =
                 task->timing->qos_tasks_ahead_at_enqueue;
             timing->dispatch_queue_us =
@@ -282,6 +324,104 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
             timing->first_completion_to_complete_us =
                 elapsed_us(task->timing->first_completion_at, completed_at);
             timing->total_us = elapsed_us(task->queued_at, completed_at);
+            timing->queued_mono_ns = SteadyNanos(task->queued_at);
+            timing->first_submit_mono_ns =
+                SteadyNanos(task->timing->first_submit_at);
+            timing->last_submit_mono_ns =
+                SteadyNanos(task->timing->last_submit_at);
+            timing->completed_mono_ns = SteadyNanos(completed_at);
+            timing->max_sub_io_latency_us =
+                task->timing->max_sub_io_latency_us;
+            timing->max_sub_io_index = task->timing->max_sub_io_index;
+            timing->max_sub_io_cid = task->timing->max_sub_io_cid;
+            timing->max_sub_io_lba = task->timing->max_sub_io_lba;
+            timing->max_sub_io_blocks = task->timing->max_sub_io_blocks;
+            timing->max_sub_io_submit_mono_ns =
+                task->timing->max_sub_io_submit_mono_ns;
+            timing->max_sub_io_complete_mono_ns =
+                task->timing->max_sub_io_complete_mono_ns;
+            timing->max_completion_gap_us =
+                task->timing->max_completion_gap_us;
+            timing->max_completion_gap_begin_mono_ns =
+                task->timing->max_completion_gap_begin_mono_ns;
+            timing->max_completion_gap_end_mono_ns =
+                task->timing->max_completion_gap_end_mono_ns;
+            timing->max_poll_return_gap_us =
+                task->timing->max_poll_return_gap_us;
+            timing->max_poll_return_gap_begin_mono_ns =
+                task->timing->max_poll_return_gap_begin_mono_ns;
+            timing->max_poll_return_gap_end_mono_ns =
+                task->timing->max_poll_return_gap_end_mono_ns;
+            if (task->nof_qos) {
+                const auto counter_delta = [](uint64_t current,
+                                              uint64_t start) {
+                    return current >= start ? current - start : 0;
+                };
+                timing->poll_calls_during_task = counter_delta(
+                    task->nof_qos->poll_calls,
+                    task->timing->poll_calls_at_first_submit);
+                timing->empty_polls_during_task = counter_delta(
+                    task->nof_qos->empty_polls,
+                    task->timing->empty_polls_at_first_submit);
+                timing->polled_completions_during_task = counter_delta(
+                    task->nof_qos->polled_completions,
+                    task->timing->polled_completions_at_first_submit);
+            }
+        }
+        if (timing.has_value() &&
+            mooncake::GetSpdkNofSlowTraceThresholdUs() > 0 &&
+            timing->total_us >=
+                mooncake::GetSpdkNofSlowTraceThresholdUs()) {
+            MC_LOG(INFO)
+                << "nof_slow_task trace_id=" << task->state->trace_id()
+                << " worker_idx=" << timing->worker_index
+                << " lane=" << timing->lane
+                << " qpair_id=" << timing->qpair_id
+                << " lane_task_seq=" << timing->lane_task_sequence
+                << " lane_completion_seq="
+                << timing->lane_completion_sequence
+                << " lba=" << task->lba
+                << " blocks=" << task->lba_count
+                << " sub_ios=" << timing->sub_io_count
+                << " queued_mono_ns=" << timing->queued_mono_ns
+                << " first_submit_mono_ns="
+                << timing->first_submit_mono_ns
+                << " last_submit_mono_ns="
+                << timing->last_submit_mono_ns
+                << " completed_mono_ns=" << timing->completed_mono_ns
+                << " total_us=" << timing->total_us
+                << " fifo_us=" << timing->qos_fifo_wait_us
+                << " fifo_full_us=" << timing->qos_fifo_full_wait_us
+                << " fifo_partial_us=" << timing->qos_fifo_partial_wait_us
+                << " fifo_zero_us=" << timing->qos_fifo_zero_wait_us
+                << " credit_us=" << timing->credit_wait_us
+                << " submit_span_us=" << timing->first_to_last_submit_us
+                << " drain_us=" << timing->last_submit_to_complete_us
+                << " max_subio_us=" << timing->max_sub_io_latency_us
+                << " max_subio_idx=" << timing->max_sub_io_index
+                << " max_subio_cid=" << timing->max_sub_io_cid
+                << " max_subio_lba=" << timing->max_sub_io_lba
+                << " max_subio_blocks=" << timing->max_sub_io_blocks
+                << " max_subio_submit_mono_ns="
+                << timing->max_sub_io_submit_mono_ns
+                << " max_subio_complete_mono_ns="
+                << timing->max_sub_io_complete_mono_ns
+                << " max_completion_gap_us="
+                << timing->max_completion_gap_us
+                << " max_completion_gap_begin_mono_ns="
+                << timing->max_completion_gap_begin_mono_ns
+                << " max_completion_gap_end_mono_ns="
+                << timing->max_completion_gap_end_mono_ns
+                << " max_poll_return_gap_us="
+                << timing->max_poll_return_gap_us
+                << " max_poll_return_gap_begin_mono_ns="
+                << timing->max_poll_return_gap_begin_mono_ns
+                << " max_poll_return_gap_end_mono_ns="
+                << timing->max_poll_return_gap_end_mono_ns
+                << " poll_calls=" << timing->poll_calls_during_task
+                << " empty_polls=" << timing->empty_polls_during_task
+                << " polled_completions="
+                << timing->polled_completions_during_task;
         }
         task->state->set_completed(
             task->failed ? mooncake::ErrorCode::TRANSFER_FAIL
@@ -322,6 +462,46 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
     if (task->timing) {
+        const int64_t sub_io_latency_us =
+            ElapsedMicros(sub_task->submitted_at, completion_now);
+        if (sub_io_latency_us > task->timing->max_sub_io_latency_us) {
+            task->timing->max_sub_io_latency_us = sub_io_latency_us;
+            task->timing->max_sub_io_index = sub_task->sub_io_index;
+            task->timing->max_sub_io_cid = cpl->cid;
+            task->timing->max_sub_io_lba = sub_task->submit_lba;
+            task->timing->max_sub_io_blocks =
+                static_cast<uint32_t>(sub_task->submit_lba_count);
+            task->timing->max_sub_io_submit_mono_ns =
+                SteadyNanos(sub_task->submitted_at);
+            task->timing->max_sub_io_complete_mono_ns =
+                SteadyNanos(completion_now);
+        }
+        if (task->timing->previous_completion_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t completion_gap_us = ElapsedMicros(
+                task->timing->previous_completion_at, completion_now);
+            if (completion_gap_us > task->timing->max_completion_gap_us) {
+                task->timing->max_completion_gap_us = completion_gap_us;
+                task->timing->max_completion_gap_begin_mono_ns =
+                    SteadyNanos(task->timing->previous_completion_at);
+                task->timing->max_completion_gap_end_mono_ns =
+                    SteadyNanos(completion_now);
+            }
+        }
+        task->timing->previous_completion_at = completion_now;
+        if (nof_qos->last_poll_return_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t poll_return_gap_us =
+                ElapsedMicros(nof_qos->last_poll_return_at, completion_now);
+            if (poll_return_gap_us >
+                task->timing->max_poll_return_gap_us) {
+                task->timing->max_poll_return_gap_us = poll_return_gap_us;
+                task->timing->max_poll_return_gap_begin_mono_ns =
+                    SteadyNanos(nof_qos->last_poll_return_at);
+                task->timing->max_poll_return_gap_end_mono_ns =
+                    SteadyNanos(completion_now);
+            }
+        }
         if (task->timing->completed_sub_io_count == 0) {
             task->timing->first_completion_at = completion_now;
         }
@@ -674,14 +854,19 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
-        if (new_binding && IsSpdkNofDebugEnabled()) {
+        if (new_binding &&
+            (IsSpdkNofDebugEnabled() ||
+             GetSpdkNofSlowTraceThresholdUs() > 0)) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
                       << " lanes=" << lane_count;
             for (size_t lane_index = 0; lane_index < lane_count;
                  ++lane_index) {
+                auto* lane = wrapper.GetIoLane(seg, lane_index);
                 LOG(INFO) << "nof_lane_bind seg_handle=" << seg
                           << " lane=" << lane_index << " worker_idx="
-                          << binding.worker_indices[lane_index];
+                          << binding.worker_indices[lane_index]
+                          << " qpair_id="
+                          << wrapper.GetIoLaneQpairId(lane);
             }
         }
         if (new_binding && lane_count > static_cast<size_t>(worker_count_)) {
@@ -741,6 +926,11 @@ static inline bool CheckSubTaskPool(
 void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
+    if (IsSpdkNofDebugEnabled() ||
+        GetSpdkNofSlowTraceThresholdUs() > 0) {
+        LOG(INFO) << "nof_worker_thread worker_idx=" << work_idx
+                  << " tid=" << syscall(SYS_gettid);
+    }
 
     int64_t total_outstanding_io = 0;
     // std::set<nof_seg_handle *> seg_set;
@@ -793,6 +983,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     task->timing->worker_dequeued_at =
                         std::chrono::steady_clock::now();
                 }
+                task->worker_index = work_idx;
 
                 SpdkNofQos* nof_qos = nullptr;
                 auto it = lane_to_qos.find(task->io_lane);
@@ -878,6 +1069,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 }
                 if (task->timing) {
                     task->timing->qos_enqueued_at = qos_enqueue_now;
+                    task->timing->lane_task_sequence =
+                        nof_qos->enqueued_task_sequence + 1;
                     task->timing->qos_tasks_ahead_at_enqueue = tasks_ahead;
                     task->timing->qos_full_pending_at_enqueue_us =
                         nof_qos->inflight_full_with_pending_us;
@@ -887,6 +1080,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         nof_qos->inflight_zero_with_pending_us;
                     ++nof_qos->sampled_timing_tasks;
                 }
+                ++nof_qos->enqueued_task_sequence;
                 nof_qos->PushTask(task);
                 if (lane_was_empty) {
                     MarkNofTaskAsQosHead(nof_qos, task, qos_enqueue_now);
@@ -947,6 +1141,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         sub_task_pool.pop();
                         sub_task->task = task;
                         sub_task->submit_lba_count = submit_lba_count;
+                        sub_task->sub_io_index =
+                            static_cast<uint32_t>(task->idx);
+                        sub_task->submit_lba = submit_lba;
+                        const auto sub_io_submit_at =
+                            (debug_enabled || task->timing)
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
 #ifdef USE_NOF_URMA
                         // Modified By Yida (v3): GPU Direct——CUDA buffer 走
@@ -1040,11 +1241,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             if (track_occupancy) {
                                 const auto occupancy_now =
                                     std::chrono::steady_clock::now();
-                                if (debug_enabled) {
-                                    sub_task->submitted_at = occupancy_now;
-                                }
                                 UpdateNofOccupancy(nof_qos.get(),
                                                    occupancy_now);
+                            }
+                            if (debug_enabled || task->timing) {
+                                sub_task->submitted_at = sub_io_submit_at;
                             }
                             if (debug_enabled) {
                                 sub_task->track_latency = true;
@@ -1053,7 +1254,14 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                 task->first_sub_io_submitted = true;
                                 if (task->timing) {
                                     task->timing->first_submit_at =
-                                        std::chrono::steady_clock::now();
+                                        sub_io_submit_at;
+                                    task->timing->poll_calls_at_first_submit =
+                                        nof_qos->poll_calls;
+                                    task->timing->empty_polls_at_first_submit =
+                                        nof_qos->empty_polls;
+                                    task->timing
+                                        ->polled_completions_at_first_submit =
+                                        nof_qos->polled_completions;
                                     // Credit waited while at the head before
                                     // this first successful submit.  Submits
                                     // only run with avail_blocks > 0, so any
@@ -1169,6 +1377,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     qos.polled_completions += static_cast<uint64_t>(ret);
                 }
                 const auto now = std::chrono::steady_clock::now();
+                qos.last_poll_return_at = now;
                 if (ret > 0) qos.last_progress = now;
                 const bool timed_out =
                     (qos.inflight_blocks[0] > 0 || qos.inflight_blocks[1] > 0) &&
@@ -2497,7 +2706,8 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     const bool track_timing =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id) ||
+        GetSpdkNofSlowTraceThresholdUs() > 0;
     auto state =
         std::make_shared<SpdkNofOperationState>(trace_id, track_timing);
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,

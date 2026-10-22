@@ -417,6 +417,12 @@ uint32_t SpdkWrapper::GetIoLaneIndex(const nof_io_lane *lane) const {
     return lane == nullptr ? 0 : lane->index;
 }
 
+uint16_t SpdkWrapper::GetIoLaneQpairId(const nof_io_lane *lane) const {
+    return lane == nullptr || lane->qpair == nullptr
+               ? 0
+               : spdk_nvme_qpair_get_id(lane->qpair);
+}
+
 bool SpdkWrapper::ClaimIoLanes(nof_seg_handle *seg, const void *owner) {
     if (!seg || !owner) return false;
     std::lock_guard<std::mutex> lock(seg->lanes_mutex);
