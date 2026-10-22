@@ -23,6 +23,7 @@
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
 #include "spdiag/auto_perf.h"
+#include "transport/kunpeng_transport/ub_diagnostics.h"
 
 namespace mooncake {
 
@@ -326,13 +327,46 @@ void* UrmaContext::localSegWithIndex(unsigned value) {
     return local_tseg_list_.at(value);
 }
 
-int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
+int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
+                                      UbMemoryRegionType type) {
+#if !defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    if (type == UbMemoryRegionType::kGpu) {
+        LOG(ERROR) << "gdr-peermem requires URMA headers with is_gpu_seg; "
+                      "use staging or rebuild with a GPU-capable URMA SDK";
+        return ERR_INVALID_ARGUMENT;
+    }
+#endif
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    // The NVIDIA P2P bridge (udma_nv_p2p_bridge.c) requires the registration
+    // length to be 64KB-aligned; nvidia_p2p_get_pages returns -EINVAL
+    // otherwise. Round up GPU segments before any length checks. Host
+    // segments keep the caller's length.
+    if (type == UbMemoryRegionType::kGpu) {
+        constexpr size_t kGpuSegAlign = 64 * 1024;
+        length = (length + kGpuSegAlign - 1) & ~(kGpuSegAlign - 1);
+    }
+#endif
     if (length > (size_t)globalConfig().max_seg_size) {
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+        if (type == UbMemoryRegionType::kGpu) {
+            LOG(ERROR) << "GPU segment length " << length
+                       << " exceeds device max_seg_size "
+                       << globalConfig().max_seg_size;
+            return ERR_INVALID_ARGUMENT;
+        }
+#endif
         PLOG(WARNING) << "The buffer length exceeds device max_seg_size, "
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
     }
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    const uint32_t is_gpu_seg =
+        (type == UbMemoryRegionType::kGpu) ? 1 : 0;
+    LOG(INFO) << "Register memory region " << va << " length " << length
+              << " is_gpu_seg=" << is_gpu_seg;
+#else
     LOG(INFO) << "Register memory region " << va << " length " << length;
+#endif
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;
     flag.bs.cacheable = URMA_NON_CACHEABLE;
@@ -348,6 +382,9 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         .flag = flag,
         .user_ctx = (uintptr_t)NULL,
         .iova = 0,
+#if defined(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+        .is_gpu_seg = (type == UbMemoryRegionType::kGpu) ? 1 : 0,
+#endif
     };
     urma_target_seg_t* seg = urma_register_seg(urma_context_, &seg_cfg);
     if (!seg) {
@@ -467,8 +504,9 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
         if (device_name != devices[i]->name) continue;
 
         eid_list = urma_get_eid_list(devices[i], &eid_cnt);
-        if (eid_list == NULL) {
+        if (eid_list == NULL || eid_cnt == 0) {
             PLOG(ERROR) << "Failed to get eid list, device = " << device_name;
+            if (eid_list) urma_free_eid_list(eid_list);
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
@@ -489,11 +527,18 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        if (multipath()) {
-            // multipath on: BALANCE mode at IODIE level (chip-aware bonding).
+        static auto bondingModeSetEnabled = []() -> bool {
+            const char* env = std::getenv("MC_URMA_SET_BONDING_MODE");
+            return env && (std::string(env) == "1" || std::string(env) == "true" ||
+                           std::string(env) == "on");
+        };
+
+        if (bondingModeSetEnabled()) {
             bondp_set_bonding_mode_in_t mode{
-                .bonding_mode = BONDP_BONDING_MODE_BALANCE,
-                .bonding_level = BONDP_BONDING_LEVEL_IODIE};
+                .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
+                                           : BONDP_BONDING_MODE_STANDALONE,
+                .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
+                                            : BONDP_BONDING_LEVEL_PORT};
             urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
                                   .len = sizeof(mode),
                                   .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
@@ -501,35 +546,25 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             memset(&out, 0, sizeof(out));
             auto ret = urma_user_ctl(context, &in, &out);
             if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding BALANCE/IODIE mode, ret = "
+                LOG(ERROR) << "Failed to set bonding mode, ret = "
                            << ret;
+                (void)urma_delete_context(context);
+                urma_free_device_list(devices);
                 return ERR_CONTEXT;
             }
-            LOG(INFO) << "[multipath ON] bonding mode set on " << device_name
+            LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
+                      << "] bonding mode set on " << device_name
                       << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);
         } else {
-            // multipath off: explicitly set the bondp default (STANDALONE/PORT)
-            // instead of leaving it implicit.
-            bondp_set_bonding_mode_in_t mode{
-                .bonding_mode = BONDP_BONDING_MODE_STANDALONE,
-                .bonding_level = BONDP_BONDING_LEVEL_PORT};
-            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
-                                  .len = sizeof(mode),
-                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
-            urma_user_ctl_out_t out;
-            memset(&out, 0, sizeof(out));
-            auto ret = urma_user_ctl(context, &in, &out);
-            if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding STANDALONE/PORT mode, ret = "
-                           << ret;
-                return ERR_CONTEXT;
+            LOG(WARNING) << "Skipping urma_user_ctl SET_BONDING_MODE on " << device_name
+                         << " (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)";
+            if (multipath()) {
+                LOG(WARNING) << "Multipath requires a compatible bonding mode "
+                                "configured externally, or a fixed UMDK with "
+                                "MC_URMA_SET_BONDING_MODE=1";
             }
-            LOG(INFO) << "[multipath OFF] bonding mode set on " << device_name
-                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
-                      << " bonding_level="
-                      << bondingLevelToString(mode.bonding_level);
         }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
@@ -656,6 +691,20 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
         // MUST happen before markSuccess(): once that publishes completion,
         // the submitting thread may recycle the slice immediately.
         auto* depth = slice->ub.jetty_depth;
+        if (auto* metrics = CurrentUbWorkerMetrics()) {
+            const auto now = getCurrentTimeInNano();
+            const auto posted = static_cast<uint64_t>(slice->ts);
+            const auto elapsed = now >= posted ? now - posted : 0;
+            metrics->completion_wait_ns += elapsed;
+            metrics->completion_wait_max_ns =
+                std::max(metrics->completion_wait_max_ns, elapsed);
+            if (cr[i].status == URMA_CR_SUCCESS) {
+                ++metrics->completed_slices;
+                metrics->completed_bytes += slice->length;
+            } else {
+                ++metrics->failed_completions;
+            }
+        }
         auto it = jetty_depth_set.find(depth);
         if (it != jetty_depth_set.end())
             it->second++;
@@ -1144,6 +1193,13 @@ int UrmaEndpoint::submitPostSend(
     wr_count =
         std::min(int(globalConfig().max_jfc_e) - *jfc_outstanding_, wr_count);
     if (wr_count <= 0) {
+        if (auto* metrics = CurrentUbWorkerMetrics()) {
+            ++metrics->queue_blocked_calls;
+            metrics->jetty_full_calls +=
+                wr_depth_list_[jetty_index] >= max_wr_depth_;
+            metrics->jfc_full_calls +=
+                *jfc_outstanding_ >= int(globalConfig().max_jfc_e);
+        }
         if (queue_log) {
             const char* status =
                 jetty_before >= max_wr_depth_ ? "jetty_full" : "jfc_full";
@@ -1191,7 +1247,14 @@ int UrmaEndpoint::submitPostSend(
         wr.flag.bs.complete_enable = 1; wr.flag.bs.inline_flag = 0;
         auto it = imported_jetty_map_.find(jetty_list_[jetty_index]);
         wr.tjetty = (it != imported_jetty_map_.end()) ? it->second : nullptr;
-        slice->ts = getCurrentTimeInNano();
+        const auto posted_ns = getCurrentTimeInNano();
+        if (auto* metrics = CurrentUbWorkerMetrics()) {
+            metrics->RecordQueueWait(static_cast<uint64_t>(slice->ts),
+                                     posted_ns);
+            ++metrics->post_attempt_slices;
+            metrics->post_attempt_bytes += slice->length;
+        }
+        slice->ts = posted_ns;
         slice->status = Transport::Slice::POSTED;
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];
         // Set endpoint pointer for each slice before submitting
@@ -1272,6 +1335,10 @@ int UrmaEndpoint::submitPostSend(
                 bad_wr = bad_wr->next;
             }
         }
+    }
+    if (auto* metrics = CurrentUbWorkerMetrics()) {
+        metrics->posted_slices += wr_count - failed_post_count;
+        metrics->post_failed_slices += failed_post_count;
     }
     if (queue_log) {
         uint64_t total_bytes = 0;

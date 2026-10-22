@@ -139,6 +139,10 @@ class Transport {
         using CleanupCallback = void (*)(Slice *);
         CleanupCallback cleanup_callback = nullptr;
 
+        // Transport instrumentation runs before completion becomes visible.
+        using CompletionCallback = void (*)(Slice *, bool);
+        CompletionCallback completion_callback = nullptr;
+
         union {
             struct {
                 uint64_t dest_addr;
@@ -199,6 +203,7 @@ class Transport {
 
        public:
         void markSuccess() {
+            notifyCompletion(true);
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
@@ -211,6 +216,7 @@ class Transport {
         }
 
         void markFailed() {
+            notifyCompletion(false);
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
@@ -223,6 +229,12 @@ class Transport {
         volatile int64_t ts;
 
        private:
+        void notifyCompletion(bool success) {
+            auto callback = completion_callback;
+            completion_callback = nullptr;
+            if (callback) callback(this, success);
+        }
+
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
@@ -312,6 +324,7 @@ class Transport {
             // transport-specific cleanup callback into its next use.
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
+            slice->completion_callback = nullptr;
             if (cleanup) cleanup(slice);
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
