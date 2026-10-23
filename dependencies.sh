@@ -92,9 +92,9 @@ INSTALL_SPDK=false
 # v3 wire 兼容，但两端仍统一 v6：hdr+capsule 合并发送、TCP_NODELAY、poller
 # 批量排空、大 I/O 与 per-I/O trace 开关只在 v6 生效。
 # Modified By Yida (urma_enable_v2): SE_Review v2 生命周期收敛 (da037fbc7) 与
-# Round 7 阶段遥测 (9458829b0) 之后升级；wire v3→v4，两端必须同版本部署。
+# Round 7 v2 阶段遥测与 queued response 生命周期修复；wire v4，两端必须同版本部署。
 SPDK_URMA_REPO_DEFAULT="https://github.com/yyyuanhao426-hash/spdk.git"
-SPDK_URMA_REF_DEFAULT="9458829b04fa8c2f6c873395ef0d7018c5576758" # urma_enable_v2
+SPDK_URMA_REF_DEFAULT="4f8a8466d495df8bb9eb42d62e6b3282174b5e1e" # urma_enable_v2
 SPDK_REPO_URL=""
 SPDK_REF="v23.01.1"
 WITH_URMA=false
