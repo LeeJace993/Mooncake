@@ -20,6 +20,7 @@
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
+#include "transport/kunpeng_transport/urma/urma_eid.h"
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
 #include "spdiag/auto_perf.h"
@@ -484,6 +485,11 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
 
 int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                             int& eid_index) {
+    if (eid_index < 0) {
+        LOG(ERROR) << "Invalid URMA EID index " << eid_index << " for "
+                   << device_name << "; check MC_EID_INDEX";
+        return ERR_CONTEXT;
+    }
     int num_devices = 0;
     urma_context_t* context = nullptr;
     urma_device_t** devices = urma_get_device_list(&num_devices);
@@ -514,10 +520,17 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             LOG(INFO) << "device_name : " << device_name
                       << " EID : " << eid(eid_list[j].eid);
         }
-        if (eid_cnt > 0) {
-            eid_index = eid_list[0].eid_index;
+        const auto* selected_eid = findUrmaEid(eid_list, eid_cnt, eid_index);
+        if (!selected_eid) {
+            LOG(ERROR) << "URMA EID index " << eid_index << " not found on "
+                       << device_name << "; check MC_EID_INDEX; no fallback";
+            urma_free_eid_list(eid_list);
+            urma_free_device_list(devices);
+            return ERR_CONTEXT;
         }
-        eid_ = eid_list[0].eid;
+        eid_ = selected_eid->eid;
+        LOG(INFO) << "Selected URMA device " << device_name << ", EID index "
+                  << eid_index << ", EID " << eid();
         urma_free_eid_list(eid_list);
 
         context = urma_create_context(devices[i], eid_index);
