@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #ifdef USE_NOF
 #include <numa.h>
 #endif
@@ -427,11 +428,95 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+static std::optional<size_t> parse_replica_count_env(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<size_t>(std::stoull(raw));
+    } catch (const std::exception&) {
+        LOG(ERROR) << "Invalid " << name << "='" << raw
+                   << "', expected a non-negative integer; the environment "
+                      "variable is ignored and the caller's ReplicateConfig "
+                      "wins";
+        return std::nullopt;
+    }
+}
+
+// JD-Cases: 透明数据放置开关（上层应用不感知 NoF segment）。
+//
+// 部署侧通过环境变量选择写路径，应用侧 ReplicateConfig 无需任何改动：
+//   MC_NOF_REPLICA_NUM -> 覆盖 nof_replica_num（NoF SSD segment，
+//                         SPDK NoF 注册通道）
+//   MC_MEM_REPLICA_NUM -> 覆盖 replica_num（transfer engine 默认内存
+//                         segment）
+//
+// 未设置的环境变量不干预（保留调用方传入值；默认 replica_num=1/nof=0
+// 即纯内存语义）。常用组合：
+//   纯内存压测：MC_MEM_REPLICA_NUM=1（或两个都不设）
+//   纯 NoF 压测：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=0
+//     （mem=0 且 nof=1 为 strict 模式：NoF 段未注册时 put 显式失败
+//      NO_AVAILABLE_HANDLE，避免 1+1 FLEXIBLE 模式下的静默内存退化）
+//   1+1 双副本：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=1
+//
+// 两者解析结果均为 0 属配置错误：master 分配阶段会以 INVALID_PARAMS
+// 拒绝 PutStart（put 失败），客户端在此打一次 ERROR 便于定位。
+struct EnvReplicaPlacement {
+    std::optional<size_t> nof_replica_num;
+    std::optional<size_t> mem_replica_num;
+
+    EnvReplicaPlacement() {
+        nof_replica_num = parse_replica_count_env("MC_NOF_REPLICA_NUM");
+        mem_replica_num = parse_replica_count_env("MC_MEM_REPLICA_NUM");
+    }
+
+    bool active() const { return nof_replica_num || mem_replica_num; }
+};
+
+static void ApplyEnvReplicaPlacement(ReplicateConfig& config) {
+    static const EnvReplicaPlacement env_placement;
+    if (!env_placement.active()) {
+        return;
+    }
+    if (env_placement.nof_replica_num) {
+        config.nof_replica_num = *env_placement.nof_replica_num;
+    }
+    if (env_placement.mem_replica_num) {
+        config.replica_num = *env_placement.mem_replica_num;
+    }
+    static std::once_flag info_once;
+    // env_placement 具有静态存储期，lambda 无需捕获即可直接使用
+    std::call_once(info_once, [] {
+        LOG(INFO) << "Env replica placement override active:"
+                  << (env_placement.mem_replica_num
+                          ? " MC_MEM_REPLICA_NUM=" +
+                                std::to_string(*env_placement.mem_replica_num)
+                          : "")
+                  << (env_placement.nof_replica_num
+                          ? " MC_NOF_REPLICA_NUM=" +
+                                std::to_string(*env_placement.nof_replica_num)
+                          : "")
+                  << " (caller ReplicateConfig values are overridden on "
+                     "every write path)";
+    });
+    if (config.replica_num == 0 && config.nof_replica_num == 0) {
+        static std::once_flag zero_once;
+        std::call_once(zero_once, [] {
+            LOG(ERROR) << "Env replica placement resolved to 0 memory and 0 "
+                          "NoF replicas; master will reject every put with "
+                          "INVALID_PARAMS. Fix MC_MEM_REPLICA_NUM / "
+                          "MC_NOF_REPLICA_NUM";
+        });
+    }
+}
+
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
+    ApplyEnvReplicaPlacement(client_cfg);
     return client_cfg;
 }
 
