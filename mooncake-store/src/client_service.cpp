@@ -433,11 +433,27 @@ static std::optional<size_t> parse_replica_count_env(const char* name) {
     if (!raw || !*raw) {
         return std::nullopt;
     }
+    // Strict non-negative decimal integer: reject sign, whitespace, and
+    // trailing characters before parsing. std::stoull alone would silently
+    // accept "-1" (wrapping to ULLONG_MAX) and "1abc" (prefix parse), turning
+    // a typo into an astronomic replica count with an unrelated allocation
+    // failure far from the misconfiguration.
+    for (const char* p = raw; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            LOG(ERROR) << "Invalid " << name << "='" << raw
+                       << "', expected a non-negative decimal integer "
+                          "without sign, whitespace, or trailing "
+                          "characters; the environment variable is ignored "
+                          "and the caller's ReplicateConfig wins";
+            return std::nullopt;
+        }
+    }
     try {
         return static_cast<size_t>(std::stoull(raw));
     } catch (const std::exception&) {
+        // Only reachable on overflow now that the character set is checked.
         LOG(ERROR) << "Invalid " << name << "='" << raw
-                   << "', expected a non-negative integer; the environment "
+                   << "', value out of range for size_t; the environment "
                       "variable is ignored and the caller's ReplicateConfig "
                       "wins";
         return std::nullopt;
