@@ -4774,11 +4774,37 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
               << ", action=mount_segment, segment_name=" << segment.name;
 
     auto err = nof_segment_access.MountSegment(segment, client_id);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
+    if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         return tl::make_unexpected(err);
+    }
+
+    // Registration retries may use a new UUID for the same endpoint. Clear
+    // markers for the authoritative mounted segment, whose allocator is kept
+    // on an idempotent mount, rather than the incoming retry's name or UUID.
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    nof_segment_access.GetMountedSegments(mounted_segments);
+    auto mounted =
+        std::find_if(mounted_segments.begin(), mounted_segments.end(),
+                     [&segment](const auto& entry) {
+                         return entry.segment_id == segment.id;
+                     });
+    if (mounted == mounted_segments.end()) {
+        mounted = std::find_if(mounted_segments.begin(), mounted_segments.end(),
+                               [&segment](const auto& entry) {
+                                   return entry.segment.te_endpoint ==
+                                          segment.te_endpoint;
+                               });
+    }
+    if (mounted == mounted_segments.end()) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // Keep the segment lock until cleanup completes so an unmount cannot
+    // interleave. Match the segment -> invalid-endpoints lock order.
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        invalid_replica_endpoints_.erase(mounted->segment.te_endpoint);
+        invalid_replica_endpoints_.erase(mounted->segment.name);
+        invalid_replica_endpoints_.erase(UuidToString(mounted->segment.id));
     }
     return {};
 #endif
@@ -5161,11 +5187,19 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    for (const auto& segment : segments) {
+        // Share successful/idempotent mount recovery with the single-segment
+        // RPC. A batch may skip invalid entries; those must remain excluded.
+        auto result = MountNoFSegment(segment, client_id);
+        if (!result) {
+            if (result.error() == ErrorCode::INVALID_PARAMS) {
+                LOG(WARNING)
+                    << "NoF segment remount: segment_name=" << segment.name
+                    << ", warn=invalid_params";
+                continue;
+            }
+            return result;
+        }
     }
     return {};
 #endif

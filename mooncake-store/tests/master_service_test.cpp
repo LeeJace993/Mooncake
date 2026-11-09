@@ -670,6 +670,201 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 }
 
 #ifdef USE_NOF
+class NoFEndpointRecoveryTest : public MasterServiceTest,
+                                public ::testing::WithParamInterface<bool> {
+   protected:
+    std::unique_ptr<MasterService> MakeService() {
+        auto config = MasterServiceConfig::builder()
+                          .set_memory_allocator(BufferAllocatorType::OFFSET)
+                          .set_nof_heartbeat_interval_sec(3600)
+                          .build();
+        return std::make_unique<MasterService>(config);
+    }
+
+    tl::expected<void, ErrorCode> Mount(MasterService& service,
+                                        const NoFSegment& segment,
+                                        const UUID& client_id) {
+        return GetParam() ? service.ReMountNoFSegment({segment}, client_id)
+                          : service.MountNoFSegment(segment, client_id);
+    }
+
+    void ExpectAllocation(MasterService& service, const UUID& client_id,
+                          bool available) {
+        ReplicateConfig config;
+        config.replica_num = 0;
+        config.nof_replica_num = 1;
+        auto result = service.PutStart(client_id, "recovery_put",
+                                       TenantId::Default(), 1024, config);
+        if (available) {
+            ASSERT_TRUE(result.has_value());
+            ASSERT_EQ(result->replicas.size(), 1u);
+            EXPECT_TRUE(result->replicas[0].is_nof_replica());
+            EXPECT_TRUE(service
+                            .PutRevoke(client_id, "recovery_put",
+                                       TenantId::Default(),
+                                       ReplicaType::NOF_SSD)
+                            .has_value());
+        } else {
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
+};
+
+TEST_P(NoFEndpointRecoveryTest, FirstMountClearsReportedEndpoint) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    const auto segment = MakeNoFSegment("nof_recovery", "nof_recovery", 0);
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    ASSERT_TRUE(Mount(*service, segment, client_id).has_value());
+    ExpectAllocation(*service, client_id, true);
+}
+
+TEST_P(NoFEndpointRecoveryTest, IdempotentMountRestoresReadsAndAllocation) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    const auto segment = MakeNoFSegment("nof_recovery", "nof_endpoint", 0);
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "completed_nof", TenantId::Default(),
+                               1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "completed_nof", TenantId::Default(),
+                             ReplicaType::NOF_SSD)
+                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->ReportInvalidReplicaEndpoints(
+                {segment.te_endpoint, segment.name, UuidToString(segment.id)})
+            .has_value());
+    ExpectAllocation(*service, client_id, false);
+    auto unreadable =
+        service->GetReplicaList("completed_nof", TenantId::Default());
+    ASSERT_FALSE(unreadable.has_value());
+    ASSERT_TRUE(Mount(*service, segment, client_id).has_value());
+    ExpectAllocation(*service, client_id, true);
+    EXPECT_TRUE(service->GetReplicaList("completed_nof", TenantId::Default())
+                    .has_value());
+}
+
+TEST_P(NoFEndpointRecoveryTest, NewUuidClearsTheExistingSegmentMarkers) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    const auto segment = MakeNoFSegment("nof_recovery", "nof_endpoint", 0);
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        service
+            ->ReportInvalidReplicaEndpoints({segment.te_endpoint, segment.name})
+            .has_value());
+    ExpectAllocation(*service, client_id, false);
+    auto retry = segment;
+    retry.id = generate_uuid();
+    retry.name = "retry_name";
+    ASSERT_TRUE(Mount(*service, retry, generate_uuid()).has_value());
+    EXPECT_EQ(service->GetMountedNoFSegmentCountForTesting(), 1u);
+    ExpectAllocation(*service, client_id, true);
+}
+
+TEST_P(NoFEndpointRecoveryTest, UnmountThenRegisterRestoresSameEndpoint) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    auto segment = MakeNoFSegment("nof_recovery", "nof_recovery", 0);
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    ExpectAllocation(*service, client_id, false);
+    ASSERT_TRUE(service->UnmountNoFSegment(segment.id, client_id).has_value());
+    segment.id = generate_uuid();
+    ASSERT_TRUE(Mount(*service, segment, client_id).has_value());
+    ExpectAllocation(*service, client_id, true);
+}
+
+TEST_P(NoFEndpointRecoveryTest, InvalidMountKeepsEndpointExcluded) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    auto segment = MakeNoFSegment("nof_recovery", "nof_recovery", 0);
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    segment.size = 0;
+    auto result = Mount(*service, segment, client_id);
+    // Batch remount skips invalid entries, preserving its existing contract.
+    if (GetParam()) {
+        EXPECT_TRUE(result.has_value());
+    } else {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    ExpectAllocation(*service, client_id, false);
+}
+
+TEST_P(NoFEndpointRecoveryTest, RecoveryKeepsOtherEndpointsExcluded) {
+    auto service = MakeService();
+    const auto client_id = generate_uuid();
+    const auto recovered = MakeNoFSegment("recovered", "recovered", 0);
+    const auto other = MakeNoFSegment("other", "other", 0);
+    ASSERT_TRUE(service->MountNoFSegment(recovered, client_id).has_value());
+    ASSERT_TRUE(service->MountNoFSegment(other, client_id).has_value());
+    ASSERT_TRUE(service
+                    ->ReportInvalidReplicaEndpoints(
+                        {recovered.te_endpoint, other.te_endpoint})
+                    .has_value());
+    ASSERT_TRUE(Mount(*service, recovered, client_id).has_value());
+    ExpectAllocation(*service, client_id, true);
+    // Removing the recovered segment leaves only the still-invalid endpoint.
+    ASSERT_TRUE(
+        service->UnmountNoFSegment(recovered.id, client_id).has_value());
+    ExpectAllocation(*service, client_id, false);
+}
+
+TEST_F(MasterServiceTest, NoFRemountBatchOnlyRecoversSuccessfulEntries) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_memory_allocator(BufferAllocatorType::OFFSET)
+                            .set_nof_heartbeat_interval_sec(3600)
+                            .build();
+    MasterService service(config);
+    const auto client_id = generate_uuid();
+    const auto recovered = MakeNoFSegment("recovered", "recovered", 0);
+    auto invalid = MakeNoFSegment("invalid", "invalid", 0);
+    ASSERT_TRUE(service.MountNoFSegment(recovered, client_id).has_value());
+    ASSERT_TRUE(service.MountNoFSegment(invalid, client_id).has_value());
+    ASSERT_TRUE(service
+                    .ReportInvalidReplicaEndpoints(
+                        {recovered.te_endpoint, invalid.te_endpoint})
+                    .has_value());
+    invalid.size = 0;
+    ASSERT_TRUE(
+        service.ReMountNoFSegment({invalid, recovered}, client_id).has_value());
+    ReplicateConfig replicas;
+    replicas.replica_num = 0;
+    replicas.nof_replica_num = 1;
+    auto put = service.PutStart(client_id, "batch_recovery",
+                                TenantId::Default(), 1024, replicas);
+    ASSERT_TRUE(put.has_value());
+    ASSERT_EQ(put->replicas.size(), 1u);
+    EXPECT_EQ(put->replicas[0]
+                  .get_nof_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              recovered.te_endpoint);
+    ASSERT_TRUE(service
+                    .PutRevoke(client_id, "batch_recovery", TenantId::Default(),
+                               ReplicaType::NOF_SSD)
+                    .has_value());
+    ASSERT_TRUE(service.UnmountNoFSegment(recovered.id, client_id).has_value());
+    auto blocked = service.PutStart(client_id, "batch_recovery",
+                                    TenantId::Default(), 1024, replicas);
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+INSTANTIATE_TEST_SUITE_P(MountAndRemount, NoFEndpointRecoveryTest,
+                         ::testing::Bool());
+
 TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
