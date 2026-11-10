@@ -30,7 +30,6 @@
 
 #include "config.h"
 #include "ub_transport.h"
-#include "ub_worker_signal.h"
 
 namespace mooncake {
 class UbContext;
@@ -62,10 +61,6 @@ class UbWorkerPool {
 
     void transferWorker(int thread_id);
 
-    bool hasWorkerWork(int thread_id);
-
-    void wakePollingWorkers(int posting_thread_id);
-
     void monitorWorker();
 
     int doProcessContextEvents();
@@ -76,7 +71,8 @@ class UbWorkerPool {
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
     std::atomic<int> redispatch_counter_;
-    std::unique_ptr<UbWorkerSignal[]> worker_signals_;
+    std::mutex cond_mutex_;
+    std::condition_variable cond_var_;
     using SliceList = std::vector<Transport::Slice*>;
     const static int kShardCount = 8;
     std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];

@@ -440,23 +440,17 @@ struct MemcpyTask {
     std::vector<MemcpyOperation> operations;
     std::shared_ptr<MemcpyOperationState> state;
     uint64_t trace_id;
-    std::chrono::steady_clock::time_point submitted_at;
-    size_t queued_ahead = 0;
 
     MemcpyTask(std::vector<MemcpyOperation> ops,
                std::shared_ptr<MemcpyOperationState> s, uint64_t trace)
-        : operations(std::move(ops)),
-          state(std::move(s)),
-          trace_id(trace),
-          submitted_at(std::chrono::steady_clock::now()) {}
+        : operations(std::move(ops)), state(std::move(s)), trace_id(trace) {}
 };
 
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a bounded worker pool for accelerator copies and for
- * host copies when MC_STORE_MEMCPY_INLINE is disabled.
- * MC_STORE_MEMCPY_WORKERS controls the worker count.
+ * This class manages a single worker thread that executes memcpy operations
+ * asynchronously.
  */
 class MemcpyWorkerPool {
    public:
@@ -823,8 +817,6 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset);
 
-    // Co-located memory replicas are combined into one MemcpyTask when local
-    // memcpy is enabled. Mixed or remote batches use TransferEngine.
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
@@ -895,18 +887,12 @@ class TransferSubmitter {
                                 const std::vector<Slice>& slices) const;
 
     /**
-     * @brief Build and submit a memcpy operation
+     * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
-
-    /**
-     * @brief Execute host-only copies inline or enqueue accelerator copies
-     */
-    std::optional<TransferFuture> submitMemcpyOperations(
-        std::vector<MemcpyOperation> operations, uint64_t trace_id);
 
 #ifdef USE_NOF
     /**

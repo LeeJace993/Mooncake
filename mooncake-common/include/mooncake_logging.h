@@ -15,7 +15,7 @@ bool ShouldVLog(int level);
 void ApplyMooncakeLogEnableToGlog();
 
 // High-frequency log sampling.  Parses MC_HIFREQ_LOG_SAMPLE_RATE once (default
-// 0.1, clamped to [0,1]) and caches it process-wide.  ShouldSampleHiFreqLog()
+// 1.0, clamped to [0,1]) and caches it process-wide.  ShouldSampleHiFreqLog()
 // without an id rolls a thread-local RNG. The trace-id overload hashes the id
 // so all layers handling the same request make the same sampling decision.
 double HiFreqLogSampleRate();

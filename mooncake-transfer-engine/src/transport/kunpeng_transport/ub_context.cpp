@@ -209,13 +209,10 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
       redispatch_counter_(0),
-      worker_signals_(std::make_unique<UbWorkerSignal[]>(kTransferWorkerCount)),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     for (auto& i : slice_queue_count_) i.store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
-    LOG(INFO) << "UB worker scheduling: per-worker wait, workers="
-              << kTransferWorkerCount << " jfcs=" << context_.jfcCount();
     for (int i = 0; i < kTransferWorkerCount; ++i) {
         worker_thread_.emplace_back([this, i] { transferWorker(i); });
     }
@@ -223,11 +220,16 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
 }
 
 UbWorkerPool::~UbWorkerPool() {
-    workers_running_.store(false, std::memory_order_release);
-    for (int i = 0; i < kTransferWorkerCount; ++i) {
-        worker_signals_[i].notify();
+    if (workers_running_) {
+        // 先持锁更新退出条件，再通知：若先 notify 后置位，被唤醒的 worker
+        // 检查条件时 flag 尚未生效会回睡，此后再无通知，join() 将挂死。
+        {
+            std::lock_guard<std::mutex> lock(cond_mutex_);
+            workers_running_.store(false, std::memory_order_release);
+        }
+        cond_var_.notify_all();
+        for (auto& entry : worker_thread_) entry.join();
     }
-    for (auto& entry : worker_thread_) entry.join();
 }
 
 int UbWorkerPool::submitPostSend(
@@ -361,19 +363,26 @@ int UbWorkerPool::submitPostSend(
         slice_list_map[shard_id].push_back(slice);
         submitted_slice_count++;
     }
-    // Account before publishing: a woken worker may complete immediately.
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
     for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
         if (slice_list_map[shard_id].empty()) continue;
         slice_queue_lock_[shard_id].lock();
         for (auto& slice : slice_list_map[shard_id])
             slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
         slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
-                                               std::memory_order_release);
+                                               std::memory_order_relaxed);
         slice_queue_lock_[shard_id].unlock();
-        worker_signals_[shard_id % kTransferWorkerCount].notify();
     }
+    // 提交计数在 cond_mutex_ 临界区内更新：与 worker 的 predicate wait
+    // （wait_for(lock, pred)）构成完整的检查/更新/通知协调。旧实现的
+    // suspended_flag_ + 裸 notify 存在两个丢失唤醒窗口（flag 置位前提交
+    // 不通知；wait 启动前到达的 notify 因 cv 无记忆而丢失），导致空闲
+    // worker 睡满 1s 才轮询到新任务。
+    {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        submitted_slice_count_.fetch_add(submitted_slice_count,
+                                         std::memory_order_release);
+    }
+    cond_var_.notify_all();
     return 0;
 }
 
@@ -425,7 +434,6 @@ void UbWorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
-    bool advanced = false;
     for (auto& entry : local_slice_queue) {
         if (entry.second.empty()) continue;
         [[maybe_unused]] const auto prepare_start =
@@ -485,7 +493,6 @@ void UbWorkerPool::performPostSend(int thread_id) {
                 metrics->endpoint_prepare_max_ns,
                 static_cast<uint64_t>(elapsed));
         }
-        const auto before = entry.second.size();
         if (auto* metrics = CurrentUbWorkerMetrics()) {
             ++metrics->post_calls;
             SpDiag::PerfPoint point(PerfKey::UB_WORKER_POST_SEND,
@@ -505,13 +512,8 @@ void UbWorkerPool::performPostSend(int thread_id) {
         } else {
             endpoint->submitPostSend(entry.second, failed_slice_list);
         }
-        advanced |= entry.second.size() < before;
 #endif
     }
-
-    // Posting publishes JFC outstanding credits. Wake the owners after that
-    // publication, even when they observed zero credits and went to sleep.
-    if (advanced) wakePollingWorkers(thread_id);
 
     if (!failed_slice_list.empty()) {
         for (auto& slice : failed_slice_list) slice->ub.retry_cnt++;
@@ -530,10 +532,6 @@ void UbWorkerPool::performPoll(int thread_id) {
     std::vector<UbTransport::Slice*> deferred_success_slices;
     for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
          jfc_index += kTransferWorkerCount) {
-        if (__atomic_load_n(context_.outstandingCount(jfc_index),
-                            __ATOMIC_ACQUIRE) <= 0) {
-            continue;
-        }
         UbTransport::Slice* failed[kPollCount];
         int num_failed = 0;
         int nr_poll;
@@ -685,36 +683,6 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
     }
 }
 
-bool UbWorkerPool::hasWorkerWork(int thread_id) {
-    for (int shard = thread_id; shard < kShardCount;
-         shard += kTransferWorkerCount) {
-        if (slice_queue_count_[shard].load(std::memory_order_acquire) != 0)
-            return true;
-    }
-    // Only this worker accesses its private retry/post queues.
-    for (const auto& entry : collective_slice_queue_[thread_id]) {
-        if (!entry.second.empty()) return true;
-    }
-    for (int jfc = thread_id; jfc < context_.jfcCount();
-         jfc += kTransferWorkerCount) {
-        if (__atomic_load_n(context_.outstandingCount(jfc),
-                            __ATOMIC_ACQUIRE) > 0)
-            return true;
-    }
-    return false;
-}
-
-void UbWorkerPool::wakePollingWorkers(int posting_thread_id) {
-    for (int jfc = 0; jfc < context_.jfcCount(); ++jfc) {
-        const int owner = jfc % kTransferWorkerCount;
-        if (owner != posting_thread_id &&
-            __atomic_load_n(context_.outstandingCount(jfc),
-                            __ATOMIC_ACQUIRE) > 0) {
-            worker_signals_[owner].notify();
-        }
-    }
-}
-
 void UbWorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const bool diagnostics = UbWorkerDiagnosticsEnabled();
@@ -722,6 +690,8 @@ void UbWorkerPool::transferWorker(int thread_id) {
     current_worker_metrics = diagnostics ? &metrics : nullptr;
     uint64_t last_report_ns = diagnostics ? getCurrentTimeInNano() : 0;
     uint64_t last_active_ns = 0;
+    const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms, as in perf
+    uint64_t last_wait_ts = getCurrentTimeInNano();
     const auto report = [&](uint64_t now_ns, bool final) {
         size_t assigned_shards = 0, assigned_jfcs = 0;
         for (int s = thread_id; s < kShardCount; s += kTransferWorkerCount) {
@@ -799,22 +769,32 @@ void UbWorkerPool::transferWorker(int thread_id) {
                 report(now, false);
             }
         }
-        if (!hasWorkerWork(thread_id)) {
-            last_active_ns = 0;
-            const auto ready = [&] {
-                return !workers_running_.load(std::memory_order_relaxed) ||
-                       hasWorkerWork(thread_id);
-            };
-            if (diagnostics) {
-                ++metrics.idle_wait_calls;
-                const auto start = getCurrentTimeInNano();
-                // Timed waits keep idle-worker interval reports available.
-                worker_signals_[thread_id].waitFor(
-                    ready,
-                    std::chrono::nanoseconds(WorkerDiagnosticIntervalNs()));
-                metrics.idle_wait_ns += getCurrentTimeInNano() - start;
-            } else {
-                worker_signals_[thread_id].wait(ready);
+        auto processed_slice_count =
+            processed_slice_count_.load(std::memory_order_relaxed);
+        auto submitted_slice_count =
+            submitted_slice_count_.load(std::memory_order_relaxed);
+        if (processed_slice_count == submitted_slice_count) {
+            uint64_t curr_wait_ts = getCurrentTimeInNano();
+            if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
+                std::unique_lock<std::mutex> lock(cond_mutex_);
+                // predicate wait：条件已在锁内重查，提交与唤醒的竞态窗口
+                // 关闭。保留 1s 超时作兜底——redispatch() 重入本地队列不
+                // 递增 submitted_slice_count_，纯 wait 在该场景会永久睡眠。
+                if (diagnostics) ++metrics.idle_wait_calls;
+                const auto wait_start =
+                    diagnostics ? getCurrentTimeInNano() : 0;
+                cond_var_.wait_for(lock, std::chrono::seconds(1), [this] {
+                    return !workers_running_.load(std::memory_order_acquire) ||
+                           processed_slice_count_.load(
+                               std::memory_order_acquire) !=
+                               submitted_slice_count_.load(
+                                   std::memory_order_acquire);
+                });
+                if (diagnostics) {
+                    metrics.idle_wait_ns += getCurrentTimeInNano() - wait_start;
+                }
+                last_active_ns = 0;
+                last_wait_ts = curr_wait_ts;
             }
             continue;
         }
