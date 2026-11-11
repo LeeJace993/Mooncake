@@ -7,7 +7,9 @@
 #include <set>
 #include <sstream>
 
+#include "master_perf.h"
 #include "vsegment/vsegment_metrics.h"
+#include "vsegment/vsegment_oplog_mode.h"
 
 namespace mooncake::vsegment {
 namespace {
@@ -178,7 +180,8 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                         "PutStart route epoch is stale"};
             auto existing_operation = operation_vsegments_.find(operation_id);
             if (existing_operation != operation_vsegments_.end()) {
-                // Reuse the reservation, but still wait for its submission.
+                // Reuse the reservation and propagate its latest accepted
+                // journal fence to the caller's durability policy.
                 auto managed = vsegments_.find(existing_operation->second);
                 if (managed == vsegments_.end())
                     return {ErrorCode::INTERNAL_ERROR, operation_id, {},
@@ -216,11 +219,20 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 }
                 std::string detail;
                 operation_vsegments_.emplace(operation_id, id);
-                // 锁收窄：提交（delta 构建 + seq 分配）在锁内完成，durable
-                // 等待移到锁外 fence 收口——partition mutex 不再横跨 etcd
-                // 往返。失败回滚语义不变：提交失败发生在锁内，照旧回滚。
-                auto persisted = PersistDeferredLocked("logical_reserve",
-                                                       &detail, &fence);
+                ErrorCode persisted = ErrorCode::OK;
+                if (VSegmentOplogAlignedMode()) {
+                    // aligned：只写一条 O(1) 的 reservation 记录，
+                    // 不做全量状态序列化、不产生 durable 等待。
+                    persisted = committer_->CommitReservation(
+                        partition_id_, operation_id, id, reservation.range,
+                        route_epoch_);
+                    if (persisted != ErrorCode::OK) {
+                        detail = "failed to persist vsegment reservation";
+                    }
+                } else {
+                    persisted = PersistDeferredLocked("logical_reserve",
+                                                      &detail, &fence);
+                }
                 if (persisted != ErrorCode::OK) {
                     operation_vsegments_.erase(operation_id);
                     managed.logical_allocator->Restore(before);
@@ -492,8 +504,18 @@ ReservationResult VSegmentManager::ReservePut(
             operation_vsegments_.emplace(operation_id, vsegment_id).second;
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        const auto persisted = PersistDeferredLocked("logical_reserve", &detail,
-                                                     &fence);
+        ErrorCode persisted = ErrorCode::OK;
+        if (VSegmentOplogAlignedMode()) {
+            persisted = committer_->CommitReservation(
+                partition_id_, operation_id, vsegment_id, result.range,
+                route_epoch_);
+            if (persisted != ErrorCode::OK) {
+                detail = "failed to persist vsegment reservation";
+            }
+        } else {
+            persisted =
+                PersistDeferredLocked("logical_reserve", &detail, &fence);
+        }
         if (persisted != ErrorCode::OK) {
             if (inserted) operation_vsegments_.erase(operation_id);
             managed->second.logical_allocator->Restore(before);
@@ -548,8 +570,10 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
         if (result != ErrorCode::OK) return result;
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        const auto persisted = PersistDeferredLocked("logical_commit", nullptr,
-                                                     &fence);
+        const auto persisted =
+            VSegmentOplogAlignedMode()
+                ? ErrorCode::OK
+                : PersistDeferredLocked("logical_commit", nullptr, &fence);
         if (persisted != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
             return persisted;
@@ -582,8 +606,14 @@ ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
                                       max_operation_tombstones_);
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        const auto persisted = PersistDeferredLocked("logical_abort", nullptr,
-                                                     &fence);
+        ErrorCode persisted = ErrorCode::OK;
+        if (VSegmentOplogAlignedMode()) {
+            persisted = committer_->CommitRelease(partition_id_, operation_id,
+                                                  route_epoch_);
+        } else {
+            persisted =
+                PersistDeferredLocked("logical_abort", nullptr, &fence);
+        }
         if (persisted != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
             operation_vsegments_ = operations_before;
@@ -612,8 +642,14 @@ ErrorCode VSegmentManager::RollbackPutReservation(
         operation_vsegments_.erase(operation_id);
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        const auto persisted = PersistDeferredLocked("logical_abort", nullptr,
-                                                     &fence);
+        ErrorCode persisted = ErrorCode::OK;
+        if (VSegmentOplogAlignedMode()) {
+            persisted = committer_->CommitRelease(partition_id_, operation_id,
+                                                  route_epoch_);
+        } else {
+            persisted =
+                PersistDeferredLocked("logical_abort", nullptr, &fence);
+        }
         if (persisted != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
             operation_vsegments_ = operations_before;
@@ -676,7 +712,9 @@ ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
         }
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        const auto persisted = PersistDeferredLocked("logical_release",
+        const auto persisted = VSegmentOplogAlignedMode()
+                                   ? ErrorCode::OK
+                                   : PersistDeferredLocked("logical_release",
                                                       nullptr, &fence);
         if (persisted != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
@@ -706,7 +744,9 @@ ErrorCode VSegmentManager::ForgetOperation(const std::string& operation_id) {
         operation_vsegments_.erase(operation);
         // 锁收窄：提交在锁内完成，durable 等待移到锁外 fence 收口（语义
         // 同原同步持久化；失败回滚不变）。
-        result = PersistDeferredLocked("operation_gc", nullptr, &fence);
+        if (!VSegmentOplogAlignedMode()) {
+            result = PersistDeferredLocked("operation_gc", nullptr, &fence);
+        }
         if (result != ErrorCode::OK) {
             managed->second.logical_allocator->Restore(before);
             operation_vsegments_.emplace(operation_id, vsegment_id);
@@ -822,8 +862,13 @@ ErrorCode VSegmentManager::PersistDeferredLocked(
     std::shared_ptr<VSegmentDeferredCommitHandle> handle;
     // committer 不支持延迟（默认回退同步 Commit）时 handle 为空且 entry
     // 已 durable，语义与 PersistLocked 等价。
-    auto result = committer_->CommitDeferred(SnapshotLocked(), mutation,
-                                              &handle, detail);
+    SpDiag::PerfPoint pt_snapshot(PerfKey::VSEGMENT_STATE_SNAPSHOT,
+                                  SpDiag::PerfLevel::MODULE);
+    pt_snapshot.Start();
+    auto snapshot = SnapshotLocked();
+    pt_snapshot.End(0);
+    auto result =
+        committer_->CommitDeferred(snapshot, mutation, &handle, detail);
     if (result != ErrorCode::OK) {
         --metadata_revision_;
         VSegmentMetrics::Instance().IncPersistenceFailure();
@@ -923,7 +968,8 @@ ErrorCode VSegmentManager::Restore(
 
 ErrorCode VSegmentManager::ReconcileObjectReferences(
     const std::vector<VSegmentObjectReference>& references,
-    std::string* detail) {
+    std::string* detail,
+    const std::vector<PendingReservation>& pending_reservations) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!owned_) return ErrorCode::STALE_ROUTE;
     std::unordered_map<std::string, std::vector<VSegmentObjectReference>>
@@ -949,6 +995,13 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
     std::unordered_map<std::string, LogicalAllocationSnapshot> before;
     const auto operations_before = operation_vsegments_;
     std::unordered_map<std::string, std::string> reconciled_operations;
+    std::unordered_map<std::string, std::vector<PendingReservation>>
+        pending_by_vsegment;
+    for (const auto& pending : pending_reservations) {
+        if (!pending.vsegment_id.empty() && !pending.operation_id.empty()) {
+            pending_by_vsegment[pending.vsegment_id].push_back(pending);
+        }
+    }
     for (auto& [vsegment_id, managed] : vsegments_) {
         before.emplace(vsegment_id, managed.logical_allocator->Snapshot());
         LogicalAllocationSnapshot desired;
@@ -978,6 +1031,33 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
                         state.logical_allocator->Restore(snapshot->second);
                 }
                 return ErrorCode::INVALID_PARAMS;
+            }
+        }
+        const auto pending_it = pending_by_vsegment.find(vsegment_id);
+        if (pending_it != pending_by_vsegment.end()) {
+            for (const auto& pending : pending_it->second) {
+                if (reconciled_operations.count(pending.operation_id) != 0) {
+                    continue;  // 已被 committed 对象覆盖
+                }
+                const LogicalRange range = pending.range;
+                bool overlaps = (range.length == 0);
+                for (const auto& taken : occupied) {
+                    if (range.offset < taken.offset + taken.length &&
+                        taken.offset < range.offset + range.length) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps) {
+                    LOG(WARNING) << "reconcile: dropping pending reservation "
+                                 << pending.operation_id
+                                 << " (overlaps committed range or empty)";
+                    continue;
+                }
+                occupied.push_back(range);
+                desired.reservations.push_back({pending.operation_id, range});
+                reconciled_operations.emplace(pending.operation_id,
+                                              vsegment_id);
             }
         }
         std::sort(occupied.begin(), occupied.end(), [](const auto& left,

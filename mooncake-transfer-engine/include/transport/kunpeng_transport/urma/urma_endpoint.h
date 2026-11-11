@@ -27,6 +27,7 @@
 #include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
+#include "transport/kunpeng_transport/urma/urma_compat.h"
 
 namespace mooncake {
 struct UrmaJFC {
@@ -192,13 +193,27 @@ class UrmaEndpoint : public UbEndPoint {
    private:
     std::vector<uint32_t> JettyNum() const;
 
-    int doSetupConnection(const std::string& peer_eid,
-                          std::vector<uint32_t> peer_jetty_num_list,
-                          std::string* reply_msg = nullptr);
+    // Export per-jetty peer info for the handshake: driver-delegated rjetty
+    // blob (hex) when urma_get_rjetty is available, plus id/uasid/trans_mode
+    // used by the receiver's hand-fill fallback. Blobs are exported fresh on
+    // every handshake: they are transient per-peer-pair data and jetty list
+    // may have been rebuilt since the previous handshake.
+    void exportJettyInfos(TransferMetadata::HandShakeDesc& desc) const;
 
-    int doSetupConnection(int qp_index, const std::string& peer_eid,
-                          uint32_t peer_jetty_num,
-                          std::string* reply_msg = nullptr);
+    int doSetupConnection(
+        const std::string& peer_eid,
+        std::vector<uint32_t> peer_jetty_num_list,
+        std::string* reply_msg = nullptr,
+        const std::vector<TransferMetadata::HandShakeDesc::PeerJettyInfo>*
+            peer_jetty_infos = nullptr,
+        int peer_trans_mode = -1);
+
+    int doSetupConnection(
+        int qp_index, const std::string& peer_eid, uint32_t peer_jetty_num,
+        std::string* reply_msg = nullptr,
+        const TransferMetadata::HandShakeDesc::PeerJettyInfo* peer_jetty_info =
+            nullptr,
+        int peer_trans_mode = -1);
 
    private:
     UrmaContext* context_;

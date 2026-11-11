@@ -101,9 +101,23 @@ struct TransferHandshakeUtil {
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
+        if (desc.trans_mode >= 0) root["trans_mode"] = desc.trans_mode;
+        if (!desc.jetty_infos.empty()) {
+            Json::Value jettyInfos(Json::arrayValue);
+            for (const auto &info : desc.jetty_infos) {
+                Json::Value item;
+                item["id"] = info.id;
+                item["uasid"] = info.uasid;
+                item["rjetty"] = info.rjetty;
+                jettyInfos.append(item);
+            }
+            root["jetty_infos"] = jettyInfos;
+        }
         MC_LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
                      << " peer_nic_path is " << desc.peer_nic_path
-                     << " jetty_num size is " << desc.jetty_num.size();
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " jetty_infos size is " << desc.jetty_infos.size()
+                     << " trans_mode is " << desc.trans_mode;
         pt.End(0);
 #endif
         return root;
@@ -155,9 +169,25 @@ struct TransferHandshakeUtil {
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
+        if (root.isMember("trans_mode") && root["trans_mode"].isInt()) {
+            desc.trans_mode = root["trans_mode"].asInt();
+        } else {
+            desc.trans_mode = -1;
+        }
+        if (root.isMember("jetty_infos") && root["jetty_infos"].isArray()) {
+            for (const auto &item : root["jetty_infos"]) {
+                TransferMetadata::HandShakeDesc::PeerJettyInfo info;
+                info.id = item["id"].asUInt();
+                info.uasid = item["uasid"].asUInt();
+                info.rjetty = item["rjetty"].asString();
+                desc.jetty_infos.push_back(std::move(info));
+            }
+        }
         MC_LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
                      << " peer_nic_path is " << desc.peer_nic_path
-                     << " jetty_num size is " << desc.jetty_num.size();
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " jetty_infos size is " << desc.jetty_infos.size()
+                     << " trans_mode is " << desc.trans_mode;
         pt.End(0);
 #endif
         return 0;

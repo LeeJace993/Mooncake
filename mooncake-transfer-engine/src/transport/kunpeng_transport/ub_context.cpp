@@ -321,6 +321,15 @@ int UbWorkerPool::submitPostSend(
         auto targetSegment =
             peer_segment_desc->buffers[buffer_id].tseg[device_id];
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        if (!slice->ub.r_seg) {
+            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id=" << device_id
+                       << " dest_addr=" << slice->ub.dest_addr;
+            slice->markFailed();
+            failed_target_ids[slice->target_id] = getCurrentTimeInNano();
+            continue;
+        }
         if (context_.numa_affinity()) {
             const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
             int data_numa = parseCpuNumaNode(peer_buf.name);
@@ -335,8 +344,7 @@ int UbWorkerPool::submitPostSend(
                         kNumaAffinitySampleInterval ==
                     0) {
                 VLOG(2) << "[numa_affinity] remote_sample trace_id="
-                        << slice->trace_id << " target_id="
-                        << slice->target_id
+                        << slice->trace_id << " target_id=" << slice->target_id
                         << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"
@@ -345,12 +353,6 @@ int UbWorkerPool::submitPostSend(
                         << " dst_chip=" << (int)slice->ub.dst_chip_id
                         << " remote_name=" << peer_buf.name;
             }
-        }
-        if (!slice->ub.r_seg) {
-            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
-                       << slice->target_id << " buffer_id=" << buffer_id
-                       << " device_id" << device_id
-                       << " dest_addr=" << slice->ub.dest_addr;
         }
         auto peer_nic_path =
             MakeNicPath(peer_segment_desc->nicPathServerName(),
@@ -644,6 +646,16 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             auto targetSegment =
                 peer_segment_desc->buffers[buffer_id].tseg[device_id];
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+            if (!slice->ub.r_seg) {
+                LOG(ERROR) << "[UB] retrieveRemoteSeg failed while "
+                              "redispatching target_id="
+                           << slice->target_id << " buffer_id=" << buffer_id
+                           << " device_id=" << device_id
+                           << " dest_addr=" << slice->ub.dest_addr;
+                slice->markFailed();
+                processed_slice_count_++;
+                continue;
+            }
             if (context_.numa_affinity()) {
                 const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
                 int data_numa = parseCpuNumaNode(peer_buf.name);
@@ -659,8 +671,7 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                         0) {
                     VLOG(2)
                         << "[numa_affinity] remote_redispatch_sample trace_id="
-                        << slice->trace_id << " target_id="
-                        << slice->target_id
+                        << slice->trace_id << " target_id=" << slice->target_id
                         << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"

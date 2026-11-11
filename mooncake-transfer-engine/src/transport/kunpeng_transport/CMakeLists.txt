@@ -11,6 +11,7 @@ if (URMA_LIBRARY)
     target_link_libraries(ub_transport
             PUBLIC
             ${URMA_LIBRARY}
+            ${CMAKE_DL_LIBS}
     )
     message(STATUS "Using real URMA library: ${URMA_LIBRARY}")
 else()
@@ -18,6 +19,7 @@ else()
     # For now, just build without mock_urma_api.cpp
     list(APPEND UB_SOURCES "urma/mock_urma.cpp")
     add_library(ub_transport OBJECT ${UB_SOURCES})
+    target_compile_definitions(ub_transport PRIVATE MOONCAKE_MOCK_URMA=1)
     message(WARNING "Not Found liburma.so building ub_transport with Mock URMA library")
 endif()
 target_include_directories(ub_transport
@@ -58,4 +60,5 @@ target_link_libraries(ub_transport
         glog::glog
         pthread
         SpDiag::spdiag_lib
+        ${CMAKE_DL_LIBS}
 )
