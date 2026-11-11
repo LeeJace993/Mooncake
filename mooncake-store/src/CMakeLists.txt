@@ -348,28 +348,30 @@ if(USE_NOF)
         ""
         CACHE PATH "UMDK install prefix for the SPDK URMA transport")
     find_path(
-      URMA_INCLUDE_DIR
+      NOF_URMA_INCLUDE_DIR
       NAMES urma_api.h
       HINTS ${UMDK_ROOT}
       PATHS /usr /usr/local
       PATH_SUFFIXES include/ub/umdk/urma include/ub/umdk include)
     find_library(
-      URMA_LIBRARY
+      NOF_URMA_LIBRARY
       NAMES urma
       HINTS ${UMDK_ROOT}
       PATHS /usr /usr/local
       PATH_SUFFIXES lib64 lib build/lib lib)
-    if(NOT URMA_INCLUDE_DIR OR NOT URMA_LIBRARY)
+    if(NOT NOF_URMA_INCLUDE_DIR OR NOT NOF_URMA_LIBRARY)
       message(
         FATAL_ERROR
           "USE_NOF_URMA=ON but UMDK (urma_api.h / liburma) not found; \
 pass -DUMDK_ROOT=/path/to/umdk-prefix")
     endif()
-    message(STATUS "NoF URMA: include=${URMA_INCLUDE_DIR} lib=${URMA_LIBRARY}")
+    message(
+      STATUS
+        "NoF URMA: include=${NOF_URMA_INCLUDE_DIR} lib=${NOF_URMA_LIBRARY}")
     include(CheckCXXSourceCompiles)
     set(_NOF_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
     set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR}
-                                ${URMA_INCLUDE_DIR})
+                                ${NOF_URMA_INCLUDE_DIR})
     check_cxx_source_compiles("
 #include <spdk/nvme_urma.h>
 static_assert(sizeof(decltype(&spdk_nvme_urma_register_memory_for_qpair)) > 0);
@@ -377,7 +379,7 @@ int main() { return 0; }
 " HAVE_SPDK_URMA_WHOLE_POOL)
     set(CMAKE_REQUIRED_INCLUDES ${_NOF_REQUIRED_INCLUDES})
     unset(_NOF_REQUIRED_INCLUDES)
-    list(APPEND SPDK_STATIC_LIBS ${URMA_LIBRARY})
+    list(APPEND SPDK_STATIC_LIBS ${NOF_URMA_LIBRARY})
   endif()
 
   # Modified By Yida (v3): NoF GPU Direct —— provider 使用 CUDA driver API
@@ -405,7 +407,7 @@ if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})
   if(USE_NOF_URMA)
-    target_include_directories(mooncake_store PRIVATE ${URMA_INCLUDE_DIR})
+    target_include_directories(mooncake_store PRIVATE ${NOF_URMA_INCLUDE_DIR})
     if(HAVE_SPDK_URMA_WHOLE_POOL)
       target_compile_definitions(mooncake_store PRIVATE HAVE_SPDK_URMA_WHOLE_POOL=1)
     endif()

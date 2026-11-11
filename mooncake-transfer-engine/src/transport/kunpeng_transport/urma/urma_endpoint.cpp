@@ -22,7 +22,6 @@
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
-#include "transport/kunpeng_transport/urma/urma_eid.h"
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
 #include "spdiag/auto_perf.h"
@@ -619,11 +618,6 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
 
 int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                             int& eid_index) {
-    if (eid_index < 0) {
-        LOG(ERROR) << "Invalid URMA EID index " << eid_index << " for "
-                   << device_name << "; check MC_EID_INDEX";
-        return ERR_CONTEXT;
-    }
     int num_devices = 0;
     urma_context_t* context = nullptr;
     urma_device_t** devices = urma_get_device_list(&num_devices);
@@ -654,17 +648,9 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             LOG(INFO) << "device_name : " << device_name
                       << " EID : " << eid(eid_list[j].eid);
         }
-        const auto* selected_eid = findUrmaEid(eid_list, eid_cnt, eid_index);
-        if (!selected_eid) {
-            LOG(ERROR) << "URMA EID index " << eid_index << " not found on "
-                       << device_name << "; check MC_EID_INDEX; no fallback";
-            urma_free_eid_list(eid_list);
-            urma_free_device_list(devices);
-            return ERR_CONTEXT;
-        }
-        eid_ = selected_eid->eid;
-        LOG(INFO) << "Selected URMA device " << device_name << ", EID index "
-                  << eid_index << ", EID " << eid();
+        // Preserve native UB automatic selection, independent of NoF settings.
+        eid_index = eid_list[0].eid_index;
+        eid_ = eid_list[0].eid;
         urma_free_eid_list(eid_list);
 
         context = urma_create_context(devices[i], eid_index);
@@ -674,45 +660,29 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        static auto bondingModeSetEnabled = []() -> bool {
-            const char* env = std::getenv("MC_URMA_SET_BONDING_MODE");
-            return env && (std::string(env) == "1" || std::string(env) == "true" ||
-                           std::string(env) == "on");
-        };
-
-        if (bondingModeSetEnabled()) {
-            bondp_set_bonding_mode_in_t mode{
-                .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
-                                           : BONDP_BONDING_MODE_STANDALONE,
-                .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
-                                            : BONDP_BONDING_LEVEL_PORT};
-            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
-                                  .len = sizeof(mode),
-                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
-            urma_user_ctl_out_t out;
-            memset(&out, 0, sizeof(out));
-            auto ret = urma_user_ctl(context, &in, &out);
-            if (ret != URMA_SUCCESS) {
-                LOG(ERROR) << "Failed to set bonding mode, ret = "
-                           << ret;
-                (void)urma_delete_context(context);
-                urma_free_device_list(devices);
-                return ERR_CONTEXT;
-            }
-            LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
-                      << "] bonding mode set on " << device_name
-                      << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
-                      << " bonding_level="
-                      << bondingLevelToString(mode.bonding_level);
-        } else {
-            LOG(WARNING) << "Skipping urma_user_ctl SET_BONDING_MODE on " << device_name
-                         << " (MC_URMA_SET_BONDING_MODE not set; legacy UMDK compat)";
-            if (multipath()) {
-                LOG(WARNING) << "Multipath requires a compatible bonding mode "
-                                "configured externally, or a fixed UMDK with "
-                                "MC_URMA_SET_BONDING_MODE=1";
-            }
+        // Configure native UB bonding for both multipath modes.
+        bondp_set_bonding_mode_in_t mode{
+            .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
+                                        : BONDP_BONDING_MODE_STANDALONE,
+            .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
+                                         : BONDP_BONDING_LEVEL_PORT};
+        urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
+                              .len = sizeof(mode),
+                              .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
+        urma_user_ctl_out_t out;
+        memset(&out, 0, sizeof(out));
+        ret = urma_user_ctl(context, &in, &out);
+        if (ret != URMA_SUCCESS) {
+            LOG(ERROR) << "Failed to set bonding mode, ret = " << ret;
+            (void)urma_delete_context(context);
+            urma_free_device_list(devices);
+            return ERR_CONTEXT;
         }
+        LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
+                  << "] bonding mode set on " << device_name
+                  << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
+                  << " bonding_level="
+                  << bondingLevelToString(mode.bonding_level);
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
             PLOG(ERROR) << "Failed to query dev attr( " << device_name << " ) ";

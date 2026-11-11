@@ -1,20 +1,15 @@
-// nof_buffer_alignment_test.cpp
-// Modified By Yida (v3): USE_NOF_URMA 下 ClientBufferAllocator 的对齐矩阵
-// 测试（512B/4KiB/128KiB/1MiB）。base 与子分配的 size/ptr 需满足 NoF 提交的
-// 块对齐校验（submitSpdkNofOperation 要求 buffer_address_ % block_size == 0、
-// size % block_size == 0）；kNofBufferAlignment=4096 时 512B sector 亦满足。
+// NoF build options must not change ordinary client-buffer payload lengths.
 #include "client_buffer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
-#include <memory>
+#include <cstring>
 #include <vector>
 
 namespace mooncake {
-
-#if defined(USE_NOF_URMA)
 
 class NofBufferAlignmentTest : public ::testing::Test {
    protected:
@@ -25,77 +20,55 @@ class NofBufferAlignmentTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
-// 对齐矩阵：512B / 4KiB / 128KiB / 1MiB（含非 4K 倍数的 512B）
-TEST_F(NofBufferAlignmentTest, AllocateAlignmentMatrix) {
-    constexpr size_t kTotalSize = 64ull * 1024 * 1024;
-    const std::vector<size_t> kSizes = {512, 4096, 128 * 1024, 1024 * 1024};
-
-    auto allocator = ClientBufferAllocator::create(kTotalSize, "", false,
-                                                   /*use_spdk_dma=*/true);
-    ASSERT_NE(allocator, nullptr);
-
-    // base 必须页对齐
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocator->getBase()) %
-                  kNofBufferAlignment,
-              0u)
-        << "allocator base is not 4K aligned";
-
-    for (size_t size : kSizes) {
-        auto handle = allocator->allocate(size);
-        ASSERT_TRUE(handle.has_value()) << "allocate(" << size << ") failed";
-        const auto addr = reinterpret_cast<uintptr_t>(handle->ptr());
-        EXPECT_EQ(addr % 512, 0u) << "512B sector misaligned, size=" << size;
-        EXPECT_EQ(handle->size() % 512, 0u)
-            << "512B sector misaligned size, requested=" << size;
-        EXPECT_EQ(addr % kNofBufferAlignment, 0u)
-            << "4K misaligned ptr, requested=" << size;
-        EXPECT_EQ(handle->size() % kNofBufferAlignment, 0u)
-            << "4K misaligned size, requested=" << size;
-
-        // 写入并读回，确认区间可用
-        std::memset(handle->ptr(), 0x5A, handle->size());
-        EXPECT_EQ(static_cast<uint8_t*>(handle->ptr())[0], 0x5A);
-        EXPECT_EQ(static_cast<uint8_t*>(handle->ptr())[handle->size() - 1],
-                  0x5A);
-    }
-}
-
-// 顺序分配偏移量均为页对齐（freed 区间重用后仍保持）
-TEST_F(NofBufferAlignmentTest, RepeatedAllocationStaysPageAligned) {
-    constexpr size_t kChunk = 128 * 1024;
-    auto allocator = ClientBufferAllocator::create(16 * kChunk, "", false,
-                                                   /*use_spdk_dma=*/true);
-    ASSERT_NE(allocator, nullptr);
-
-    for (int round = 0; round < 3; ++round) {
-        std::vector<std::optional<BufferHandle>> handles;
-        for (int i = 0; i < 8; ++i) {
-            auto handle = allocator->allocate(kChunk + i * 512);
-            ASSERT_TRUE(handle.has_value());
-            EXPECT_EQ(
-                reinterpret_cast<uintptr_t>(handle->ptr()) %
-                    kNofBufferAlignment,
-                0u)
-                << "round=" << round << " i=" << i;
-            handles.push_back(std::move(handle));
-        }
-        // 析构释放后进入下一轮，验证空闲复用路径同样保持对齐
-    }
-}
-
-#else  // !USE_NOF_URMA
-
-// 未启用 USE_NOF_URMA 时行为不变：64B 对齐、size 不取整
-TEST(NofBufferAlignmentDisabledTest, UnalignedSmallAllocationKept) {
-    auto allocator = ClientBufferAllocator::create(1024 * 1024, "", false,
+TEST_F(NofBufferAlignmentTest, OrdinaryAllocationKeepsLogicalSize) {
+    auto allocator = ClientBufferAllocator::create(4 * 1024 * 1024, "", false,
                                                    /*use_spdk_dma=*/false);
     ASSERT_NE(allocator, nullptr);
-    auto handle = allocator->allocate(512);
-    ASSERT_TRUE(handle.has_value());
-    EXPECT_EQ(handle->size(), 512u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocator->getBase()) % 64, 0u);
+    for (size_t size : {1u, 63u, 64u, 511u, 512u, 513u, 4095u, 4096u, 4097u,
+                        128u * 1024, 1024u * 1024}) {
+        SCOPED_TRACE(size);
+        auto handle = allocator->allocate(size);
+        ASSERT_TRUE(handle.has_value());
+        EXPECT_EQ(handle->size(), size);
+        auto slices = split_into_slices(*handle);
+        size_t payload_size = 0;
+        for (const auto& slice : slices) payload_size += slice.size;
+        EXPECT_EQ(payload_size, size);
+    }
 }
 
-#endif
+TEST_F(NofBufferAlignmentTest, SmallValuesShareAnExternalBufferWithoutPadding) {
+    alignas(64) std::array<unsigned char, 4096> buffer{};
+    auto allocator =
+        ClientBufferAllocator::create(buffer.data(), buffer.size());
+    ASSERT_NE(allocator, nullptr);
+    std::vector<BufferHandle> handles;
+    for (unsigned char value = 1; value <= 8; ++value) {
+        auto handle = allocator->allocate(64);
+        ASSERT_TRUE(handle.has_value());
+        ASSERT_EQ(handle->size(), 64u);
+        std::memset(handle->ptr(), value, handle->size());
+        handles.push_back(std::move(*handle));
+    }
+    for (size_t i = 0; i < handles.size(); ++i) {
+        EXPECT_EQ(static_cast<unsigned char*>(handles[i].ptr())[0], i + 1);
+    }
+}
+
+TEST_F(NofBufferAlignmentTest, NofSectorSizedPayloadIsNotExpandedToFourKiB) {
+    alignas(4096) std::array<unsigned char, 8192> buffer{};
+    auto allocator =
+        ClientBufferAllocator::create(buffer.data(), buffer.size());
+    auto first = allocator->allocate(512);
+    auto second = allocator->allocate(512);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(first->size(), 512u);
+    EXPECT_EQ(second->size(), 512u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(first->ptr()) % 512, 0u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(second->ptr()) % 512, 0u);
+}
 
 }  // namespace mooncake
 

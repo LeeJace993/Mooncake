@@ -48,24 +48,15 @@ TEST_F(EidIndexEnvTest, UnsetPreservesConfiguredIndex) {
     EXPECT_EQ(config.eid_index, 4);
 }
 
-TEST_F(EidIndexEnvTest, AcceptsPortAndPrimaryIndices) {
-    for (int index : {0, 1, 4, 5, std::numeric_limits<int>::max()}) {
-        ASSERT_EQ(::setenv("MC_EID_INDEX", std::to_string(index).c_str(), 1), 0);
-        GlobalConfig config;
-        loadGlobalConfig(config);
-        EXPECT_EQ(config.eid_index, index);
-    }
-}
-
-TEST_F(EidIndexEnvTest, MalformedOverrideDisablesUbInsteadOfUsingDefault) {
-    for (const char* value : {"", "-1", "-2", "abc", "1junk", "1.0", " 1",
-                              "1 ", "+1", "0x1", "999999999999999999999"}) {
+TEST_F(EidIndexEnvTest, NofEnvironmentDoesNotOverrideNativeUbConfiguration) {
+    for (const char* value : {"0", "1", "4", "5", "", "-1", "abc", "1junk",
+                              "999999999999999999999"}) {
         SCOPED_TRACE(value);
         ASSERT_EQ(::setenv("MC_EID_INDEX", value, 1), 0);
         GlobalConfig config;
         config.eid_index = 4;
         loadGlobalConfig(config);
-        EXPECT_EQ(config.eid_index, -1);
+        EXPECT_EQ(config.eid_index, 4);
     }
 }
 

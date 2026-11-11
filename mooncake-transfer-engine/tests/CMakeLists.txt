@@ -215,12 +215,6 @@ endif()
 
 # UB transport test with URMA endpoint and mock support
 if(USE_UB)
-  add_executable(urma_eid_test ${WORKSPACE}/urma_eid_test.cpp)
-  target_include_directories(urma_eid_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include ${urma_INCLUDE_DIR})
-  target_link_libraries(urma_eid_test PRIVATE gtest gtest_main)
-  add_test(NAME urma_eid_test COMMAND urma_eid_test)
-
   add_executable(urma_compat_test ${WORKSPACE}/urma_compat_test.cpp)
   target_include_directories(urma_compat_test PRIVATE ${urma_INCLUDE_DIR})
   target_link_libraries(urma_compat_test PRIVATE transfer_engine gtest
