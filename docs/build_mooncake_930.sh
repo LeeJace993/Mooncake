@@ -470,7 +470,10 @@ for b in mooncake_master mooncake_client; do
     [ -x "$INSTALL_PREFIX/bin/$b" ] && ok "$INSTALL_PREFIX/bin/$b" \
         || { warn "缺失 $INSTALL_PREFIX/bin/$b"; MISS=1; }
 done
-python -c "from mooncake.store import MooncakeDistributedNoFRegister; print('  store.so OK')" \
+# store.so NEEDED liburma.so.0：系统 /usr/lib64 解析到旧版（缺 urma_register_seg_dmabuf），
+# import 验收必须前置 UMDK 扩展版 lib 目录，否则误报导入失败
+LD_LIBRARY_PATH="$(dirname "$UMDK_LIB"):$INSTALL_PREFIX/lib:/usr/local/lib64:/usr/local/lib" \
+    python -c "from mooncake.store import MooncakeDistributedNoFRegister; print('  store.so OK')" \
     || { warn "store.so 导入失败"; MISS=1; }
 [ "$MISS" = 0 ] || die "验收未通过（见上）"
 
