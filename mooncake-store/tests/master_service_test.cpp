@@ -669,6 +669,197 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
 }
 
+class MemoryEndpointRecoveryTest : public MasterServiceTest,
+                                   public ::testing::WithParamInterface<bool> {
+   protected:
+    std::unique_ptr<MasterService> MakeService() {
+        auto config = MasterServiceConfig::builder()
+                          .set_memory_allocator(BufferAllocatorType::OFFSET)
+                          .set_client_live_ttl_sec(3600)
+                          .build();
+        return std::make_unique<MasterService>(config);
+    }
+
+    void MountOwner(MasterService& service, const Segment& segment,
+                    const UUID& client_id) {
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+        auto ping = service.Ping(client_id);
+        ASSERT_TRUE(ping.has_value());
+        ASSERT_EQ(ping->client_status, ClientStatus::OK);
+    }
+
+    tl::expected<void, ErrorCode> Recover(MasterService& service,
+                                          const Segment& segment,
+                                          const UUID& client_id) {
+        return GetParam() ? service.ReMountSegment({segment}, client_id)
+                          : service.MountSegment(segment, client_id);
+    }
+
+    void ExpectAllocation(MasterService& service, const UUID& client_id,
+                          bool available) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.nof_replica_num = 0;
+        auto result = service.PutStart(client_id, "memory_recovery_put",
+                                       TenantId::Default(), 1024, config);
+        if (available) {
+            ASSERT_TRUE(result.has_value());
+            ASSERT_EQ(result->replicas.size(), 1u);
+            EXPECT_TRUE(result->replicas[0].is_memory_replica());
+            EXPECT_TRUE(service
+                            .PutRevoke(client_id, "memory_recovery_put",
+                                       TenantId::Default(), ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
+};
+
+TEST_P(MemoryEndpointRecoveryTest, OwnerRemountRestoresReadsAndAllocation) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    auto segment = MakeSegment("memory_recovery");
+    segment.te_endpoint = "memory_endpoint";
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, segment, owner));
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(*service, owner, "completed_memory", config);
+
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+    EXPECT_FALSE(
+        service->GetReplicaList("completed_memory", TenantId::Default())
+            .has_value());
+    for (int i = 0; i < 2; ++i) {
+        auto ping = service->Ping(owner);
+        ASSERT_TRUE(ping.has_value());
+        EXPECT_EQ(ping->client_status, ClientStatus::NEED_REMOUNT);
+    }
+    // A heartbeat requests recovery; it must not remove the exclusion itself.
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+
+    ASSERT_TRUE(Recover(*service, segment, owner).has_value());
+    auto ping = service->Ping(owner);
+    ASSERT_TRUE(ping.has_value());
+    // ReportInvalidReplicaEndpoints also records the UUID. A leftover UUID
+    // would keep requesting recovery and exclude this segment from vsegments.
+    EXPECT_EQ(ping->client_status, ClientStatus::OK);
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, true));
+    EXPECT_TRUE(service->GetReplicaList("completed_memory", TenantId::Default())
+                    .has_value());
+}
+
+TEST_P(MemoryEndpointRecoveryTest, RecoveryRejectsWrongOwnerAndDescriptor) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto segment = MakeSegment("memory_recovery");
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, segment, owner));
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    auto wrong_owner = Recover(*service, segment, generate_uuid());
+    ASSERT_FALSE(wrong_owner.has_value());
+    EXPECT_EQ(wrong_owner.error(), ErrorCode::INVALID_PARAMS);
+    auto changed = segment;
+    changed.size /= 2;
+    auto wrong_descriptor = Recover(*service, changed, owner);
+    ASSERT_FALSE(wrong_descriptor.has_value());
+    EXPECT_EQ(wrong_descriptor.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+}
+
+TEST_P(MemoryEndpointRecoveryTest, PartialRecoveryKeepsOtherSegmentExcluded) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto first = MakeSegment("first");
+    const auto second = MakeSegment("second");
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, first, owner));
+    ASSERT_TRUE(service->MountSegment(second, owner).has_value());
+    ASSERT_TRUE(service
+                    ->ReportInvalidReplicaEndpoints(
+                        {first.te_endpoint, second.te_endpoint})
+                    .has_value());
+    ASSERT_TRUE(Recover(*service, first, owner).has_value());
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+    ASSERT_TRUE(service->UnmountSegment(first.id, owner).has_value());
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+    ASSERT_TRUE(Recover(*service, second, owner).has_value());
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::OK);
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, true));
+}
+
+TEST_P(MemoryEndpointRecoveryTest, SubsequentFailureRequestsRecoveryAgain) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto segment = MakeSegment("memory_recovery");
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, segment, owner));
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(
+            service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                .has_value());
+        EXPECT_EQ(service->Ping(owner)->client_status,
+                  ClientStatus::NEED_REMOUNT);
+        ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+        ASSERT_TRUE(Recover(*service, segment, owner).has_value());
+        EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::OK);
+        ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, true));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(MountAndRemount, MemoryEndpointRecoveryTest,
+                         ::testing::Bool());
+
+TEST_F(MemoryEndpointRecoveryTest, FullRemountClearsAllReportedAliases) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto segment = MakeSegment("memory_recovery");
+    // A first mount has not yet marked this client OK. Exercise the complete
+    // remount path, rather than the already-remounted fast path.
+    ASSERT_TRUE(service->MountSegment(segment, owner).has_value());
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, owner).has_value());
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::OK);
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, true));
+}
+
+TEST_F(MemoryEndpointRecoveryTest, UnrelatedOwnerDoesNotNeedRemount) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto other_owner = generate_uuid();
+    const auto segment = MakeSegment("memory_recovery");
+    const auto other = MakeSegment("other_memory");
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, segment, owner));
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, other, other_owner));
+    ASSERT_TRUE(service->ReportInvalidReplicaEndpoints({segment.te_endpoint})
+                    .has_value());
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(service->Ping(other_owner)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MemoryEndpointRecoveryTest, InvalidBatchDoesNotPartiallyRecover) {
+    auto service = MakeService();
+    const auto owner = generate_uuid();
+    const auto first = MakeSegment("first");
+    auto second = MakeSegment("second");
+    ASSERT_NO_FATAL_FAILURE(MountOwner(*service, first, owner));
+    ASSERT_TRUE(service->MountSegment(second, owner).has_value());
+    ASSERT_TRUE(service
+                    ->ReportInvalidReplicaEndpoints(
+                        {first.te_endpoint, second.te_endpoint})
+                    .has_value());
+    second.size /= 2;
+    auto result = service->ReMountSegment({first, second}, owner);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_NO_FATAL_FAILURE(ExpectAllocation(*service, owner, false));
+    EXPECT_EQ(service->Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+}
+
 #ifdef USE_NOF
 class NoFEndpointRecoveryTest : public MasterServiceTest,
                                 public ::testing::WithParamInterface<bool> {

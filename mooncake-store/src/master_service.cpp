@@ -4691,6 +4691,13 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 
         auto err = segment_access.MountSegment(segment, client_id);
         if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            // Only the registered owner with the same descriptor may clear
+            // endpoint quarantine through an idempotent mount.
+            auto validation =
+                segment_access.ValidateRemountSegment(segment, client_id);
+            if (validation != ErrorCode::OK) {
+                return tl::make_unexpected(validation);
+            }
             // Return OK because this is an idempotent operation
             mount_result = err;
         } else if (err != ErrorCode::OK) {
@@ -4897,12 +4904,24 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     return tl::make_unexpected(validation);
                 }
             }
-        }
-        if (ok_client_.contains(client_id)) {
-            LOG(WARNING) << "client_id=" << client_id
-                         << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
-            return {};
+            if (ok_client_.contains(client_id)) {
+                // Client liveness and endpoint quarantine are independent.
+                // The owner may be acknowledging a recovery requested by
+                // Ping, even though its heartbeat never expired. Keep the
+                // segment lock so unmount cannot race this cleanup.
+                std::lock_guard<std::shared_mutex> invalid_lock(
+                    invalid_endpoints_mutex_);
+                for (const auto& segment : segments) {
+                    Segment mounted;
+                    if (!segment_access.GetSegment(segment.id, mounted)) {
+                        continue;
+                    }
+                    invalid_replica_endpoints_.erase(mounted.te_endpoint);
+                    invalid_replica_endpoints_.erase(mounted.name);
+                    invalid_replica_endpoints_.erase(UuidToString(mounted.id));
+                }
+                return {};
+            }
         }
 
         {
@@ -5164,6 +5183,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     invalid_replica_endpoints_.erase(
                         restore.segment.te_endpoint);
                     invalid_replica_endpoints_.erase(restore.segment.name);
+                    invalid_replica_endpoints_.erase(
+                        UuidToString(restore.segment.id));
                 }
                 standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
                 standby_allocator_keepalive_.erase(restore.segment.name);
@@ -11209,6 +11230,34 @@ auto MasterService::Ping(const UUID& client_id)
             client_status = ClientStatus::OK;
         } else {
             client_status = ClientStatus::NEED_REMOUNT;
+        }
+    }
+    if (client_status == ClientStatus::OK) {
+        bool has_invalid_endpoints;
+        {
+            std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+            has_invalid_endpoints = !invalid_replica_endpoints_.empty();
+        }
+        // Usually the exclusion set is empty. Only consult the registry when
+        // recovery may be needed, keeping this off the data transfer path.
+        if (has_invalid_endpoints) {
+            auto segment_access = segment_manager_.getSegmentAccess();
+            std::vector<Segment> segments;
+            if (segment_access.GetClientSegments(client_id, segments) ==
+                ErrorCode::OK) {
+                std::shared_lock<std::shared_mutex> lock(
+                    invalid_endpoints_mutex_);
+                for (const auto& segment : segments) {
+                    if (invalid_replica_endpoints_.contains(
+                            segment.te_endpoint) ||
+                        invalid_replica_endpoints_.contains(segment.name) ||
+                        invalid_replica_endpoints_.contains(
+                            UuidToString(segment.id))) {
+                        client_status = ClientStatus::NEED_REMOUNT;
+                        break;
+                    }
+                }
+            }
         }
     }
     PodUUID pod_client_id = {client_id.first, client_id.second};
