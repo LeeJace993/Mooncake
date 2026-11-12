@@ -18,6 +18,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <mutex>
 #include "config.h"
 #include "mooncake_logging.h"
@@ -661,6 +662,10 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             return ERR_CONTEXT;
         }
         // Configure native UB bonding for both multipath modes.
+        // Only bonding devices understand BONDP_USER_CTL_SET_BONDING_MODE;
+        // on plain udma devices the opcode value collides with
+        // UDMA_U_USER_CTL_DELETE_JETTY_EX and crashes the provider.
+        if (strncmp(devices[i]->name, "bonding", 7) == 0) {
         bondp_set_bonding_mode_in_t mode{
             .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
                                         : BONDP_BONDING_MODE_STANDALONE,
@@ -679,10 +684,11 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             return ERR_CONTEXT;
         }
         LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
-                  << "] bonding mode set on " << device_name
-                  << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
-                  << " bonding_level="
-                  << bondingLevelToString(mode.bonding_level);
+                  << "] bonding mode set on " << device_name;
+        } else {
+            LOG(INFO) << "skip bonding mode config on non-bonding device: "
+                      << devices[i]->name;
+        }
         ret = urma_query_device(devices[i], &dev_attr_);
         if (ret) {
             PLOG(ERROR) << "Failed to query dev attr( " << device_name << " ) ";
