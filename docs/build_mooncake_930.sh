@@ -416,6 +416,9 @@ CMAKE_ARGS=(
   -DCMAKE_MODULE_LINKER_FLAGS="-L$(dirname "$UMDK_LIB")"
 )
 [ -n "$UMDK_ROOT" ] && CMAKE_ARGS+=(-DUMDK_ROOT="$UMDK_ROOT")
+# NoF 段 find_library(NOF_URMA_LIBRARY) 默认命中系统 /usr/lib64/liburma.so
+# （旧版缺 urma_register_seg_dmabuf 符号），显式喂 UMDK 扩展版路径避免链接失败
+[ -n "$UMDK_LIB" ] && CMAKE_ARGS+=(-DNOF_URMA_LIBRARY="$UMDK_LIB" -DNOF_URMA_INCLUDE_DIR="$UMDK_INC")
 [ "${#SPDIAG_ARGS[@]}" -gt 0 ] && CMAKE_ARGS+=("${SPDIAG_ARGS[@]}")
 echo "  cmake -S $SRC_ROOT -B $BUILD_DIR ${CMAKE_ARGS[*]}"
 cmake -S "$SRC_ROOT" -B "$BUILD_DIR" "${CMAKE_ARGS[@]}"
