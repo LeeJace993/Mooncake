@@ -661,30 +661,32 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
-        // Configure native UB bonding for both multipath modes.
-        // Only bonding devices understand BONDP_USER_CTL_SET_BONDING_MODE;
-        // on plain udma devices the opcode value collides with
-        // UDMA_U_USER_CTL_DELETE_JETTY_EX and crashes the provider.
+        // Bonding opcodes are provider-specific: opcode 7 deletes a jetty on
+        // bare UDMA devices. Match the bonding-device guard used by YLT.
         if (strncmp(devices[i]->name, "bonding", 7) == 0) {
-        bondp_set_bonding_mode_in_t mode{
-            .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
-                                        : BONDP_BONDING_MODE_STANDALONE,
-            .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
-                                         : BONDP_BONDING_LEVEL_PORT};
-        urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
-                              .len = sizeof(mode),
-                              .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
-        urma_user_ctl_out_t out;
-        memset(&out, 0, sizeof(out));
-        ret = urma_user_ctl(context, &in, &out);
-        if (ret != URMA_SUCCESS) {
-            LOG(ERROR) << "Failed to set bonding mode, ret = " << ret;
-            (void)urma_delete_context(context);
-            urma_free_device_list(devices);
-            return ERR_CONTEXT;
-        }
-        LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
-                  << "] bonding mode set on " << device_name;
+            bondp_set_bonding_mode_in_t mode{
+                .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
+                                            : BONDP_BONDING_MODE_STANDALONE,
+                .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
+                                             : BONDP_BONDING_LEVEL_PORT};
+            urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
+                                  .len = sizeof(mode),
+                                  .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
+            urma_user_ctl_out_t out;
+            memset(&out, 0, sizeof(out));
+            ret = urma_user_ctl(context, &in, &out);
+            if (ret != URMA_SUCCESS) {
+                LOG(ERROR) << "Failed to set bonding mode, ret = " << ret;
+                (void)urma_delete_context(context);
+                urma_free_device_list(devices);
+                return ERR_CONTEXT;
+            }
+            LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
+                      << "] bonding mode set on " << device_name
+                      << " bonding_mode="
+                      << bondingModeToString(mode.bonding_mode)
+                      << " bonding_level="
+                      << bondingLevelToString(mode.bonding_level);
         } else {
             LOG(INFO) << "skip bonding mode config on non-bonding device: "
                       << devices[i]->name;
