@@ -187,6 +187,9 @@ static inline void MarkNofTaskAsQosHead(
         task->timing->qos_head_at ==
             std::chrono::steady_clock::time_point{}) {
         task->timing->qos_head_at = now;
+        task->timing->available_blocks_at_head =
+            nof_qos->inflight_blocks_limit - nof_qos->inflight_blocks[0] -
+            nof_qos->inflight_blocks[1];
         const auto counter_delta = [](uint64_t current, uint64_t start) {
             return static_cast<int64_t>(current >= start ? current - start : 0);
         };
@@ -374,16 +377,47 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
                     task->timing->polled_completions_at_first_submit);
             }
         }
+        const auto slow_threshold = mooncake::GetSpdkNofSlowTraceThresholdUs();
         if (timing.has_value() &&
-            mooncake::GetSpdkNofSlowTraceThresholdUs() > 0 &&
-            timing->total_us >=
-                mooncake::GetSpdkNofSlowTraceThresholdUs()) {
+            ((slow_threshold > 0 && timing->total_us >= slow_threshold) ||
+             (task->timing->vsegment_op_id &&
+              mooncake::logging::ShouldSampleHiFreqLog(task->state->trace_id())))) {
             MC_LOG(INFO)
                 << "nof_slow_task trace_id=" << task->state->trace_id()
                 << " worker_idx=" << timing->worker_index
                 << " lane=" << timing->lane
                 << " qpair_id=" << timing->qpair_id
                 << " lane_task_seq=" << timing->lane_task_sequence
+                << " vsegment_op_id=" << task->timing->vsegment_op_id
+                << " child_idx=" << task->timing->vsegment_child_index
+                << " child_count=" << task->timing->vsegment_child_count
+                << " endpoint='" << task->timing->vsegment_endpoint << "'"
+                << " offset_bytes=" << task->timing->vsegment_offset_bytes
+                << " length_bytes=" << task->timing->vsegment_length_bytes
+                << " qos_enqueue_mono_ns="
+                << SteadyNanos(task->timing->qos_enqueued_at)
+                << " qos_head_mono_ns="
+                << SteadyNanos(task->timing->qos_head_at)
+                << " qos_tasks_ahead="
+                << task->timing->qos_tasks_ahead_at_enqueue
+                << " enqueue_head_seq=" << task->timing->head_seq_at_enqueue
+                << " enqueue_head_remaining_blocks="
+                << task->timing->head_remaining_blocks_at_enqueue
+                << " head_available_blocks="
+                << task->timing->available_blocks_at_head
+                << " task_backpressure_eagain="
+                << task->timing->backpressure_eagain
+                << " task_backpressure_enomem="
+                << task->timing->backpressure_enomem
+                << " task_backpressure_recovered_us="
+                << task->timing->backpressure_wait_us
+                << " task_backpressure_active="
+                << (task->timing->backpressure_started_at !=
+                    std::chrono::steady_clock::time_point{})
+                << " first_backpressure_mono_ns="
+                << SteadyNanos(task->timing->first_backpressure_at)
+                << " last_backpressure_recovery_mono_ns="
+                << SteadyNanos(task->timing->last_backpressure_recovery_at)
                 << " lane_completion_seq="
                 << timing->lane_completion_sequence
                 << " lba=" << task->lba
@@ -396,6 +430,13 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
                 << timing->last_submit_mono_ns
                 << " completed_mono_ns=" << timing->completed_mono_ns
                 << " total_us=" << timing->total_us
+                << " dispatch_queue_us=" << timing->dispatch_queue_us
+                << " worker_setup_us=" << timing->worker_setup_us
+                << " buffer_resolve_us=" << task->timing->buffer_resolve_us
+                << " head_to_first_submit_us=" << timing->head_to_first_submit_us
+                << " submit_call_count=" << task->timing->submit_call_count
+                << " submit_call_sum_us=" << task->timing->submit_call_sum_us
+                << " submit_call_max_us=" << task->timing->submit_call_max_us
                 << " fifo_us=" << timing->qos_fifo_wait_us
                 << " fifo_full_us=" << timing->qos_fifo_full_wait_us
                 << " fifo_partial_us=" << timing->qos_fifo_partial_wait_us
@@ -1042,10 +1083,17 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 {
                     uint32_t blk = SpdkWrapper::GetInstance().GetBlockSize(
                         task->seg_handle);
+                    const auto resolve_started = task->timing
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
                     task->buffer_info =
                         NofMemoryDomainManager::GetInstance().ResolveBuffer(
                             task->ptr,
                             static_cast<uint64_t>(task->lba_count) * blk);
+                    if (task->timing) {
+                        task->timing->buffer_resolve_us = ElapsedMicros(
+                            resolve_started, std::chrono::steady_clock::now());
+                    }
                     if (task->buffer_info.type == NofMemoryType::kError ||
                         task->buffer_info.type ==
                             NofMemoryType::kNotSupported) {
@@ -1073,10 +1121,15 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 if (track_occupancy) {
                     UpdateNofOccupancy(nof_qos, qos_enqueue_now);
                 }
+                task->queue_sequence = ++nof_qos->enqueued_task_sequence;
                 if (task->timing) {
                     task->timing->qos_enqueued_at = qos_enqueue_now;
-                    task->timing->lane_task_sequence =
-                        nof_qos->enqueued_task_sequence + 1;
+                    task->timing->lane_task_sequence = task->queue_sequence;
+                    if (const auto* head = nof_qos->head[task->op]) {
+                        task->timing->head_seq_at_enqueue = head->queue_sequence;
+                        task->timing->head_remaining_blocks_at_enqueue =
+                            head->remaining_lba;
+                    }
                     task->timing->qos_tasks_ahead_at_enqueue = tasks_ahead;
                     task->timing->qos_full_pending_at_enqueue_us =
                         nof_qos->inflight_full_with_pending_us;
@@ -1086,7 +1139,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         nof_qos->inflight_zero_with_pending_us;
                     ++nof_qos->sampled_timing_tasks;
                 }
-                ++nof_qos->enqueued_task_sequence;
                 nof_qos->PushTask(task);
                 if (lane_was_empty) {
                     MarkNofTaskAsQosHead(nof_qos, task, qos_enqueue_now);
@@ -1180,6 +1232,14 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
 #endif
+                        if (task->timing) {
+                            const auto elapsed = ElapsedMicros(
+                                sub_io_submit_at, std::chrono::steady_clock::now());
+                            ++task->timing->submit_call_count;
+                            task->timing->submit_call_sum_us += elapsed;
+                            task->timing->submit_call_max_us = std::max(
+                                task->timing->submit_call_max_us, elapsed);
+                        }
                         ++nof_qos->submit_attempts;
                         if (ret != 0) {
                             const bool retryable =
@@ -1196,6 +1256,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             }
                             sub_task_pool.push(sub_task);
                             if (retryable && has_inflight) {
+                                if (auto* t = task->timing.get()) {
+                                    if (ret == -EAGAIN) {
+                                        ++t->backpressure_eagain;
+                                    } else {
+                                        ++t->backpressure_enomem;
+                                    }
+                                    using Clock = std::chrono::steady_clock;
+                                    if (t->backpressure_started_at ==
+                                        Clock::time_point{}) {
+                                        t->backpressure_started_at = Clock::now();
+                                        if (t->first_backpressure_at ==
+                                            Clock::time_point{}) {
+                                            t->first_backpressure_at =
+                                                t->backpressure_started_at;
+                                        }
+                                    }
+                                }
                                 // SPDK uses EAGAIN/ENOMEM as queue-pressure
                                 // signals. Keep the task at the head, poll
                                 // completions to return credits, then retry it
@@ -1228,6 +1305,17 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             task->failed = true;
                             task->remaining_lba = 0;
                         } else {
+                            if (task->timing &&
+                                task->timing->backpressure_started_at !=
+                                    std::chrono::steady_clock::time_point{}) {
+                                auto& t = *task->timing;
+                                t.last_backpressure_recovery_at =
+                                    std::chrono::steady_clock::now();
+                                t.backpressure_wait_us += ElapsedMicros(
+                                    t.backpressure_started_at,
+                                    t.last_backpressure_recovery_at);
+                                t.backpressure_started_at = {};
+                            }
                             ++nof_qos->submit_successes;
                             if (nof_qos->submit_backpressured) {
                                 nof_qos->submit_backpressured = false;
@@ -1370,8 +1458,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     SpdkWrapper::GetInstance().IsIoLaneHealthy(it.first);
                 if (healthy && it.second->inflight_blocks[0] == 0 &&
                     it.second->inflight_blocks[1] == 0) {
+                    it.second->debug_poll_left_inflight = false;
                     continue;
                 }
+                const auto poll_started = debug_enabled && healthy
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 ret = healthy ? SpdkWrapper::GetInstance().PollIoLane(
                                     it.first, 0)
                               : -ENXIO;
@@ -1383,6 +1475,17 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     qos.polled_completions += static_cast<uint64_t>(ret);
                 }
                 const auto now = std::chrono::steady_clock::now();
+                if (debug_enabled && healthy) {
+                    qos.debug_poll_call_max_us = std::max(
+                        qos.debug_poll_call_max_us, ElapsedMicros(poll_started, now));
+                    if (qos.debug_poll_left_inflight) {
+                        qos.debug_poll_between_calls_max_us = std::max(
+                            qos.debug_poll_between_calls_max_us,
+                            ElapsedMicros(qos.last_poll_return_at, poll_started));
+                    }
+                    qos.debug_poll_left_inflight =
+                        qos.inflight_blocks[0] > 0 || qos.inflight_blocks[1] > 0;
+                }
                 qos.last_poll_return_at = now;
                 if (ret > 0) qos.last_progress = now;
                 const bool timed_out =
@@ -1520,6 +1623,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
                         << " total_outstanding_io=" << total_outstanding_io
+                        << " poll_call_window_max_us="
+                        << nof_qos->debug_poll_call_max_us
+                        << " poll_between_calls_window_max_us="
+                        << nof_qos->debug_poll_between_calls_max_us
                         << " max_inflight_blocks="
                         << nof_qos->max_inflight_blocks
                         << " occupancy_total_us="
@@ -1589,6 +1696,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << completion_latency_avg_us
                         << " max_completion_latency_us="
                         << nof_qos->max_completion_latency_us;
+                    nof_qos->debug_poll_call_max_us = 0;
+                    nof_qos->debug_poll_between_calls_max_us = 0;
                 }
                 last_debug_snapshot = now;
             }
@@ -2302,10 +2411,15 @@ ErrorCode WriteFileRange(const vsegment::EndpointTransferSubRequest& request,
     }
 }
 
+#ifdef USE_NOF
 class VSegmentOperationState final : public OperationState {
  public:
     std::vector<TransferFuture> children;
     bool submission_failed{false};
+    uint64_t op_id = 0;
+    uint64_t parent_trace_id = 0;
+    size_t planned_children = 0;
+    std::chrono::steady_clock::time_point started_at;
     bool is_completed() override {
         for (const auto& child : children)
             if (!child.isReady()) return false;
@@ -2321,9 +2435,45 @@ class VSegmentOperationState final : public OperationState {
             if (child_error != ErrorCode::OK) error = child_error;
         }
         result_ = error;
+        if (!op_id) return;
+        const auto total_us =
+            ElapsedMicros(started_at, std::chrono::steady_clock::now());
+        const auto threshold = GetSpdkNofSlowTraceThresholdUs();
+        if (error == ErrorCode::OK &&
+            !(threshold > 0 && total_us >= threshold) &&
+            !logging::ShouldSampleHiFreqLog(parent_trace_id)) return;
+        int64_t first_submit = 0;
+        int64_t last_completion = 0;
+        size_t timed_children = 0;
+        size_t last_child = 0;
+        for (size_t i = 0; i < children.size(); ++i) {
+            const auto timing = children[i].nofTiming();
+            if (!timing) continue;
+            ++timed_children;
+            const auto submit = timing->first_submit_mono_ns;
+            if (submit && (!first_submit || submit < first_submit)) {
+                first_submit = submit;
+            }
+            if (timing->completed_mono_ns > last_completion) {
+                last_completion = timing->completed_mono_ns;
+                last_child = i;
+            }
+        }
+        MC_LOG(INFO) << "nof_vsegment_operation trace_id=" << parent_trace_id
+                     << " vsegment_op_id=" << op_id
+                     << " planned_children=" << planned_children
+                     << " submitted_children=" << children.size()
+                     << " timed_children=" << timed_children
+                     << " first_submit_mono_ns=" << first_submit
+                     << " last_completion_mono_ns=" << last_completion
+                     << " last_child_idx="
+                     << (last_completion ? static_cast<int64_t>(last_child) : -1)
+                     << " observed_total_us=" << total_us
+                     << " rc=" << static_cast<int>(error);
     }
     TransferStrategy get_strategy() const override { return TransferStrategy::SPDK_NVMF; }
 };
+#endif
 }  // namespace
 
 std::optional<TransferFuture> TransferSubmitter::submitVSegment(
@@ -2341,6 +2491,14 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
             [](const auto& request) { return request.backend != vsegment::PSegmentBackend::NOF; }))
             return std::nullopt;
         auto state = std::make_shared<VSegmentOperationState>();
+        state->parent_trace_id = logging::CurrentTraceId();
+        if (GetSpdkNofSlowTraceThresholdUs() > 0 ||
+            logging::ShouldSampleHiFreqLog(state->parent_trace_id)) {
+            static std::atomic<uint64_t> next_op_id{1};
+            state->op_id = next_op_id.fetch_add(1, std::memory_order_relaxed);
+            state->started_at = std::chrono::steady_clock::now();
+            state->planned_children = plan.requests.size();
+        }
         for (const auto& request : plan.requests) {
             AllocatedBuffer::Descriptor handle{};
             handle.transport_endpoint_ = request.endpoint;
@@ -2348,7 +2506,8 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
             handle.size_ = request.transfer.length;
             auto child = submitSpdkNofOperation(handle,
                 reinterpret_cast<void*>(request.transfer.client_address),
-                request.transfer.length, op_code);
+                request.transfer.length, op_code, state->op_id,
+                state->children.size(), plan.requests.size());
             if (!child) { state->submission_failed = true; break; }
             state->children.push_back(std::move(*child));
         }
@@ -2887,7 +3046,8 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 #ifdef USE_NOF
 std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t vsegment_op_id,
+    size_t child_index, size_t child_count) {
     if (handle.transport_endpoint_.empty() || handle.size_ < size) {
         LOG(ERROR) << "Invalid NoF request endpoint="
                    << handle.transport_endpoint_
@@ -2924,6 +3084,14 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         std::make_shared<SpdkNofOperationState>(trace_id, track_timing);
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
                      size / block_size, op_code, state);
+    if (task.timing && vsegment_op_id) {
+        task.timing->vsegment_op_id = vsegment_op_id;
+        task.timing->vsegment_child_index = child_index;
+        task.timing->vsegment_child_count = child_count;
+        task.timing->vsegment_endpoint = handle.transport_endpoint_;
+        task.timing->vsegment_offset_bytes = handle.buffer_address_;
+        task.timing->vsegment_length_bytes = size;
+    }
     spdk_nvmf_pool_->submitTask(std::move(task));
 
     VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;

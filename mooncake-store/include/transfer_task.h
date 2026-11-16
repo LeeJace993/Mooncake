@@ -490,6 +490,10 @@ class MemcpyWorkerPool {
 struct SpdkNofQos;
 
 struct SpdkNofTaskTiming {
+    int64_t buffer_resolve_us = 0;
+    int64_t submit_call_sum_us = 0;
+    int64_t submit_call_max_us = 0;
+    uint64_t submit_call_count = 0;
     std::chrono::steady_clock::time_point worker_dequeued_at;
     std::chrono::steady_clock::time_point qos_enqueued_at;
     std::chrono::steady_clock::time_point qos_head_at;
@@ -498,6 +502,21 @@ struct SpdkNofTaskTiming {
     std::chrono::steady_clock::time_point first_completion_at;
     std::chrono::steady_clock::time_point previous_completion_at;
     std::chrono::steady_clock::time_point credit_wait_started_at;
+    std::chrono::steady_clock::time_point first_backpressure_at;
+    std::chrono::steady_clock::time_point backpressure_started_at;
+    std::chrono::steady_clock::time_point last_backpressure_recovery_at;
+    int64_t backpressure_wait_us = 0;
+    uint32_t backpressure_eagain = 0;
+    uint32_t backpressure_enomem = 0;
+    uint64_t head_seq_at_enqueue = 0;
+    uint32_t head_remaining_blocks_at_enqueue = 0;
+    int available_blocks_at_head = 0;
+    uint64_t vsegment_op_id = 0;
+    size_t vsegment_child_index = 0;
+    size_t vsegment_child_count = 0;
+    std::string vsegment_endpoint;
+    uint64_t vsegment_offset_bytes = 0;
+    size_t vsegment_length_bytes = 0;
     uint64_t lane_task_sequence = 0;
     uint64_t poll_calls_at_first_submit = 0;
     uint64_t empty_polls_at_first_submit = 0;
@@ -534,6 +553,7 @@ struct SpdkNofTaskTiming {
  * @brief Spdk nvmf operation descriptor
  */
 struct SpdkNofTask {
+    uint64_t queue_sequence = 0;
     nof_seg_handle* seg_handle;
     nof_io_lane* io_lane;
     uint32_t io_lane_index;
@@ -605,6 +625,9 @@ struct SpdkNofSubTask {
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
+    int64_t debug_poll_call_max_us = 0;
+    int64_t debug_poll_between_calls_max_us = 0;
+    bool debug_poll_left_inflight = false;
     int inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
     int inflight_blocks_limit;
@@ -914,7 +937,8 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitSpdkNofOperation(
         const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code, uint64_t vsegment_op_id = 0,
+        size_t child_index = 0, size_t child_count = 0);
 #endif
 
     /**
