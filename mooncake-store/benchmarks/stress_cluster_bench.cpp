@@ -315,6 +315,11 @@ DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_bool(segment_write_vsegment, false,
             "Use the default VSegment profile for segment_write puts");
+DEFINE_bool(
+    vsegment_nof_io, false,
+    "This benchmark uses a NoF VSegment profile. Register the local "
+    "NoF I/O buffers even though VSegment puts require "
+    "--nof_replica_num=0. Set on both remote_memory writer and reader.");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
 DEFINE_bool(key_include_value_size, false,
             "Append the value size to segment keys so runs with different "
@@ -734,7 +739,8 @@ class StressBenchmark {
         LOG(INFO) << "RealClient setup succeeded"
                   << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
-        if (gpu_config_.use_gpu_buffer && FLAGS_nof_replica_num > 0) {
+        if (gpu_config_.use_gpu_buffer &&
+            (FLAGS_nof_replica_num > 0 || FLAGS_vsegment_nof_io)) {
             if (!EnsurePlacementClient()) return -1;
             auto snapshots = placement_client_->GetAllNoFSegments();
             if (!snapshots || snapshots->empty()) {
@@ -1986,7 +1992,8 @@ class StressBenchmark {
 
    private:
     bool EnsureNofPools() {
-        if (!FLAGS_nof_whole_pool_register || FLAGS_nof_replica_num == 0) {
+        if (!FLAGS_nof_whole_pool_register ||
+            (FLAGS_nof_replica_num == 0 && !FLAGS_vsegment_nof_io)) {
             return true;
         }
 #if defined(USE_NOF_URMA)
@@ -2004,8 +2011,16 @@ class StressBenchmark {
             return false;
         }
         auto segments = placement_client_->GetAllNoFSegments();
-        if (!segments || segments->empty()) return false;
-        const auto requested = ParseSegments(FLAGS_nof_segments);
+        if (!segments || segments->empty()) {
+            LOG(ERROR) << "No mounted NoF segments available for whole-pool "
+                          "registration";
+            return false;
+        }
+        // VSegment placement is selected by its profile, not --nof_segments.
+        // Register against every mounted URMA endpoint it may choose.
+        const auto requested = FLAGS_vsegment_nof_io
+                                   ? std::vector<std::string>{}
+                                   : ParseSegments(FLAGS_nof_segments);
         std::vector<std::pair<void*, size_t>> buffers;
         buffers.emplace_back(buffer_, gpu_config_.mode == "gdr-peermem"
                                           ? (1 + FLAGS_num_threads) * buffer_size_
@@ -2015,6 +2030,7 @@ class StressBenchmark {
                 if (buffer.ptr) buffers.emplace_back(buffer.ptr, buffer.size);
             }
         }
+        size_t matching_urma_segments = 0;
         for (const auto& segment : *segments) {
             if (!requested.empty() && FLAGS_strict_segment_placement &&
                 std::find(requested.begin(), requested.end(), segment.name) ==
@@ -2027,6 +2043,7 @@ class StressBenchmark {
                         << segment.name;
                 continue;
             }
+            ++matching_urma_segments;
             for (const auto& [buffer, requested_size] : buffers) {
                 const auto id = segment.te_endpoint + ":buffer=" +
                                 std::to_string(reinterpret_cast<uintptr_t>(buffer));
@@ -2049,6 +2066,11 @@ class StressBenchmark {
                 LOG(INFO) << "NoF whole-pool registered segment="
                           << segment.name << " size=" << size;
             }
+        }
+        if (matching_urma_segments == 0) {
+            LOG(ERROR) << "No matching URMA NoF segments for whole-pool "
+                          "registration";
+            return false;
         }
         return true;
 #else
@@ -2089,17 +2111,25 @@ class StressBenchmark {
                                  key.starts_with("nof_rmv_") ||
                                  key.starts_with("seg_") || key.starts_with("rmv_");
         if (write && !segment_key) {
-            measured_memory_bytes_[1].fetch_add(bytes * FLAGS_replica_num,
-                                               std::memory_order_relaxed);
-            measured_nof_bytes_[1].fetch_add(bytes * FLAGS_nof_replica_num,
-                                            std::memory_order_relaxed);
+            if (FLAGS_vsegment_nof_io) {
+                measured_nof_bytes_[1].fetch_add(bytes * FLAGS_replica_num,
+                                                 std::memory_order_relaxed);
+            } else {
+                measured_memory_bytes_[1].fetch_add(bytes * FLAGS_replica_num,
+                                                    std::memory_order_relaxed);
+                measured_nof_bytes_[1].fetch_add(bytes * FLAGS_nof_replica_num,
+                                                 std::memory_order_relaxed);
+            }
             return;
         }
-        const bool nof = key.starts_with("nof_seg_") ||
-                         key.starts_with("nof_rmv_") ||
-                         (!segment_key && FLAGS_replica_num == 0);
-        const uint64_t replicas = write ? (nof ? FLAGS_nof_replica_num
-                                              : FLAGS_replica_num) : 1;
+        const bool nof =
+            key.starts_with("nof_seg_") || key.starts_with("nof_rmv_") ||
+            (!segment_key && (FLAGS_replica_num == 0 || FLAGS_vsegment_nof_io));
+        const uint64_t replicas =
+            write ? (nof ? (FLAGS_vsegment_nof_io ? FLAGS_replica_num
+                                                  : FLAGS_nof_replica_num)
+                         : FLAGS_replica_num)
+                  : 1;
         auto& counter = nof ? measured_nof_bytes_[write ? 1 : 0]
                             : measured_memory_bytes_[write ? 1 : 0];
         counter.fetch_add(static_cast<uint64_t>(bytes) * replicas,
@@ -3125,6 +3155,14 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
     LOG(INFO) << "  Memory replicas: " << FLAGS_replica_num;
     LOG(INFO) << "  NoF replicas:   " << FLAGS_nof_replica_num;
+    LOG(INFO) << "  VSegment NoF I/O: "
+              << (FLAGS_vsegment_nof_io ? "enabled" : "disabled");
+    if (FLAGS_scenario == "remote_memory" && FLAGS_segment_write_vsegment &&
+        !FLAGS_vsegment_nof_io) {
+        LOG(WARNING) << "--segment_write_vsegment has no effect in "
+                        "remote_memory; use --vsegment_nof_io=true to "
+                        "pre-register NoF buffers";
+    }
     LOG(INFO) << "  NoF whole-pool: "
               << (!FLAGS_nof_whole_pool_register
                       ? "disabled"
@@ -3142,7 +3180,10 @@ int main(int argc, char* argv[]) {
     } else {
         LOG(INFO) << "  Memory segments: auto-discover from master";
     }
-    if (!FLAGS_nof_segments.empty()) {
+    if (FLAGS_vsegment_nof_io) {
+        LOG(INFO) << "  NoF segments:   selected by VSegment profile; "
+                     "registering all mounted URMA endpoints";
+    } else if (!FLAGS_nof_segments.empty()) {
         LOG(INFO) << "  NoF segments:   " << FLAGS_nof_segments;
     } else {
         LOG(INFO) << "  NoF segments:   auto-discover from master";
@@ -3210,6 +3251,23 @@ int main(int argc, char* argv[]) {
                       "duration statistics interval must be positive";
         return 1;
     }
+    if (FLAGS_vsegment_nof_io && !((FLAGS_scenario == "remote_memory") ||
+                                   (FLAGS_scenario == "segment_write" &&
+                                    FLAGS_segment_write_vsegment))) {
+        LOG(ERROR) << "--vsegment_nof_io requires remote_memory or "
+                      "segment_write with --segment_write_vsegment=true";
+        return 1;
+    }
+    if (FLAGS_vsegment_nof_io &&
+        (FLAGS_replica_num == 0 || FLAGS_nof_replica_num != 0)) {
+        LOG(ERROR) << "VSegment NoF I/O requires --replica_num>0 and "
+                      "--nof_replica_num=0";
+        return 1;
+    }
+    if (FLAGS_vsegment_nof_io && !FLAGS_nof_segments.empty()) {
+        LOG(WARNING) << "--nof_segments does not select VSegment placement "
+                        "and is ignored for whole-pool registration";
+    }
     const size_t max_size = std::numeric_limits<size_t>::max();
     const auto max_read_size =
         static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
@@ -3244,8 +3302,8 @@ int main(int argc, char* argv[]) {
     mooncake::bench::GpuPathOptions path;
     path.mode = gpu_config.mode;
     path.protocol = FLAGS_protocol;
-    path.memory_replicas = FLAGS_replica_num > 0;
-    path.nof_replicas = FLAGS_nof_replica_num > 0;
+    path.memory_replicas = FLAGS_replica_num > 0 && !FLAGS_vsegment_nof_io;
+    path.nof_replicas = FLAGS_nof_replica_num > 0 || FLAGS_vsegment_nof_io;
     path.require_direct = FLAGS_require_gpu_direct;
 #if defined(USE_CUDA)
     path.cuda_build = true;
