@@ -332,6 +332,11 @@ DEFINE_uint64(batch_size, 32,
 DEFINE_uint64(num_threads, 1,
               "Number of concurrent benchmark worker threads");
 DEFINE_uint64(warmup_keys, 5, "Number of warmup keys (not counted in stats)");
+DEFINE_string(key_order, "sequential",
+              "Read key order for remote_memory/remote_disk: sequential or "
+              "uniform_random (one shuffled pass without replacement)");
+DEFINE_uint64(key_order_seed, 42,
+              "Seed for uniform_random read key order");
 DEFINE_uint64(wait_seconds, 5,
               "Seconds to wait before reading (for remote scenarios)");
 DEFINE_uint64(client_init_wait_seconds, 0,
@@ -378,8 +383,9 @@ DEFINE_uint64(read_segment_nums, 0,
               "Number of memory and NoF segments to read/remove from "
               "(0 = all, memory segments first)");
 DEFINE_uint64(duration, 0,
-              "Duration in seconds for continuous reading in local_memory and "
-              "segment_read scenarios (0 = read num_keys once)");
+              "Duration in seconds for continuous reading in remote_memory, "
+              "remote_disk, local_memory and segment_read scenarios "
+              "(0 = read num_keys once)");
 DEFINE_bool(prewarm_accelerator, true,
             "Probe accelerator availability after client setup and before "
             "performance timing");
@@ -876,9 +882,26 @@ class StressBenchmark {
     int RunReader() {
         LOG(INFO) << "=== READER MODE ===";
         LOG(INFO) << "Scenario: " << FLAGS_scenario;
+        if (FLAGS_key_order != "sequential" &&
+            FLAGS_key_order != "uniform_random") {
+            LOG(ERROR) << "Invalid --key_order=" << FLAGS_key_order
+                       << " (expected sequential or uniform_random)";
+            return 1;
+        }
         LOG(INFO) << "Reading " << FLAGS_num_keys << " keys with "
                   << FLAGS_num_threads
-                  << " threads, batch_size=" << FLAGS_batch_size;
+                  << " threads, batch_size=" << FLAGS_batch_size
+                  << ", duration=" << FLAGS_duration << "s";
+
+        std::vector<size_t> read_order;
+        if (FLAGS_key_order == "uniform_random") {
+            read_order.resize(FLAGS_num_keys);
+            std::iota(read_order.begin(), read_order.end(), size_t{0});
+            std::mt19937_64 rng(FLAGS_key_order_seed);
+            std::shuffle(read_order.begin(), read_order.end(), rng);
+        }
+        LOG(INFO) << "Read key order: " << FLAGS_key_order
+                  << " seed=" << FLAGS_key_order_seed;
 
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
@@ -907,13 +930,23 @@ class StressBenchmark {
         std::latch start_latch(
             static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
         std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::atomic<bool> stop_flag{false};
+        const std::atomic<bool>* read_stop_flag =
+            FLAGS_duration > 0 ? &stop_flag : nullptr;
         auto threads = LaunchReadWorkers(
             FLAGS_num_threads, FLAGS_num_keys, stats, ready_latch, start_latch,
-            done_latch, [](size_t idx) { return MakeKey(idx); });
+            done_latch, [&read_order](size_t idx) {
+                return MakeKey(read_order.empty() ? idx : read_order[idx]);
+            }, read_stop_flag);
 
         ready_latch.wait();
         stats.StartTimer();
         start_latch.arrive_and_wait();
+        if (FLAGS_duration > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(FLAGS_duration));
+            stop_flag.store(true, std::memory_order_relaxed);
+        }
         done_latch.wait();
         stats.StopTimer();
 
