@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -314,7 +315,8 @@ DEFINE_string(scenario, "local_memory",
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_bool(segment_write_vsegment, false,
-            "Use the default VSegment profile for segment_write puts");
+            "Discover registered NoF segments for segment_write keys and "
+            "write using the default NoF VSegment profile");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
 DEFINE_bool(key_include_value_size, false,
             "Append the value size to segment keys so runs with different "
@@ -1182,7 +1184,10 @@ class StressBenchmark {
     }
 
     int RunSegmentWrite() {
-        if (FLAGS_segment_write_vsegment) {
+        const bool use_vsegment = FLAGS_segment_write_vsegment;
+        const bool verify_physical_placement =
+            FLAGS_strict_segment_placement && !use_vsegment;
+        if (use_vsegment) {
             if (FLAGS_replica_num == 0 || FLAGS_nof_replica_num != 0) {
                 LOG(ERROR) << "VSegment segment_write requires --replica_num>0 "
                               "and --nof_replica_num=0";
@@ -1195,9 +1200,9 @@ class StressBenchmark {
                               "--require_gpu_direct";
                 return 1;
             }
-            return RunWriter();
         }
-        auto segments = DiscoverBenchmarkSegments();
+        auto segments = use_vsegment ? DiscoverNoFVSegmentWriteSegments()
+                                     : DiscoverBenchmarkSegments();
         if (segments.empty()) {
             return -1;
         }
@@ -1207,7 +1212,8 @@ class StressBenchmark {
         LOG(INFO) << "=== SEGMENT WRITE MODE ===";
         LOG(INFO) << "PUT measurement uses one serial API stream; --num_threads "
                      "controls concurrent reads/removes, not PUT concurrency";
-        LOG(INFO) << "Writing to " << segments.size() << " segments, "
+        LOG(INFO) << (use_vsegment ? "Generating keys from " : "Writing to ")
+                  << segments.size() << " segments, "
                   << FLAGS_num_keys << " keys per segment (interleaved), each "
                   << FLAGS_value_size / MB << " MiB";
 
@@ -1215,7 +1221,8 @@ class StressBenchmark {
         std::vector<size_t> seg_failed(segments.size(), 0);
         std::vector<mooncake::ReplicateConfig> configs(segments.size());
         for (size_t s = 0; s < segments.size(); ++s) {
-            configs[s] = MakeSegmentReplicateConfig(segments[s]);
+            configs[s] = use_vsegment ? MakeReplicateConfig()
+                                      : MakeSegmentReplicateConfig(segments[s]);
         }
 
         {
@@ -1256,7 +1263,7 @@ class StressBenchmark {
                                             configs[s]);
                 auto t1 = Clock::now();
                 if (ret == 0) AccountMeasuredIo(key, FLAGS_value_size, true);
-                if (ret == 0 && FLAGS_strict_segment_placement &&
+                if (ret == 0 && verify_physical_placement &&
                     !VerifyPlacement(key, segment)) {
                     ret = -1;
                 }
@@ -1274,15 +1281,18 @@ class StressBenchmark {
             }
 
             if ((i + 1) % 10 == 0 || i == FLAGS_num_keys - 1) {
-                LOG(INFO) << "  Written " << (i + 1) << "/" << FLAGS_num_keys
-                          << " keys to all " << segments.size() << " segments";
+                LOG(INFO) << "  Processed " << (i + 1) << "/" << FLAGS_num_keys
+                          << " key rounds across " << segments.size()
+                          << " segment names";
             }
         }
 
         for (size_t s = 0; s < segments.size(); ++s) {
             total_written += seg_written[s];
             total_failed += seg_failed[s];
-            LOG(INFO) << "Requested segment [" << s << "] " << segments[s].name
+            LOG(INFO) << (use_vsegment ? "Key source segment ["
+                                       : "Requested segment [")
+                      << s << "] " << segments[s].name
                       << " type=" << SegmentKindName(segments[s].kind)
                       << " complete: " << seg_written[s] << " succeeded, "
                       << seg_failed[s] << " failed";
@@ -1293,7 +1303,8 @@ class StressBenchmark {
         FinishMeasurement("segment_write");
         put_stats.FinalizeSequential();
         put_stats.Print("SEGMENT PUT BENCHMARK");
-        const int verification = FLAGS_verify ? VerifySegments(segments) : 0;
+        const int verification =
+            FLAGS_verify ? VerifySegments(segments, false, use_vsegment) : 0;
 
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for reader to connect...";
@@ -2631,6 +2642,63 @@ class StressBenchmark {
         return threads;
     }
 
+    std::vector<BenchmarkSegment> DiscoverNoFVSegmentWriteSegments() {
+        std::vector<std::string> addresses{FLAGS_master_server};
+        if (FLAGS_master_server.starts_with("etcd://")) {
+            // The client refreshes the partition router every five seconds.
+            const auto deadline = Clock::now() + std::chrono::seconds(10);
+            addresses = client_->GetSubmasterAddresses();
+            while (addresses.empty() && Clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                addresses = client_->GetSubmasterAddresses();
+            }
+            if (addresses.empty()) {
+                LOG(ERROR) << "No SubMaster addresses available from etcd "
+                              "partition routing for NoF segment discovery";
+                return {};
+            }
+        }
+
+        std::set<std::string> names;
+        for (const auto& address : addresses) {
+            bool success = false;
+            const auto discovered =
+                DiscoverNoFSegmentsFromMaster(address, &success);
+            if (!success) {
+                LOG(ERROR) << "NoF segment discovery failed at " << address;
+                return {};
+            }
+            names.insert(discovered.begin(), discovered.end());
+        }
+        if (names.empty()) {
+            LOG(ERROR) << "No registered NoF segments found for VSegment "
+                          "segment_write";
+            return {};
+        }
+        if (FLAGS_num_keys > std::numeric_limits<size_t>::max() / names.size()) {
+            LOG(ERROR) << "Too many keys for the discovered NoF segments";
+            return {};
+        }
+
+        std::set<std::string> key_prefixes;
+        std::vector<BenchmarkSegment> segments;
+        segments.reserve(names.size());
+        for (const auto& name : names) {
+            if (!key_prefixes.insert(SanitizeSegmentName(name)).second) {
+                LOG(ERROR) << "NoF segment names produce duplicate keys: "
+                           << name;
+                return {};
+            }
+            segments.push_back({name, SegmentKind::NOF, {}});
+        }
+        for (const auto& segment : segments) {
+            LOG(INFO) << "Discovered registered NoF segment " << segment.name;
+        }
+        LOG(INFO) << "Writing through the default NoF VSegment profile; "
+                     "discovered names are used to generate keys";
+        return segments;
+    }
+
     std::vector<BenchmarkSegment> DiscoverBenchmarkSegments() {
         std::vector<BenchmarkSegment> segments;
         auto append = [&segments](std::vector<std::string> names,
@@ -2923,7 +2991,7 @@ class StressBenchmark {
     }
 
     int VerifySegments(const std::vector<BenchmarkSegment>& segments,
-                       bool remove_keys = false) {
+                       bool remove_keys = false, bool use_vsegment = false) {
         size_t errors = 0;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             for (const auto& segment : segments) {
@@ -2933,7 +3001,7 @@ class StressBenchmark {
                     ++errors;
                     continue;
                 }
-                if (FLAGS_strict_segment_placement &&
+                if (FLAGS_strict_segment_placement && !use_vsegment &&
                     !VerifyPlacement(key, segment)) {
                     ++errors;
                     continue;

@@ -80,6 +80,8 @@ class RealClient : public PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<RealClient> create();
 
+    [[nodiscard]] std::vector<std::string> GetSubmasterAddresses() const;
+
     Status configureScheduling(
         const scheduling::SchedulerConfig &scheduler_config);
 

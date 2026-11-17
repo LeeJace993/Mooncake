@@ -766,6 +766,11 @@ RealClient::~RealClient() {
     tearDownAll_internal();
 }
 
+std::vector<std::string> RealClient::GetSubmasterAddresses() const {
+    return client_ ? client_->GetSubmasterAddresses()
+                   : std::vector<std::string>{};
+}
+
 std::shared_ptr<RealClient> RealClient::create() {
     auto sp = std::shared_ptr<RealClient>(new RealClient());
     ResourceTracker::getInstance().registerInstance(sp);
