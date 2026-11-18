@@ -1,6 +1,7 @@
 #include "config.h"
 #include "http_transport.h"
 #include "metrics.h"
+#include "nof_pool.h"
 #include "notify_rpc_transport.h"
 #include "rate_gate.h"
 #include "thread_pool.h"
@@ -153,6 +154,8 @@ class RegisteredBuffer {
     RegisteredBuffer &operator=(const RegisteredBuffer &) = delete;
 
     bool Valid() const { return registered_; }
+    void *Data() const { return data_; }
+    size_t Size() const { return size_; }
     void *At(size_t index) {
         return static_cast<char *>(data_) + stride_ * index;
     }
@@ -410,6 +413,20 @@ class Writer {
     size_t NotifyQueueSize() const { return notify_pool_.QueueSize(); }
     uint64_t NotifyDroppedCount() const { return notify_pool_.DroppedCount(); }
 
+    // Process-owned buffers for NoF whole-pool registration. Each
+    // RegisteredBuffer is one contiguous page-aligned block, so a single
+    // registration per endpoint covers every slot.
+    std::vector<std::pair<void *, size_t>> NoFBuffers() const {
+        std::vector<std::pair<void *, size_t>> buffers;
+        buffers.reserve(buffers_.size());
+        for (const auto &buffer : buffers_) {
+            if (buffer->Valid()) {
+                buffers.emplace_back(buffer->Data(), buffer->Size());
+            }
+        }
+        return buffers;
+    }
+
    private:
     void JoinWorkers() {
         for (auto &worker : workers_) {
@@ -606,6 +623,38 @@ int main(int argc, char **argv) {
         }
     }
 
+    // NoF whole-pool registration (vsegment --vsegment_required_medium=nof
+    // deployments, opt-in via store.whole_pool_register /
+    // MC_NOF_WHOLE_POOL_REGISTER). Writer buffers are the source blocks SPDK
+    // URMA DMA reads from; registering them up front keeps the URMA
+    // registration cache flat and moves the per-qpair first-touch cost out
+    // of the measured window (exp5_wholepool_verify: wait P50 301ms -> 583us).
+    // Reader reads land in the client buffer pool, which is SPDK DMA managed
+    // under USE_NOF builds, so no kvtest-owned registration is needed there.
+    if (config.store.whole_pool_register) {
+        std::vector<std::pair<void *, size_t>> nof_buffers;
+        if (writer) nof_buffers = writer->NoFBuffers();
+        if (!nof_buffers.empty()) {
+            std::string nof_error;
+            if (!EnsureNofWholePoolRegistered(
+                    config.store.master_server_address, nof_buffers,
+                    &nof_error)) {
+                LOG(ERROR) << "NoF whole-pool registration failed: "
+                           << nof_error;
+                ReleaseNofPoolTokens();
+                metrics.Stop();
+                client->tearDownAll();
+                google::ShutdownGoogleLogging();
+                return 1;
+            }
+        } else {
+            LOG(INFO) << "NoF whole-pool registration enabled but no "
+                         "kvtest-owned buffers for role=" << config.role
+                      << "; reader reads land in the client buffer pool, "
+                         "which is SPDK DMA managed under USE_NOF builds";
+        }
+    }
+
     std::mutex workload_mutex;
     bool workload_started = false;
     bool workload_paused = false;
@@ -782,6 +831,9 @@ int main(int argc, char **argv) {
     LOG(INFO) << "mooncake_kvtest shutdown: draining workload";
     metrics.Freeze();
     if (writer) writer->RequestStop();
+    // Release NoF whole-pool registration tokens before the registered
+    // buffers are freed (nof_gpu_direct_report.h ownership contract).
+    ReleaseNofPoolTokens();
     // Join outbound RPC tasks before destroying the client pools or stopping
     // this process's RPC server. This also preserves self-notify in dual mode.
     if (writer) writer->Stop();

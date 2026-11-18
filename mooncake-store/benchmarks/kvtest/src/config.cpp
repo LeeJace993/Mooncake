@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -220,6 +221,13 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
             store.get("replica_num",
                       static_cast<Json::UInt64>(cfg.store.replica_num))
                 .asUInt64());
+        if (store.isMember("whole_pool_register")) {
+            cfg.store.whole_pool_register =
+                store["whole_pool_register"].asBool();
+        } else if (const char *raw =
+                       std::getenv("MC_NOF_WHOLE_POOL_REGISTER")) {
+            cfg.store.whole_pool_register = std::string(raw) != "0";
+        }
 
         if (cfg.peers.empty()) {
             for (const auto &node : cfg.nodes) {

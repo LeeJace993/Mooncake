@@ -4,6 +4,7 @@ add_executable(
   src/http_transport.cpp
   src/main.cpp
   src/metrics.cpp
+  src/nof_pool.cpp
   src/notify_rpc_transport.cpp)
 
 target_include_directories(mooncake_kvtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

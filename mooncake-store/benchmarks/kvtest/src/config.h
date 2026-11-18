@@ -25,6 +25,11 @@ struct StoreConfig {
     std::string master_server_address{"127.0.0.1:50051"};
     std::string tenant_id{"default"};
     size_t replica_num{1};
+    // NoF whole-pool registration of kvtest-owned writer buffers
+    // (vsegment --vsegment_required_medium=nof deployments). JSON field
+    // wins; otherwise env MC_NOF_WHOLE_POOL_REGISTER (bench-compatible);
+    // otherwise off. 930 memory-vsegment deployments should keep this off.
+    bool whole_pool_register{false};
 };
 
 struct Config {
