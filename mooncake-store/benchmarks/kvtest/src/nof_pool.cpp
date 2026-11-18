@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "master_client.h"
-#include "nof_gpu_direct_report.h"
+#include "nof_memory_pool.h"
 #include "types.h"
 
 namespace mooncake::kvtest {

@@ -832,7 +832,7 @@ int main(int argc, char **argv) {
     metrics.Freeze();
     if (writer) writer->RequestStop();
     // Release NoF whole-pool registration tokens before the registered
-    // buffers are freed (nof_gpu_direct_report.h ownership contract).
+    // buffers are freed (nof_memory_pool.h ownership contract).
     ReleaseNofPoolTokens();
     // Join outbound RPC tasks before destroying the client pools or stopping
     // this process's RPC server. This also preserves self-notify in dual mode.

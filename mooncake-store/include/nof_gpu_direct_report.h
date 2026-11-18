@@ -18,16 +18,15 @@
 #include <memory>
 #include <string>
 
+// Whole-pool host memory registration moved to nof_memory_pool.h (SPDK-free,
+// no GPU Direct involvement); re-exported here for existing includers.
+#include "nof_memory_pool.h"
+
 namespace mooncake {
 
 /// NoF GPU Direct 是否可用（USE_NOF_GPU_DIRECT + CUDA provider 可用）。
 /// 仅在 USE_NOF_URMA 构建中有定义。
 bool NofGpuDirectAvailable();
-
-bool NofWholePoolRegistrationAvailable();
-// Caller must drain I/O, release this token, then unregister/free the buffer.
-std::shared_ptr<void> RegisterNofMemoryPool(const std::string& endpoint,
-                                           void* buffer, size_t size);
 
 struct NofGpuIoStats {
     uint64_t submitted = 0;

@@ -29,7 +29,7 @@ bool EnsureNofWholePoolRegistered(
     std::string *error);
 
 /// Releases the registration tokens. Must be called before the registered
-/// buffers are freed (ownership contract in nof_gpu_direct_report.h).
+/// buffers are freed (ownership contract in nof_memory_pool.h).
 void ReleaseNofPoolTokens();
 
 }  // namespace mooncake::kvtest
