@@ -309,6 +309,16 @@ uint64_t LogicalRangeAllocator::FreeBytes() const {
     return bytes;
 }
 
+uint64_t LogicalRangeAllocator::ReservedBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t bytes = 0;
+    for (const auto& [operation_id, range] : reservations_) {
+        (void)operation_id;
+        bytes += range.length;
+    }
+    return bytes;
+}
+
 size_t LogicalRangeAllocator::ReservationCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reservations_.size();

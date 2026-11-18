@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <iomanip>
 #include <sstream>
 #include <string_view>
 #include <type_traits>
@@ -16,6 +17,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
 #include "vsegment/vsegment_metrics.h"
@@ -2104,15 +2106,15 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
     if (vsegment_service_) {
         const auto& snapshot = vsegment_service_->quota_snapshot();
         const auto& metrics = vsegment::VSegmentMetrics::Instance();
-        const auto logical_capacity = metrics.logical_capacity_bytes();
-        const auto logical_free = metrics.logical_free_bytes();
+        const auto logical_capacity = metrics.formed_capacity_bytes();
+        const auto logical_free = metrics.formed_free_bytes();
         const auto logical_used =
             logical_capacity - std::min(logical_capacity, logical_free);
         os << ", generation=" << snapshot.config_generation
            << ", profiles=" << snapshot.profile_specs.size()
            << ", partitions_installed="
-           // PartitionCount/VSegmentCount 内部持 manager 锁，快照引用与
-           // metrics 读取均为锁外安全视图。
+           // PartitionCount/VSegmentCount take the manager lock internally;
+           // the snapshot reference is a lock-free view.
            << vsegment_service_->PartitionCount()
            << ", vsegments=" << vsegment_service_->VSegmentCount()
            << ", logical_capacity=" << logical_capacity
@@ -2142,6 +2144,27 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
 
 std::string WrappedMasterService::GetVSegmentStatusLogLine() const {
     return master_service_.GetVSegmentStatusLogLine();
+}
+
+std::string MasterService::GetVSegmentStorageLogLine() const {
+    // No capacity line when vsegment is disabled; the status line already
+    // reports enabled=0.
+    if (!vsegment_service_) return std::string();
+    const auto& metrics = vsegment::VSegmentMetrics::Instance();
+    std::ostringstream os;
+    os << "VSegment Storage: "
+       << byte_size_to_string(metrics.allocated_bytes()) << " / "
+       << byte_size_to_string(metrics.total_capacity_bytes()) << " ("
+       << std::fixed << std::setprecision(1)
+       << metrics.used_ratio() * 100.0 << "%), available "
+       << byte_size_to_string(metrics.available_bytes()) << ", formed "
+       << byte_size_to_string(metrics.formed_capacity_bytes()) << ", quota "
+       << byte_size_to_string(metrics.quota_bytes());
+    return os.str();
+}
+
+std::string WrappedMasterService::GetVSegmentStorageLogLine() const {
+    return master_service_.GetVSegmentStorageLogLine();
 }
 
 tl::expected<InterMasterHandshakeResponse, ErrorCode>

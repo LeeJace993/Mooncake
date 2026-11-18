@@ -123,6 +123,17 @@ uint64_t MetricValue(const std::string& name) {
     return std::stoull(text.substr(begin, end - begin));
 }
 
+double MetricDoubleValue(const std::string& name) {
+    const auto text = VSegmentMetrics::Instance().Serialize();
+    const std::string prefix = "\n" + name + " ";
+    const auto pos = text.find(prefix);
+    if (pos == std::string::npos)
+        return std::numeric_limits<double>::quiet_NaN();
+    const auto begin = pos + prefix.size();
+    const auto end = text.find('\n', begin);
+    return std::stod(text.substr(begin, end - begin));
+}
+
 class ScopedEnv {
    public:
     explicit ScopedEnv(const char* name) : name_(name) {
@@ -1342,6 +1353,50 @@ TEST(VSegmentManagerTest, RetireReturnsExtentsToPartitionQuota) {
     EXPECT_TRUE(manager.Create("default"));
 }
 
+TEST(VSegmentManagerTest, StatsExcludeRetiredVSegmentsFromFormedCapacity) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+
+    auto stats = manager.Stats();
+    // 2 segments x 512 B quota -> quota 1024 B; 4 units / 2 members ->
+    // capacity 1024 B; one 512 B vsegment is created initially.
+    EXPECT_EQ(stats.quota_bytes, 1024u);
+    EXPECT_EQ(stats.capacity_bytes, 1024u);
+    EXPECT_EQ(stats.logical_capacity_bytes, 512u);
+    EXPECT_EQ(stats.logical_free_bytes, 512u);
+    EXPECT_EQ(stats.reserved_bytes, 0u);
+
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
+    stats = manager.Stats();
+    EXPECT_EQ(stats.logical_capacity_bytes, 512u);
+    EXPECT_EQ(stats.logical_free_bytes, 448u);
+    EXPECT_EQ(stats.reserved_bytes, 64u);
+    EXPECT_EQ(stats.reservations, 1u);
+    ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, "put-1"),
+              ErrorCode::OK);
+
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::DRAINING),
+              ErrorCode::OK);
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OK);
+    stats = manager.Stats();
+    EXPECT_EQ(stats.retired, 1u);
+    // RETIRED returned the quota, so formed must drop to zero to avoid double
+    // counting.
+    EXPECT_EQ(stats.logical_capacity_bytes, 0u);
+    EXPECT_EQ(stats.logical_free_bytes, 0u);
+    EXPECT_EQ(stats.capacity_bytes, 1024u);
+    EXPECT_EQ(stats.quota_bytes, 1024u);
+
+    ASSERT_TRUE(manager.Create("default"));
+    stats = manager.Stats();
+    EXPECT_EQ(stats.logical_capacity_bytes, 512u);
+    EXPECT_EQ(stats.capacity_bytes, 1024u);
+}
+
 TEST(VSegmentManagerTest, ConsumesMultipleProfilesFromPublishedSnapshot) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 3;
@@ -1750,14 +1805,37 @@ TEST(VSegmentHaTest, ReplaysIncrementalDeltaAndLegacyFullState) {
 
 TEST(VSegmentMetricsTest, ExportsCapacityAndFailureSignals) {
     auto& metrics = VSegmentMetrics::Instance();
-    metrics.SetCapacity(1024, 256, 2, 3, 1);
+    VSegmentGaugeValues values;
+    values.quota_bytes = 2048;
+    values.total_capacity_bytes = 1024;
+    values.allocated_bytes = 768;
+    values.reserved_bytes = 256;
+    values.available_bytes = 256;
+    values.formed_capacity_bytes = 1024;
+    values.formed_free_bytes = 256;
+    values.reservations = 2;
+    values.committed_allocations = 3;
+    values.pending_creations = 1;
+    metrics.SetGauges(values);
     metrics.IncCreateFailure();
     metrics.IncPersistenceFailure();
     metrics.IncStaleRoute();
     const auto text = metrics.Serialize();
-    EXPECT_NE(text.find("mooncake_vsegment_logical_capacity_bytes 1024"),
+    EXPECT_NE(text.find("mooncake_vsegment_quota_bytes 2048"),
               std::string::npos);
-    EXPECT_NE(text.find("mooncake_vsegment_logical_free_bytes 256"),
+    EXPECT_NE(text.find("mooncake_vsegment_total_capacity_bytes 1024"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_allocated_bytes 768"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_reserved_bytes 256"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_available_bytes 256"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_used_ratio 0.750000"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_formed_capacity_bytes 1024"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_formed_free_bytes 256"),
               std::string::npos);
     EXPECT_NE(text.find("mooncake_vsegment_create_failure_total"),
               std::string::npos);
@@ -1765,6 +1843,19 @@ TEST(VSegmentMetricsTest, ExportsCapacityAndFailureSignals) {
               std::string::npos);
     EXPECT_NE(text.find("mooncake_vsegment_stale_route_total"),
               std::string::npos);
+    // The gauges are process-global; leave no values behind for other tests.
+    metrics.SetGauges(VSegmentGaugeValues{});
+}
+
+TEST(VSegmentMetricsTest, UsedRatioIsZeroWithoutCapacity) {
+    auto& metrics = VSegmentMetrics::Instance();
+    VSegmentGaugeValues values;
+    values.allocated_bytes = 4096;
+    metrics.SetGauges(values);
+    EXPECT_DOUBLE_EQ(metrics.used_ratio(), 0.0);
+    EXPECT_NE(metrics.Serialize().find("mooncake_vsegment_used_ratio 0.000000"),
+              std::string::npos);
+    metrics.SetGauges(VSegmentGaugeValues{});
 }
 
 TEST(VSegmentHaTest, AcceptedCommitWaitsForDurabilityWithoutRollbackSignal) {
@@ -2037,7 +2128,11 @@ TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
     VSegmentService service(snapshot, std::chrono::hours(1));
     ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
               ErrorCode::OK);
-    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 512u);
+    // quota = 2 segments x 512 B; capacity = 4 units / 2 members x 2 members
+    // x 256 B = 1024 B; the initial vsegment is 512 B.
+    EXPECT_EQ(MetricValue("mooncake_vsegment_quota_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_formed_capacity_bytes"), 512u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
 
     VSegmentPutStartResult started;
@@ -2049,11 +2144,64 @@ TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
     ASSERT_TRUE(started) << started.detail;
     // Non-forced refresh is throttled: the new reservation is not visible.
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
-    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 512u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_formed_capacity_bytes"), 512u);
 
     // An ownership change forces a refresh: the removed Partition is gone.
     ASSERT_EQ(service.RemovePartition("partition-1", 9), ErrorCode::OK);
-    EXPECT_EQ(MetricValue("mooncake_vsegment_logical_capacity_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_quota_bytes"), 0u);
+}
+
+TEST(VSegmentServiceTest, ReportsPoolCapacityUsageAndReservations) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+
+    // Zero interval: every vsegment operation refreshes the gauges.
+    VSegmentService service(snapshot, std::chrono::milliseconds(0));
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_quota_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_available_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_formed_capacity_bytes"), 512u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_formed_free_bytes"), 512u);
+    EXPECT_DOUBLE_EQ(MetricDoubleValue("mooncake_vsegment_used_ratio"), 0.0);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 80u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reserved_bytes"), 80u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_available_bytes"), 944u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
+    EXPECT_DOUBLE_EQ(MetricDoubleValue("mooncake_vsegment_used_ratio"),
+                     80.0 / 1024.0);
+
+    ASSERT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 80u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reserved_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_committed_allocations"), 1u);
+
+    ASSERT_EQ(service.ReleaseObject(started.replica, "object-1"),
+              ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_available_bytes"), 1024u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_committed_allocations"), 0u);
+    EXPECT_DOUBLE_EQ(MetricDoubleValue("mooncake_vsegment_used_ratio"), 0.0);
 }
 
 TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {

@@ -126,9 +126,19 @@ struct VSegmentPutStartResult {
 YLT_REFL(VSegmentPutStartResult, error, operation_id, replica, detail);
 
 struct VSegmentManagerStats {
+    // Configured quota: sum of this Partition's quota extent lengths
+    // (planning leftovers excluded).
+    uint64_t quota_bytes{0};
+    // Writable capacity: largest logical capacity that can be formed into
+    // VSegments after the extent and member-count remainders are dropped.
+    uint64_t capacity_bytes{0};
+    // Logical capacity (and free bytes) of created, non-retired VSegments.
     uint64_t logical_capacity_bytes{0};
     uint64_t logical_free_bytes{0};
+    // Logical bytes used by VSegment profiles with required_medium=nof.
     uint64_t nof_logical_used_bytes{0};
+    // Bytes held by in-flight PutStart reservations (part of allocated).
+    uint64_t reserved_bytes{0};
     size_t preparing{0};
     size_t active{0};
     size_t draining{0};
@@ -255,8 +265,13 @@ class VSegmentManager {
         std::shared_ptr<VSegmentDeferredCommitHandle>* fence_out = nullptr);
     void TrimOperationTombstonesLocked(ManagedVSegment& managed,
                                        size_t max_completed);
+    // Static capacity derived from quota_configs_ and profiles_; constant
+    // after construction.
+    void ComputePoolCapacity();
     std::string partition_id_;
     uint64_t config_generation_{0};
+    uint64_t quota_bytes_{0};
+    uint64_t capacity_bytes_{0};
     std::string default_profile_;
     std::unordered_map<std::string, VSegmentProfile> profiles_;
     std::vector<PartitionVSegmentConfig> quota_configs_;

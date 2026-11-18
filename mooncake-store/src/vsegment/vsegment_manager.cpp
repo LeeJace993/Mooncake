@@ -60,6 +60,7 @@ VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
     for (auto& profile : profiles) {
         profiles_.emplace(profile.name, std::move(profile));
     }
+    ComputePoolCapacity();
 }
 
 VSegmentManager::VSegmentManager(
@@ -77,6 +78,7 @@ VSegmentManager::VSegmentManager(
           std::max<size_t>(1, max_operation_tombstones)) {
     for (const auto& profile : quota_snapshot.profile_specs)
         profiles_.emplace(profile.name, profile);
+    ComputePoolCapacity();
 }
 
 VSegmentManager::VSegmentManager(
@@ -92,6 +94,7 @@ VSegmentManager::VSegmentManager(
       committer_(std::move(committer)),
       max_operation_tombstones_(std::max<size_t>(1, max_operation_tombstones)) {
     for (const auto& profile : profiles) profiles_.emplace(profile.name, profile);
+    ComputePoolCapacity();
 }
 
 VSegmentAllocationResult VSegmentManager::Create(
@@ -1188,20 +1191,39 @@ bool VSegmentManager::FindView(const std::string& vsegment_id,
     return true;
 }
 
+void VSegmentManager::ComputePoolCapacity() {
+    quota_bytes_ = 0;
+    capacity_bytes_ = 0;
+    for (const auto& config : quota_configs_) {
+        auto profile = profiles_.find(config.profile_name);
+        if (profile == profiles_.end()) continue;
+        const uint64_t extent = profile->second.member_extent_size;
+        const uint64_t members = profile->second.member_count;
+        if (extent == 0 || members == 0) continue;
+        std::set<std::string> segments;
+        uint64_t units = 0;
+        for (const auto& quota : config.quotas) {
+            // A segment appears once per quota; count duplicate entries once.
+            if (!segments.insert(quota.segment_id).second) continue;
+            quota_bytes_ += quota.length;
+            units += quota.length / extent;
+        }
+        // Each vsegment takes one extent from member_count distinct segments,
+        // so only floor(total_units / member_count) groups can be used; the
+        // remainder is discarded. groups * members <= units, so multiplying
+        // groups * members first cannot overflow.
+        const uint64_t groups = units / members;
+        capacity_bytes_ += (groups * members) * extent;
+    }
+}
+
 VSegmentManagerStats VSegmentManager::Stats() const {
     VSegmentManagerStats stats;
+    stats.quota_bytes = quota_bytes_;
+    stats.capacity_bytes = capacity_bytes_;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, managed] : vsegments_) {
-            const auto capacity = managed.view.logical_capacity;
-            const auto free = managed.logical_allocator->FreeBytes();
-            stats.logical_capacity_bytes += capacity;
-            stats.logical_free_bytes += free;
-            const auto profile = profiles_.find(managed.profile_name);
-            if (profile != profiles_.end() &&
-                profile->second.required_medium == "nof") {
-                stats.nof_logical_used_bytes += capacity - free;
-            }
             switch (managed.lifecycle) {
                 case Lifecycle::PREPARING:
                     ++stats.preparing;
@@ -1215,6 +1237,22 @@ VSegmentManagerStats VSegmentManager::Stats() const {
                 case Lifecycle::RETIRED:
                     ++stats.retired;
                     break;
+            }
+            // RETIRED already returned the physical quota
+            // (TransitionLifecycle); counting it would double-count capacity
+            // reused by a new vsegment.
+            if (managed.lifecycle == Lifecycle::RETIRED) continue;
+            const auto free_bytes = managed.logical_allocator->FreeBytes();
+            stats.logical_capacity_bytes += managed.view.logical_capacity;
+            stats.logical_free_bytes += free_bytes;
+            stats.reserved_bytes += managed.logical_allocator->ReservedBytes();
+            // NoF-medium logical usage feeds the nof_logical_used gauge and
+            // the periodic VSegment Status log line.
+            const auto profile = profiles_.find(managed.profile_name);
+            if (profile != profiles_.end() &&
+                profile->second.required_medium == "nof") {
+                stats.nof_logical_used_bytes +=
+                    managed.view.logical_capacity - free_bytes;
             }
             stats.reservations +=
                 managed.logical_allocator->ReservationCount();
