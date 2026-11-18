@@ -187,7 +187,14 @@ bool SpdkWrapper::InitializeEnv() {
         return true;
     }
 
-    struct spdk_env_opts opts;
+    // Versioned ABI: spdk_env_opts_init() preserves the caller's opts_size
+    // (SPDK v26.09 lib/env_dpdk/init.c) and gates its SET_FIELD defaults on
+    // it, and spdk_env_init() warns when it is below the minimum. Zero-init
+    // and declare our size BEFORE opts_init; an uninitialized struct would
+    // feed stack garbage as opts_size (UB, non-deterministic across
+    // bare-metal vs container stacks).
+    struct spdk_env_opts opts = {};
+    opts.opts_size = sizeof(opts);
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
 
