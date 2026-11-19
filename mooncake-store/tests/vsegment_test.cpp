@@ -1246,6 +1246,48 @@ TEST(VSegmentManagerTest, RejectsUnalignedNoFReservationWithoutConsumingSpace) {
     EXPECT_EQ(reservation.range.offset, 0u);
 }
 
+TEST(VSegmentManagerTest, NofLogicalUsedGaugeExcludesRetiredVSegments) {
+    auto profile = Profile();
+    profile.required_medium = "nof";
+    VSegmentManager manager(Config(), {profile}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+
+    // An empty nof-medium vsegment contributes nothing to the gauge.
+    auto active_stats = manager.Stats();
+    EXPECT_EQ(active_stats.nof_logical_used_bytes, 0u);
+    EXPECT_GT(active_stats.logical_capacity_bytes, 0u);
+
+    // A reservation removes bytes from the free pool, and the gauge tracks
+    // the nof-medium part of it.
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 16));
+    active_stats = manager.Stats();
+    EXPECT_GT(active_stats.nof_logical_used_bytes, 0u);
+    EXPECT_EQ(active_stats.nof_logical_used_bytes,
+              active_stats.logical_capacity_bytes -
+                  active_stats.logical_free_bytes);
+
+    // Releasing the reservation returns the gauge to zero while the
+    // vsegment is still counted in the formed gauges.
+    ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, "put-1"),
+              ErrorCode::OK);
+    active_stats = manager.Stats();
+    EXPECT_EQ(active_stats.nof_logical_used_bytes, 0u);
+
+    // Retired vsegments leave the formed and nof gauges entirely (the
+    // post-PR18 Stats() skips RETIRED before accumulating).
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::DRAINING),
+              ErrorCode::OK);
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OK);
+    const auto retired_stats = manager.Stats();
+    EXPECT_EQ(retired_stats.nof_logical_used_bytes, 0u);
+    EXPECT_EQ(retired_stats.logical_capacity_bytes, 0u);
+    EXPECT_EQ(retired_stats.logical_free_bytes, 0u);
+}
+
 TEST(VSegmentManagerTest, RejectsFileWriteFromReclaimedReservation) {
     VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
@@ -1855,6 +1897,19 @@ TEST(VSegmentMetricsTest, UsedRatioIsZeroWithoutCapacity) {
     EXPECT_DOUBLE_EQ(metrics.used_ratio(), 0.0);
     EXPECT_NE(metrics.Serialize().find("mooncake_vsegment_used_ratio 0.000000"),
               std::string::npos);
+    metrics.SetGauges(VSegmentGaugeValues{});
+}
+
+TEST(VSegmentMetricsTest, SetGaugesCarriesNofLogicalUsed) {
+    auto& metrics = VSegmentMetrics::Instance();
+    VSegmentGaugeValues values;
+    values.nof_logical_used_bytes = 512;
+    metrics.SetGauges(values);
+    EXPECT_EQ(metrics.nof_logical_used_bytes(), 512u);
+    EXPECT_NE(metrics.Serialize().find(
+                  "mooncake_vsegment_nof_logical_used_bytes 512"),
+              std::string::npos);
+    // The gauges are process-global; leave no values behind for other tests.
     metrics.SetGauges(VSegmentGaugeValues{});
 }
 
