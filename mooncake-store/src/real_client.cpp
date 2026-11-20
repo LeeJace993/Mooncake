@@ -771,6 +771,12 @@ std::vector<std::string> RealClient::GetSubmasterAddresses() const {
                    : std::vector<std::string>{};
 }
 
+tl::expected<std::vector<NoFSegment>, ErrorCode>
+RealClient::GetAllNoFSegments() {
+    if (!client_) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    return client_->GetAllNoFSegments();
+}
+
 std::shared_ptr<RealClient> RealClient::create() {
     auto sp = std::shared_ptr<RealClient>(new RealClient());
     ResourceTracker::getInstance().registerInstance(sp);

@@ -85,6 +85,11 @@ class Client {
         read_replica_validator_ = std::move(validator);
     }
 
+    // Reuse the connected master, including HA discovery and leader changes.
+    tl::expected<std::vector<NoFSegment>, ErrorCode> GetAllNoFSegments() {
+        return master_client_.GetAllNoFSegments();
+    }
+
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
     ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range) {

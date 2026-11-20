@@ -82,6 +82,8 @@ class RealClient : public PyClient {
 
     [[nodiscard]] std::vector<std::string> GetSubmasterAddresses() const;
 
+    tl::expected<std::vector<NoFSegment>, ErrorCode> GetAllNoFSegments();
+
     Status configureScheduling(
         const scheduling::SchedulerConfig &scheduler_config);
 

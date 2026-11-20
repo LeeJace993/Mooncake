@@ -10,9 +10,8 @@
 #include <utility>
 #include <vector>
 
-#include "master_client.h"
 #include "nof_memory_pool.h"
-#include "types.h"
+#include "real_client.h"
 
 namespace mooncake::kvtest {
 namespace {
@@ -51,8 +50,7 @@ std::set<std::string> &NofPoolRegistered() {
 }  // namespace
 
 bool EnsureNofWholePoolRegistered(
-    const std::string &master_server_address,
-    const std::vector<std::pair<void *, size_t>> &buffers,
+    RealClient &client, const std::vector<std::pair<void *, size_t>> &buffers,
     std::string *error) {
 #if defined(USE_NOF_URMA)
     if (!mooncake::NofWholePoolRegistrationAvailable()) {
@@ -62,15 +60,13 @@ bool EnsureNofWholePoolRegistered(
             "the URMA registration cache";
         return false;
     }
-    auto master =
-        std::make_unique<mooncake::MasterClient>(mooncake::generate_uuid());
-    if (master->Connect(master_server_address) != mooncake::ErrorCode::OK) {
-        *error = "Cannot connect to master for NoF whole-pool registration: " +
-                 master_server_address;
+    auto segments = client.GetAllNoFSegments();
+    if (!segments) {
+        *error =
+            "Cannot query mounted NoF segments through the connected client";
         return false;
     }
-    auto segments = master->GetAllNoFSegments();
-    if (!segments || segments->empty()) {
+    if (segments->empty()) {
         *error =
             "No mounted NoF segments available for whole-pool registration "
             "(master has not mounted any NoF segment yet)";
@@ -113,7 +109,7 @@ bool EnsureNofWholePoolRegistered(
               << " new_registrations=" << new_registrations;
     return true;
 #else
-    (void)master_server_address;
+    (void)client;
     (void)buffers;
     *error = "NoF whole-pool registration requested without USE_NOF_URMA";
     return false;

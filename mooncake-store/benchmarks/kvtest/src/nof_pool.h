@@ -15,17 +15,22 @@
 #include <utility>
 #include <vector>
 
+namespace mooncake {
+class RealClient;
+}
+
 namespace mooncake::kvtest {
 
 /// Registers the given process-owned buffers against every mounted URMA NoF
 /// segment. VSegment placement is chosen by the master's vsegment profile,
 /// so every mounted URMA endpoint is covered (no per-segment filtering).
+/// Reuses the initialized client and its master discovery; no separate RPC
+/// address or second master connection is needed.
 /// Returns false on any failure and fills *error: a per-I/O registration
 /// fallback is deliberately refused because large batches can exhaust the
 /// URMA registration cache (exp5: 21336 registrations before the fix).
 bool EnsureNofWholePoolRegistered(
-    const std::string &master_server_address,
-    const std::vector<std::pair<void *, size_t>> &buffers,
+    RealClient &client, const std::vector<std::pair<void *, size_t>> &buffers,
     std::string *error);
 
 /// Releases the registration tokens. Must be called before the registered

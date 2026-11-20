@@ -197,6 +197,10 @@ bool SpdkWrapper::InitializeEnv() {
     opts.opts_size = sizeof(opts);
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
+#ifdef USE_NOF_URMA
+    // URMA initiators use the provider, not local PCI/NVMe devices or VFIO.
+    opts.no_pci = true;
+#endif
 
     // EAL pins its calling thread to the main lcore. Preserve the caller's
     // placement so subsequently created RPC/helper threads do not inherit

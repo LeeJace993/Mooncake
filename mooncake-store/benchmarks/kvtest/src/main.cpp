@@ -636,9 +636,8 @@ int main(int argc, char **argv) {
         if (writer) nof_buffers = writer->NoFBuffers();
         if (!nof_buffers.empty()) {
             std::string nof_error;
-            if (!EnsureNofWholePoolRegistered(
-                    config.store.master_server_address, nof_buffers,
-                    &nof_error)) {
+            if (!EnsureNofWholePoolRegistered(*client, nof_buffers,
+                                              &nof_error)) {
                 LOG(ERROR) << "NoF whole-pool registration failed: "
                            << nof_error;
                 ReleaseNofPoolTokens();
